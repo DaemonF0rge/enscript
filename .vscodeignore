@@ -1,0 +1,22 @@
+# Exclude development files from the packaged extension
+.git/
+.vscode/
+src/
+server/src/
+test/
+*.ts
+*.map
+tsconfig*.json
+jest.config.js
+.gitignore
+
+# Include compiled output (override .gitignore)
+!out/
+!server/out/
+
+# Exclude unnecessary node_modules files
+node_modules/.bin/
+node_modules/**/test/
+node_modules/**/*.md
+node_modules/**/*.ts
+node_modules/**/.github/

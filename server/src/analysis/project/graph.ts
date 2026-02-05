@@ -1,3 +1,41 @@
+/**
+ * Analyzer (Graph) Module - Enforce Script LSP
+ * ==============================================
+ * 
+ * Central code intelligence facade that coordinates parsing, symbol indexing,
+ * and LSP query handling. Uses singleton pattern for shared state.
+ * 
+ * KEY RESPONSIBILITIES:
+ *   - Document parsing and caching (ensure())
+ *   - Symbol resolution at cursor position
+ *   - Workspace-wide symbol search
+ *   - Go-to-definition navigation
+ *   - Hover information
+ *   - Code completions
+ *   - Reference finding
+ * 
+ * CACHING STRATEGY:
+ *   - Documents are parsed on-demand and cached by URI + version
+ *   - Cache hit returns immediately if version matches
+ *   - Parse errors return empty stubs to allow graceful degradation
+ * 
+ * IMPROVEMENTS NEEDED (from JS version fixes):
+ * 
+ * 1. THREE-TIER SYMBOL SEARCH PRIORITY
+ *    Current: Simple .includes() matching
+ *    Needed: Prioritize exact > prefix > contains matches
+ * 
+ * 2. ENUM MEMBER KIND FILTERING
+ *    Current: All symbols returned regardless of kind filter
+ *    Needed: Respect kinds filter for enum members
+ * 
+ * 3. NON-VOID RETURN TYPE PREFERENCE
+ *    When multiple symbols have same name, prefer ones with return types
+ *    Why: Breaks method chaining resolution when wrong symbol selected
+ * 
+ * @module enscript/server/src/analysis/project/graph
+ */
+
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { Position, Range, Location, SymbolInformation, SymbolKind, Diagnostic, DiagnosticSeverity } from 'vscode-languageserver';
 import { parse, ParseError, ClassDeclNode, File, SymbolNodeBase, FunctionDeclNode, VarDeclNode, TypedefNode, toSymbolKind, EnumDeclNode, EnumMemberDeclNode, TypeNode } from '../ast/parser';
@@ -16,6 +54,17 @@ interface SymbolEntry {
         range: Range;
     };
     scope: 'global' | 'class' | 'function';
+}
+
+/**
+ * Completion result with optional metadata
+ */
+interface CompletionResult {
+    name: string;
+    kind: string;
+    detail?: string;
+    insertText?: string;
+    returnType?: string;
 }
 
 /**
@@ -134,14 +183,14 @@ export class Analyzer {
                 //     source:   'parser'
                 // };
                 // connection.sendDiagnostics({ uri: err.uri, diagnostics: [diagnostic] });
-                console.error(String(err.stack));
+                // Stack trace removed to reduce noise during indexing
             } else {
                 // unexpected failure
                 console.error(String(err));
             }
 
             // 4 · return an empty stub so callers can continue
-            return { body: [], version: 0 };
+            return { body: [], version: 0, diagnostics: [] };
         }
     }
 
@@ -188,50 +237,760 @@ export class Analyzer {
         return result;
     }
 
-    getCompletions(doc: TextDocument, _pos: Position) {
+    // ========================================================================
+    // COMPLETIONS - Enhanced with parameter type resolution & member access
+    // ========================================================================
+    // This is a major improvement over the basic implementation.
+    //
+    // FEATURES:
+    // 1. CONTEXT DETECTION: Detects if cursor is after a dot (member access)
+    // 2. PARAMETER TYPE RESOLUTION: Resolves types of function parameters
+    //    Example: void SomeFunc(PlayerBase p) { p. } → shows PlayerBase methods
+    // 3. LOCAL VARIABLE TYPE RESOLUTION: Resolves types of local variables
+    //    Example: PlayerBase player = GetPlayer(); player. → shows methods
+    // 4. INHERITANCE CHAIN: Walks up class hierarchy for complete method list
+    // 5. GLOBAL COMPLETIONS: Shows classes, functions, enums when not after dot
+    // 6. CLASS CONTEXT: When inside a class, show methods from this class + parents
+    // 7. FUNCTION RETURN TYPES: GetGame(). → resolves return type of GetGame()
+    // ========================================================================
+    getCompletions(doc: TextDocument, pos: Position): CompletionResult[] {
         const ast = this.ensure(doc);
-        return ast.body.filter((n: any) => n.name);
+        const text = doc.getText();
+        const offset = doc.offsetAt(pos);
+        
+        // Check if we're after a dot (member completion)
+        const textBeforeCursor = text.substring(0, offset);
+        
+        // Match both variable.method and function().method patterns
+        // Pattern 1: variable. or variable.prefix
+        // Pattern 2: function(). or function().prefix  
+        // Pattern 3: function(args). or function(args).prefix
+        const dotMatch = textBeforeCursor.match(/(\w+)(\([^)]*\))?\s*\.\s*(\w*)$/);
+        
+        if (dotMatch) {
+            // MEMBER COMPLETION MODE
+            const name = dotMatch[1];
+            const hasParens = !!dotMatch[2]; // true if it's a function call like GetGame()
+            const prefix = dotMatch[3] || '';
+            
+            console.info(`Completion: matched "${name}" hasParens=${hasParens} prefix="${prefix}"`);
+            
+            // Handle 'this' keyword
+            if (name === 'this') {
+                const containingClass = this.findContainingClass(ast, pos);
+                if (containingClass) {
+                    return this.getClassMemberCompletions(containingClass.name, prefix);
+                }
+            }
+            
+            // Handle 'super' keyword
+            if (name === 'super') {
+                const containingClass = this.findContainingClass(ast, pos);
+                if (containingClass?.base?.identifier) {
+                    return this.getClassMemberCompletions(containingClass.base.identifier, prefix);
+                }
+            }
+            
+            // If it's a function call like GetGame(). → look up the function's return type
+            if (hasParens) {
+                const returnType = this.resolveFunctionReturnType(name);
+                if (returnType) {
+                    return this.getClassMemberCompletions(returnType, prefix);
+                }
+            }
+            
+            // Try to resolve the variable's type
+            const varType = this.resolveVariableType(doc, pos, name);
+            
+            if (varType) {
+                // Get methods/fields for this type (including inherited)
+                return this.getClassMemberCompletions(varType, prefix);
+            }
+            
+            // If name looks like a class name (starts with uppercase), 
+            // it might be a static method call: ClassName.StaticMethod()
+            // OR an enum access: EnumName.EnumValue
+            if (name[0] === name[0].toUpperCase()) {
+                // First check if it's an enum
+                const enumNode = this.findEnumByName(name);
+                if (enumNode) {
+                    return this.getEnumMemberCompletions(enumNode, prefix);
+                }
+                
+                // Otherwise check for class static members
+                const classNode = this.findClassByName(name);
+                if (classNode) {
+                    return this.getStaticMemberCompletions(classNode, prefix);
+                }
+            }
+            
+            return [];
+        }
+        
+        // Get the prefix being typed (for filtering)
+        const prefixMatch = textBeforeCursor.match(/(\w+)$/);
+        const prefix = prefixMatch ? prefixMatch[1].toLowerCase() : '';
+        
+        // CONTEXT-AWARE COMPLETION MODE
+        const results: CompletionResult[] = [];
+        const seen = new Set<string>();
+        
+        // Check if we're inside a class
+        const containingClass = this.findContainingClass(ast, pos);
+        
+        if (containingClass) {
+            // Add methods/fields from current class hierarchy (including modded)
+            const classHierarchy = this.getClassHierarchyOrdered(containingClass.name, new Set());
+            
+            for (const classNode of classHierarchy) {
+                for (const member of classNode.members || []) {
+                    if (!member.name) continue;
+                    if (seen.has(member.name)) continue;
+                    if (prefix && !member.name.toLowerCase().startsWith(prefix)) continue;
+                    
+                    seen.add(member.name);
+                    
+                    if (member.kind === 'FunctionDecl') {
+                        const func = member as FunctionDeclNode;
+                        const params = func.parameters?.map(p => 
+                            `${p.type?.identifier || 'auto'} ${p.name}`
+                        ).join(', ') || '';
+                        
+                        results.push({
+                            name: func.name,
+                            kind: 'function',
+                            detail: `${func.returnType?.identifier || 'void'} (${classNode.name})`,
+                            insertText: `${func.name}()`,
+                            returnType: func.returnType?.identifier
+                        });
+                    } else if (member.kind === 'VarDecl') {
+                        const field = member as VarDeclNode;
+                        results.push({
+                            name: field.name,
+                            kind: 'field',
+                            detail: `${field.type?.identifier || 'auto'} (${classNode.name})`
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Add all top-level symbols from ALL indexed documents
+        for (const [uri, fileAst] of this.docCache) {
+            for (const node of fileAst.body) {
+                if (!node.name) continue;
+                if (seen.has(node.name)) continue;
+                if (prefix && !node.name.toLowerCase().startsWith(prefix)) continue;
+                
+                seen.add(node.name);
+                
+                if (node.kind === 'ClassDecl') {
+                    results.push({
+                        name: node.name,
+                        kind: 'class',
+                        detail: (node as ClassDeclNode).base?.identifier 
+                            ? `extends ${(node as ClassDeclNode).base?.identifier}` 
+                            : 'class'
+                    });
+                } else if (node.kind === 'FunctionDecl') {
+                    const func = node as FunctionDeclNode;
+                    results.push({
+                        name: func.name,
+                        kind: 'function',
+                        detail: func.returnType?.identifier || 'void',
+                        insertText: `${func.name}()`,
+                        returnType: func.returnType?.identifier
+                    });
+                } else if (node.kind === 'VarDecl') {
+                    const v = node as VarDeclNode;
+                    results.push({
+                        name: v.name,
+                        kind: 'variable',
+                        detail: v.type?.identifier || 'auto'
+                    });
+                } else if (node.kind === 'EnumDecl') {
+                    results.push({
+                        name: node.name,
+                        kind: 'enum',
+                        detail: 'enum'
+                    });
+                } else if (node.kind === 'Typedef') {
+                    results.push({
+                        name: node.name,
+                        kind: 'typedef',
+                        detail: `typedef ${(node as TypedefNode).oldType?.identifier}`
+                    });
+                }
+            }
+        }
+        
+        return results;
+    }
+
+    /**
+     * Resolve the type of a variable at a given position
+     * Checks: function parameters, local variables, class fields
+     */
+    /**
+     * Known DayZ global variables that have a more specific type than declared.
+     * Example: g_Game is declared as "Game" but is actually "CGame"
+     */
+    private static readonly KNOWN_VARIABLE_TYPES: Record<string, string> = {
+        'g_Game': 'CGame',
+    };
+
+    private resolveVariableType(doc: TextDocument, pos: Position, varName: string): string | null {
+        console.info(`resolveVariableType: looking for "${varName}"`);
+        
+        // Check for known variable type overrides first
+        const knownType = Analyzer.KNOWN_VARIABLE_TYPES[varName];
+        if (knownType) {
+            console.info(`  Using known variable type for ${varName} -> ${knownType}`);
+            return knownType;
+        }
+        
+        const ast = this.ensure(doc);
+        
+        // Find which function we're inside
+        const containingFunc = this.findContainingFunction(ast, pos);
+        
+        if (containingFunc) {
+            // Check function parameters first
+            // Example: void SomeFunc(PlayerBase p) { p. } → type is "PlayerBase"
+            for (const param of containingFunc.parameters || []) {
+                if (param.name === varName) {
+                    console.info(`  Found param ${varName} -> ${param.type?.identifier}`);
+                    return param.type?.identifier || null;
+                }
+            }
+            
+            // Check local variables
+            for (const local of containingFunc.locals || []) {
+                if (local.name === varName) {
+                    console.info(`  Found local ${varName} -> ${local.type?.identifier}`);
+                    return local.type?.identifier || null;
+                }
+            }
+        }
+        
+        // Check if we're inside a class - look for fields + inherited fields
+        const containingClass = this.findContainingClass(ast, pos);
+        if (containingClass) {
+            // Check current class and all parent classes (including modded)
+            const classHierarchy = this.getClassHierarchyOrdered(containingClass.name, new Set());
+            for (const classNode of classHierarchy) {
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'VarDecl' && member.name === varName) {
+                        console.info(`  Found field ${varName} in ${classNode.name} -> ${(member as VarDeclNode).type?.identifier}`);
+                        return (member as VarDeclNode).type?.identifier || null;
+                    }
+                }
+            }
+        }
+        
+        // Check global variables in ALL indexed files
+        for (const [uri, fileAst] of this.docCache) {
+            for (const node of fileAst.body) {
+                if (node.kind === 'VarDecl' && node.name === varName) {
+                    console.info(`  Found global ${varName} -> ${(node as VarDeclNode).type?.identifier}`);
+                    return (node as VarDeclNode).type?.identifier || null;
+                }
+            }
+        }
+        
+        // Try scanning the current document for variable declarations
+        const text = doc.getText();
+        
+        // Pattern: Type varName; or Type varName =
+        const varDeclMatch = text.match(new RegExp(`(\\w+)\\s+${varName}\\s*[;=]`));
+        if (varDeclMatch) {
+            console.info(`  Found via regex ${varName} -> ${varDeclMatch[1]}`);
+            return varDeclMatch[1];
+        }
+        
+        // Pattern: (Type varName) or (Type varName,) - function parameters
+        const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)\\s+${varName}\\s*[,)]`));
+        if (paramMatch) {
+            console.info(`  Found param via regex ${varName} -> ${paramMatch[1]}`);
+            return paramMatch[1];
+        }
+        
+        // Pattern: out Type varName or inout Type varName
+        const outParamMatch = text.match(new RegExp(`(?:out|inout)\\s+(\\w+)\\s+${varName}\\s*[,)]`));
+        if (outParamMatch) {
+            return outParamMatch[1];
+        }
+        
+        return null;
+    }
+
+    /**
+     * Known DayZ singleton functions that return a more specific type than declared.
+     * These functions are declared to return base class but actually return derived class.
+     * Example: GetGame() is declared as returning "Game" but actually returns "CGame"
+     */
+    private static readonly KNOWN_RETURN_TYPES: Record<string, string> = {
+        'GetGame': 'CGame',
+        'GetDayZGame': 'DayZGame',
+        'g_Game': 'CGame',
+    };
+
+    /**
+     * Resolve the return type of a function by name
+     * Searches top-level functions and class methods across all indexed files
+     */
+    private resolveFunctionReturnType(funcName: string): string | null {
+        console.info(`resolveFunctionReturnType: looking for "${funcName}" in ${this.docCache.size} indexed files`);
+        
+        // Check for known overrides first (e.g., GetGame() returns CGame, not Game)
+        const knownType = Analyzer.KNOWN_RETURN_TYPES[funcName];
+        if (knownType) {
+            console.info(`  Using known return type for ${funcName} -> ${knownType}`);
+            return knownType;
+        }
+        
+        // Search all indexed documents for a function with this name
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                // Top-level function
+                if (node.kind === 'FunctionDecl' && node.name === funcName) {
+                    const func = node as FunctionDeclNode;
+                    const returnType = func.returnType?.identifier;
+                    console.info(`  Found top-level function ${funcName} -> ${returnType}`);
+                    // Skip void functions
+                    if (returnType && returnType !== 'void') {
+                        return returnType;
+                    }
+                }
+                
+                // Class method (for static calls or when we don't know the class)
+                if (node.kind === 'ClassDecl') {
+                    for (const member of (node as ClassDeclNode).members || []) {
+                        if (member.kind === 'FunctionDecl' && member.name === funcName) {
+                            const func = member as FunctionDeclNode;
+                            const returnType = func.returnType?.identifier;
+                            console.info(`  Found ${funcName} in class ${node.name} -> ${returnType}`);
+                            if (returnType && returnType !== 'void') {
+                                return returnType;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        console.info(`  ${funcName} not found in ${this.docCache.size} cached documents`);
+        return null;
+    }
+
+    /**
+     * Find the function containing the given position
+     */
+    private findContainingFunction(ast: File, pos: Position): FunctionDeclNode | null {
+        for (const node of ast.body) {
+            if (node.kind === 'FunctionDecl') {
+                const func = node as FunctionDeclNode;
+                if (this.positionInRange(pos, func.start, func.end)) {
+                    return func;
+                }
+            }
+            
+            if (node.kind === 'ClassDecl') {
+                for (const member of (node as ClassDeclNode).members || []) {
+                    if (member.kind === 'FunctionDecl') {
+                        const func = member as FunctionDeclNode;
+                        if (this.positionInRange(pos, func.start, func.end)) {
+                            return func;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find the class containing the given position
+     */
+    private findContainingClass(ast: File, pos: Position): ClassDeclNode | null {
+        for (const node of ast.body) {
+            if (node.kind === 'ClassDecl') {
+                const cls = node as ClassDeclNode;
+                if (this.positionInRange(pos, cls.start, cls.end)) {
+                    return cls;
+                }
+            }
+        }
+        return null;
+    }
+
+    private positionInRange(pos: Position, start: Position, end: Position): boolean {
+        if (pos.line < start.line || pos.line > end.line) return false;
+        if (pos.line === start.line && pos.character < start.character) return false;
+        if (pos.line === end.line && pos.character > end.character) return false;
+        return true;
+    }
+
+    /**
+     * Get member completions for a class type (methods + fields)
+     * Walks the FULL inheritance chain INCLUDING modded classes
+     */
+    private getClassMemberCompletions(className: string, prefix: string): CompletionResult[] {
+        const results: CompletionResult[] = [];
+        const seen = new Set<string>(); // Deduplicate by name
+        
+        console.info(`getClassMemberCompletions: "${className}" prefix="${prefix}"`);
+        
+        // Get the complete class hierarchy including modded classes
+        const classHierarchy = this.getClassHierarchyOrdered(className, new Set());
+        
+        console.info(`  Class hierarchy: [${classHierarchy.map(c => c.name).join(', ')}]`);
+        
+        for (const classNode of classHierarchy) {
+            for (const member of classNode.members || []) {
+                if (!member.name) continue;
+                if (seen.has(member.name)) continue; // Skip duplicates
+                if (prefix && !member.name.toLowerCase().startsWith(prefix.toLowerCase())) continue;
+                
+                // Skip static members for instance completions
+                if (member.modifiers?.includes('static')) continue;
+                
+                seen.add(member.name);
+                
+                if (member.kind === 'FunctionDecl') {
+                    const func = member as FunctionDeclNode;
+                    const params = func.parameters?.map(p => 
+                        `${p.type?.identifier || 'auto'} ${p.name}`
+                    ).join(', ') || '';
+                    
+                    // Show visibility modifier if present
+                    const visibility = func.modifiers?.find(m => ['private', 'protected'].includes(m)) || '';
+                    const visPrefix = visibility ? `${visibility} ` : '';
+                    
+                    results.push({
+                        name: func.name,
+                        kind: 'function',
+                        detail: `${visPrefix}${func.returnType?.identifier || 'void'} - ${classNode.name}`,
+                        insertText: `${func.name}()`,
+                        returnType: func.returnType?.identifier
+                    });
+                } else if (member.kind === 'VarDecl') {
+                    const field = member as VarDeclNode;
+                    const visibility = field.modifiers?.find(m => ['private', 'protected'].includes(m)) || '';
+                    const visPrefix = visibility ? `${visibility} ` : '';
+                    
+                    results.push({
+                        name: field.name,
+                        kind: 'variable',
+                        detail: `${visPrefix}${field.type?.identifier || 'auto'} - ${classNode.name}`
+                    });
+                }
+            }
+        }
+        
+        return results;
+    }
+
+    /**
+     * Get static member completions for a class (ClassName.StaticMethod())
+     */
+    private getStaticMemberCompletions(classNode: ClassDeclNode, prefix: string): CompletionResult[] {
+        const results: CompletionResult[] = [];
+        
+        for (const member of classNode.members || []) {
+            if (!member.name) continue;
+            if (!member.modifiers?.includes('static')) continue;
+            if (prefix && !member.name.toLowerCase().startsWith(prefix.toLowerCase())) continue;
+            
+            if (member.kind === 'FunctionDecl') {
+                const func = member as FunctionDeclNode;
+                const params = func.parameters?.map(p => 
+                    `${p.type?.identifier || 'auto'} ${p.name}`
+                ).join(', ') || '';
+                
+                results.push({
+                    name: `${func.name}(${params})`,
+                    kind: 'function',
+                    detail: `${func.returnType?.identifier || 'void'} (static)`,
+                    insertText: `${func.name}()`
+                });
+            }
+        }
+        
+        return results;
+    }
+
+    /**
+     * Find a class by name across all cached documents
+     */
+    private findClassByName(className: string): ClassDeclNode | null {
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl' && node.name === className) {
+                    return node as ClassDeclNode;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find an enum by name across all indexed files
+     */
+    private findEnumByName(enumName: string): EnumDeclNode | null {
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.kind === 'EnumDecl' && node.name === enumName) {
+                    return node as EnumDeclNode;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Get completions for enum members (e.g., MuzzleState. → shows U, L, etc.)
+     */
+    private getEnumMemberCompletions(enumNode: EnumDeclNode, prefix: string): CompletionResult[] {
+        const results: CompletionResult[] = [];
+        
+        for (const member of enumNode.members || []) {
+            if (!member.name) continue;
+            if (prefix && !member.name.toLowerCase().startsWith(prefix.toLowerCase())) continue;
+            
+            results.push({
+                name: member.name,
+                kind: 'enumMember',
+                detail: `${enumNode.name}.${member.name}`
+            });
+        }
+        
+        return results;
+    }
+
+    /**
+     * Get completion detail text for a node
+     */
+    private getCompletionDetail(node: SymbolNodeBase): string {
+        switch (node.kind) {
+            case 'ClassDecl': {
+                const cls = node as ClassDeclNode;
+                return cls.base ? `extends ${cls.base.identifier}` : 'class';
+            }
+            case 'FunctionDecl': {
+                const func = node as FunctionDeclNode;
+                return func.returnType?.identifier || 'void';
+            }
+            case 'VarDecl': {
+                const v = node as VarDeclNode;
+                return v.type?.identifier || 'auto';
+            }
+            case 'EnumDecl':
+                return 'enum';
+            default:
+                return '';
+        }
     }
 
     resolveDefinitions(doc: TextDocument, _pos: Position): SymbolNodeBase[] {
         const offset = doc.offsetAt(_pos);
+        const text = doc.getText();
 
-        const token = getTokenAtPosition(doc.getText(), offset);
+        const token = getTokenAtPosition(text, offset);
         if (!token || token.kind !== TokenKind.Identifier) return [];
 
         const name = token.value;
         console.info(`resolveDefinitions: "${name}"`);
 
+        // Check if this is a member access (e.g., player.GetInputType)
+        // Look backwards from the token start to find a dot
+        const textBeforeToken = text.substring(0, token.start);
+        const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
+        
+        if (memberMatch) {
+            // MEMBER ACCESS: Resolve the variable type and search only that class hierarchy
+            const varName = memberMatch[1];
+            const varType = this.resolveVariableType(doc, _pos, varName);
+            
+            if (varType) {
+                const classMatches = this.findMemberInClassHierarchy(varType, name);
+                if (classMatches.length > 0) {
+                    return classMatches;
+                }
+            }
+            
+            // If varName looks like a class (uppercase), try static member lookup
+            if (varName[0] === varName[0].toUpperCase()) {
+                const classMatches = this.findMemberInClassHierarchy(varName, name);
+                if (classMatches.length > 0) {
+                    return classMatches;
+                }
+            }
+        }
+        
+        // Check if we're inside a class - prioritize current class and inheritance
+        const ast = this.ensure(doc);
+        const containingClass = this.findContainingClass(ast, _pos);
+        
+        if (containingClass) {
+            // First, look in current class hierarchy
+            const hierarchyMatches = this.findMemberInClassHierarchy(containingClass.name, name);
+            if (hierarchyMatches.length > 0) {
+                return hierarchyMatches;
+            }
+        }
+
+        // FALLBACK: Global search - but with proper scoping rules
+        // - Enum members ONLY if accessed via EnumName.member
+        // - Class members ONLY if inside that class (already checked above)
         const matches: SymbolNodeBase[] = [];
+
+        // Check if this is an enum member access (e.g., MuzzleState.U)
+        const enumMemberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
+        const isEnumAccess = enumMemberMatch && enumMemberMatch[1][0] === enumMemberMatch[1][0].toUpperCase();
 
         // iterate all loaded documents
         for (const [uri, ast] of this.docCache) {
             for (const node of ast.body) {
-                // top-level match
+                // top-level match (classes, functions, global variables, enums, typedefs)
                 if (node.name === name) {
                     matches.push(node as SymbolNodeBase);
                 }
 
-                // class member match
-                if (node.kind === 'ClassDecl') {
-                    for (const member of (node as ClassDeclNode).members) {
-                        if (member.name === name) {
-                            matches.push(member as SymbolNodeBase);
-                        }
-                    }
-                }
-
-                // enum member match
-                if (node.kind === 'EnumDecl') {
+                // Enum member match - ONLY if accessed via EnumName.member
+                if (isEnumAccess && enumMemberMatch && node.kind === 'EnumDecl' && node.name === enumMemberMatch[1]) {
                     for (const member of (node as EnumDeclNode).members) {
                         if (member.name === name) {
                             matches.push(member as SymbolNodeBase);
                         }
                     }
                 }
+                
+                // Class members are NOT included in global search
+                // They should only be found via:
+                // 1. Member access (player.Method) - handled above
+                // 2. Inside the class (this.Method or just Method) - handled above
+                // 3. Inheritance chain - handled above
             }
         }
 
+        return matches;
+    }
+
+    /**
+     * Find a member (method or field) in a class and its full hierarchy
+     * Includes: parent classes (extends) and modded classes
+     */
+    private findMemberInClassHierarchy(className: string, memberName: string): SymbolNodeBase[] {
+        const matches: SymbolNodeBase[] = [];
+        const visited = new Set<string>();
+        
+        // Collect all classes in the hierarchy (inheritance + modded)
+        // Returns in order: base classes first, then derived, with modded grouped by class
+        const classesToSearch = this.getClassHierarchyOrdered(className, visited);
+        
+        for (const classNode of classesToSearch) {
+            for (const member of classNode.members || []) {
+                if (member.name === memberName) {
+                    matches.push(member as SymbolNodeBase);
+                }
+            }
+        }
+        
+        return matches;
+    }
+
+    /**
+     * Get all classes in a hierarchy in inheritance order:
+     * 1. Root base class first (e.g., Managed)
+     * 2. Then each level of inheritance down to the target class
+     * 3. Modded classes are grouped with their base class
+     * 
+     * Example for PlayerBase extends ManBase extends Entity:
+     *   Returns: [Entity, modded Entity, ManBase, modded ManBase, PlayerBase, modded PlayerBase]
+     */
+    private getClassHierarchyOrdered(className: string, visited: Set<string>): ClassDeclNode[] {
+        if (visited.has(className)) return [];
+        visited.add(className);
+        
+        // Find all classes with this name (original + modded versions)
+        const classNodes = this.findAllClassesByName(className);
+        if (classNodes.length === 0) return [];
+        
+        // Separate original class from modded classes
+        const originalClass = classNodes.find(c => !c.modifiers?.includes('modded'));
+        const moddedClasses = classNodes.filter(c => c.modifiers?.includes('modded'));
+        
+        // Get the base class name (from original or first modded)
+        const baseClassName = (originalClass || classNodes[0])?.base?.identifier;
+        
+        // Recursively get parent hierarchy FIRST (so base classes come first)
+        const parentHierarchy: ClassDeclNode[] = baseClassName 
+            ? this.getClassHierarchyOrdered(baseClassName, visited)
+            : [];
+        
+        // Build result: parents first, then this class (original + modded)
+        const result: ClassDeclNode[] = [...parentHierarchy];
+        
+        // Add original class first, then modded classes
+        if (originalClass) {
+            result.push(originalClass);
+        }
+        result.push(...moddedClasses);
+        
+        return result;
+    }
+
+    /**
+     * Get all classes in a hierarchy including:
+     * - The class itself
+     * - All parent classes (via extends)
+     * - All modded versions of any class in the hierarchy
+     * @deprecated Use getClassHierarchyOrdered for ordered results
+     */
+    private getClassHierarchy(className: string, visited: Set<string>): ClassDeclNode[] {
+        const result: ClassDeclNode[] = [];
+        
+        if (visited.has(className)) return result;
+        visited.add(className);
+        
+        // Find all classes with this name (includes modded classes)
+        const classNodes = this.findAllClassesByName(className);
+        
+        for (const classNode of classNodes) {
+            result.push(classNode);
+            
+            // Walk up inheritance chain
+            if (classNode.base?.identifier) {
+                const parentClasses = this.getClassHierarchy(classNode.base.identifier, visited);
+                result.push(...parentClasses);
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * Find all classes with a given name (handles modded classes)
+     * In Enforce Script, multiple 'modded class X' can exist for the same class
+     */
+    private findAllClassesByName(className: string): ClassDeclNode[] {
+        const matches: ClassDeclNode[] = [];
+        
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl' && node.name === className) {
+                    const classNode = node as ClassDeclNode;
+                    console.info(`  findAllClassesByName("${className}"): found in ${uri} (modded=${classNode.modifiers?.includes('modded')}, members=${classNode.members?.length || 0})`);
+                    matches.push(classNode);
+                }
+            }
+        }
+        
+        if (matches.length === 0) {
+            console.info(`  findAllClassesByName("${className}"): NO MATCHES FOUND`);
+        }
+        
         return matches;
     }
 
@@ -256,6 +1015,130 @@ export class Analyzer {
         return [] as { uri: string; range: Range }[];
     }
 
+    // ========================================================================
+    // WORKSPACE SYMBOL SEARCH - Three-Tier Priority System
+    // ========================================================================
+    // Problem: When searching for "U", we want "U()" to appear before "UFLog",
+    // "Update", "UnitTest", etc. Simple .includes() returns them in arbitrary order.
+    //
+    // Solution: Three-tier priority:
+    //   1. EXACT MATCHES - Symbol name exactly equals query (highest priority)
+    //   2. PREFIX MATCHES - Symbol name starts with query
+    //   3. CONTAINS MATCHES - Symbol name contains query anywhere (lowest priority)
+    //
+    // Results are returned in priority order: exact first, then prefix, then contains.
+    // ========================================================================
+
+    /**
+     * Collect symbols with three-tier prioritization
+     */
+    private collectSymbolsPrioritized(
+        uri: string,
+        query: string,
+        members: SymbolNodeBase[],
+        exactMatches: SymbolInformation[],
+        prefixMatches: SymbolInformation[],
+        containsMatches: SymbolInformation[],
+        containerName?: string,
+        kinds?: SymbolKind[]
+    ): void {
+        const queryLower = query.toLowerCase();
+        
+        for (const node of members) {
+            const nameLower = node.name.toLowerCase();
+            const nodeKind = toSymbolKind(node.kind);
+            
+            // Check if this kind is allowed (if filter specified)
+            const kindMatch = !kinds || kinds.length === 0 || kinds.includes(nodeKind);
+            
+            // Determine match type
+            const isExact = nameLower === queryLower;
+            const isPrefix = !isExact && nameLower.startsWith(queryLower);
+            const isContains = !isExact && !isPrefix && nameLower.includes(queryLower);
+            
+            if (kindMatch && (isExact || isPrefix || isContains)) {
+                const symbolInfo: SymbolInformation = {
+                    name: node.name,
+                    kind: nodeKind,
+                    containerName: containerName,
+                    location: { uri, range: { start: node.nameStart, end: node.nameEnd } }
+                };
+                
+                if (isExact) {
+                    exactMatches.push(symbolInfo);
+                } else if (isPrefix) {
+                    prefixMatches.push(symbolInfo);
+                } else {
+                    containsMatches.push(symbolInfo);
+                }
+            }
+
+            // Recurse into class members
+            if (node.kind === "ClassDecl") {
+                this.collectSymbolsPrioritized(
+                    uri, query, (node as ClassDeclNode).members,
+                    exactMatches, prefixMatches, containsMatches,
+                    node.name, kinds
+                );
+            }
+
+            // Handle enum members - IMPORTANT: respect kinds filter!
+            // Bug fix: Previously enum members were always returned even when
+            // searching for functions. Now we check the kinds filter.
+            if (node.kind === "EnumDecl") {
+                const enumMemberKindMatch = !kinds || kinds.length === 0 || kinds.includes(SymbolKind.EnumMember);
+                
+                if (enumMemberKindMatch) {
+                    for (const enumerator of (node as EnumDeclNode).members) {
+                        const enumNameLower = enumerator.name.toLowerCase();
+                        const enumExact = enumNameLower === queryLower;
+                        const enumPrefix = !enumExact && enumNameLower.startsWith(queryLower);
+                        const enumContains = !enumExact && !enumPrefix && enumNameLower.includes(queryLower);
+                        
+                        if (enumExact || enumPrefix || enumContains) {
+                            const enumSymbol: SymbolInformation = {
+                                name: enumerator.name,
+                                kind: SymbolKind.EnumMember,
+                                containerName: node.name,
+                                location: { uri, range: { start: enumerator.nameStart, end: enumerator.nameEnd } }
+                            };
+                            
+                            if (enumExact) {
+                                exactMatches.push(enumSymbol);
+                            } else if (enumPrefix) {
+                                prefixMatches.push(enumSymbol);
+                            } else {
+                                containsMatches.push(enumSymbol);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Get workspace symbols with optional kind filtering
+     * Uses three-tier priority: exact > prefix > contains
+     */
+    getWorkspaceSymbols(query: string, kinds?: SymbolKind[]): SymbolInformation[] {
+        const exactMatches: SymbolInformation[] = [];
+        const prefixMatches: SymbolInformation[] = [];
+        const containsMatches: SymbolInformation[] = [];
+        
+        for (const [uri, ast] of this.docCache) {
+            this.collectSymbolsPrioritized(
+                uri, query, ast.body,
+                exactMatches, prefixMatches, containsMatches,
+                undefined, kinds
+            );
+        }
+        
+        // Return in priority order: exact first, then prefix, then contains
+        return [...exactMatches, ...prefixMatches, ...containsMatches];
+    }
+
+    // Legacy method for backwards compatibility
     getInnerWorkspaceSymbols(uri: string, query: string, members: SymbolNodeBase[], containerName?: string): SymbolInformation[] {
         const res: SymbolInformation[] = [];
         for (const node of members) {
@@ -288,27 +1171,708 @@ export class Analyzer {
         return res
     }
 
-    getWorkspaceSymbols(query: string): SymbolInformation[] {
-        const res: SymbolInformation[] = [];
-        for (const [uri, ast] of this.docCache) {
-            res.push(...this.getInnerWorkspaceSymbols(uri, query, ast.body, undefined));
+    // Minimum number of indexed files before running type checks
+    // This prevents false positives during initial indexing
+    private static readonly MIN_INDEX_SIZE_FOR_TYPE_CHECKS = 100;
+
+    runDiagnostics(doc: TextDocument): Diagnostic[] {
+        const ast = this.ensure(doc);
+        const diags: Diagnostic[] = [];
+        
+        // Include parser-generated diagnostics (e.g., ternary operator errors)
+        if (ast.diagnostics && ast.diagnostics.length > 0) {
+            diags.push(...ast.diagnostics);
         }
-        return res;
+        
+        // Only run type/symbol checks if we have enough indexed files
+        // This prevents false positives during initial workspace indexing
+        if (this.docCache.size >= Analyzer.MIN_INDEX_SIZE_FOR_TYPE_CHECKS) {
+            // Check for unknown types and symbols
+            this.checkUnknownSymbols(ast, diags);
+            
+            // Check for type mismatches in assignments
+            this.checkTypeMismatches(doc, diags);
+        }
+        
+        // Check for multi-line statements (not supported in Enforce Script)
+        // This doesn't require indexing - it's purely syntactic
+        this.checkMultiLineStatements(doc, diags);
+        
+        // Check for duplicate variable declarations in same scope
+        // Enforce Script doesn't allow duplicate variable names even in sibling for loops
+        this.checkDuplicateVariables(doc, diags);
+        
+        return diags;
     }
 
-    runDiagnostics(doc: TextDocument) {
-        const ast = this.ensure(doc);
-        const diags = [] as any[];
-        for (const node of (ast.body as any[])) {
-            if (node.kind === 'Typedef') {
-                diags.push({
-                    message: `Typedef '${node.name}' is never used`,
-                    range: { start: doc.positionAt(node.start), end: doc.positionAt(node.end) },
-                    severity: 2
-                });
+    /**
+     * Check for duplicate variable declarations within the same scope.
+     * In Enforce Script, you cannot have two for loops with the same loop variable
+     * at the same scope level, even though they're "separate" blocks.
+     * 
+     * Example that causes error:
+     *   for (int j = 0; j < 10; j++) { }
+     *   for (int j = 0; j < 10; j++) { }  // ERROR: 'j' already declared
+     */
+    private checkDuplicateVariables(doc: TextDocument, diags: Diagnostic[]): void {
+        const text = doc.getText();
+        
+        // Track variables by scope - use a stack of scopes
+        // Each scope has a map of variable names to their declaration info
+        type VarInfo = { line: number; character: number };
+        let scopeStack: Map<string, VarInfo>[] = [new Map()]; // Start with global/class scope
+        
+        // Pattern to find variable declarations
+        // Matches: Type varName in various contexts (including for loop init)
+        const varDeclPattern = /\b(int|float|bool|string|auto|vector|Man|PlayerBase|\w+)\s+(\w+)\s*(?:=|;|,|\)|<)/g;
+        
+        // Pattern to detect function declarations
+        const funcDeclPattern = /\b(void|int|float|bool|string|auto|override\s+\w+|\w+)\s+(\w+)\s*\([^)]*\)\s*\{?\s*$/;
+        
+        // Pattern to detect for/foreach/while loops (their vars go to parent scope in Enforce)
+        const loopPattern = /\b(for|foreach|while)\s*\(/;
+        
+        // Pattern to detect class declarations
+        const classDeclPattern = /\b(?:modded\s+)?class\s+(\w+)/;
+        
+        // Track when we enter/exit functions
+        let inFunction = false;
+        let functionBraceDepth = 0;
+        let braceDepth = 0;
+        
+        // Track class fields - these need to be visible inside methods
+        let classFieldScope: Map<string, VarInfo> = new Map();
+        let inClass = false;
+        let classBraceDepth = 0;
+        
+        // Process line by line to track scope
+        const lines = text.split('\n');
+        
+        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+            const line = lines[lineNum];
+            
+            // Check if this line starts a class
+            if (classDeclPattern.test(line.trim()) && !inClass) {
+                inClass = true;
+                classBraceDepth = braceDepth;
+                classFieldScope = new Map(); // Fresh class field scope
+            }
+            
+            // Check if this line starts a new function
+            if (funcDeclPattern.test(line.trim())) {
+                // New function - reset to: global scope + class fields + new function scope
+                scopeStack = [scopeStack[0], classFieldScope, new Map()];
+                inFunction = true;
+                functionBraceDepth = braceDepth;
+            }
+            
+            // Check if this line has a for/foreach/while loop
+            // In Enforce Script, loop variables are scoped to the PARENT scope, not the loop block
+            const isLoopLine = loopPattern.test(line);
+            
+            // FIRST: Find variable declarations on this line BEFORE processing braces
+            // This ensures for loop variables (int j in "for (int j = 0...") 
+            // are added to the current scope before we push a new scope for {
+            let match;
+            varDeclPattern.lastIndex = 0;
+            
+            while ((match = varDeclPattern.exec(line)) !== null) {
+                const typeName = match[1];
+                const varName = match[2];
+                
+                // Skip if it looks like a function call or keyword
+                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event'].includes(typeName)) {
+                    continue;
+                }
+                
+                // Skip common false positives
+                if (['this', 'super', 'null', 'true', 'false'].includes(varName)) {
+                    continue;
+                }
+                
+                // Check all scopes in the stack for existing declaration
+                let foundDuplicate = false;
+                for (const scope of scopeStack) {
+                    const existing = scope.get(varName);
+                    if (existing) {
+                        const startPos = { line: lineNum, character: match.index + match[1].length + 1 };
+                        const endPos = { line: lineNum, character: match.index + match[1].length + 1 + varName.length };
+                        
+                        diags.push({
+                            message: `Variable '${varName}' is already declared at line ${existing.line + 1}. Enforce Script does not allow duplicate variable names in the same scope.`,
+                            range: { start: startPos, end: endPos },
+                            severity: DiagnosticSeverity.Error
+                        });
+                        foundDuplicate = true;
+                        break;
+                    }
+                }
+                
+                // Record this declaration in the appropriate scope
+                if (!foundDuplicate && scopeStack.length > 0) {
+                    // If we're at class level (in a class but not in a function), record as class field
+                    if (inClass && !inFunction && braceDepth === classBraceDepth + 1) {
+                        classFieldScope.set(varName, {
+                            line: lineNum,
+                            character: match.index
+                        });
+                    }
+                    // Always add to current scope stack
+                    scopeStack[scopeStack.length - 1].set(varName, {
+                        line: lineNum,
+                        character: match.index
+                    });
+                }
+            }
+            
+            // THEN: Process braces AFTER variable declarations
+            // This ensures for loop vars are in parent scope
+            for (let charIdx = 0; charIdx < line.length; charIdx++) {
+                const char = line[charIdx];
+                if (char === '{') {
+                    braceDepth++;
+                    // Push new scope
+                    scopeStack.push(new Map());
+                } else if (char === '}') {
+                    braceDepth--;
+                    // Pop scope
+                    if (scopeStack.length > 1) {
+                        scopeStack.pop();
+                    }
+                    // Check if we exited a function
+                    if (inFunction && braceDepth <= functionBraceDepth) {
+                        inFunction = false;
+                    }
+                    // Check if we exited a class
+                    if (inClass && braceDepth <= classBraceDepth) {
+                        inClass = false;
+                        classFieldScope = new Map();
+                    }
+                }
             }
         }
-        return diags;
+    }
+
+    /**
+     * Type compatibility result
+     */
+    private checkTypeCompatibility(declaredType: string, assignedType: string): {
+        compatible: boolean;
+        isDowncast: boolean;
+        isUpcast: boolean;
+        message?: string;
+    } {
+        // Same type is always compatible
+        if (declaredType === assignedType) {
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // Normalize types (remove ref, autoptr, etc.)
+        const normalizeType = (t: string): string => {
+            return t.replace(/^(ref|autoptr)\s+/, '').trim();
+        };
+        
+        const declNorm = normalizeType(declaredType);
+        const assignNorm = normalizeType(assignedType);
+        
+        if (declNorm === assignNorm) {
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // Primitive type compatibility
+        const numericTypes = new Set(['int', 'float', 'bool']);
+        if (numericTypes.has(declNorm) && numericTypes.has(assignNorm)) {
+            // int/float/bool are compatible with each other (implicit conversion)
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // string is only compatible with string
+        if (declNorm === 'string' || assignNorm === 'string') {
+            if (declNorm !== assignNorm) {
+                return { 
+                    compatible: false, 
+                    isDowncast: false, 
+                    isUpcast: false,
+                    message: `Cannot convert '${assignNorm}' to 'string'`
+                };
+            }
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // void is not compatible with anything
+        if (declNorm === 'void' || assignNorm === 'void') {
+            return { 
+                compatible: false, 
+                isDowncast: false, 
+                isUpcast: false,
+                message: `Cannot assign 'void' to a variable`
+            };
+        }
+        
+        // auto/typename/Class are wildcards
+        if (declNorm === 'auto' || assignNorm === 'auto' ||
+            declNorm === 'typename' || assignNorm === 'typename' ||
+            declNorm === 'Class' || assignNorm === 'Class') {
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // array types - need to check element type compatibility
+        if (declNorm.startsWith('array<') || assignNorm.startsWith('array<')) {
+            const bothArrays = declNorm.startsWith('array') && assignNorm.startsWith('array');
+            return { compatible: bothArrays, isDowncast: false, isUpcast: false };
+        }
+        
+        // Check class hierarchy
+        // UPCAST: Assigning derived (child) to base (parent) - ALWAYS SAFE
+        // Example: Man m = playerBase; where PlayerBase extends Man
+        const assignedHierarchy = this.getClassHierarchyOrdered(assignNorm, new Set());
+        for (const classNode of assignedHierarchy) {
+            if (classNode.name === declNorm) {
+                // declaredType is a parent of assignedType - this is an upcast (safe)
+                return { compatible: true, isDowncast: false, isUpcast: true };
+            }
+        }
+        
+        // DOWNCAST: Assigning base (parent) to derived (child) - REQUIRES CAST
+        // Example: PlayerBase p = man; where Man is parent of PlayerBase
+        // Should use: PlayerBase p = PlayerBase.Cast(man);
+        // Or: Class.CastTo(p, man);
+        const declaredHierarchy = this.getClassHierarchyOrdered(declNorm, new Set());
+        for (const classNode of declaredHierarchy) {
+            if (classNode.name === assignNorm) {
+                // assignedType is a parent of declaredType - this is a downcast (risky)
+                return { 
+                    compatible: true, // Technically compiles but risky
+                    isDowncast: true, 
+                    isUpcast: false,
+                    message: `Unsafe downcast from '${assignNorm}' to '${declNorm}'. Use '${declNorm}.Cast(value)' or 'Class.CastTo(target, value)' instead.`
+                };
+            }
+        }
+        
+        // Check primitive types BEFORE checking if classes exist
+        // Primitives won't be found as classes, so we need to handle them first
+        const primitiveTypes = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
+        const declIsPrimitive = primitiveTypes.has(declNorm);
+        const assignIsPrimitive = primitiveTypes.has(assignNorm);
+        
+        // Primitive vs class (or vice versa) is never compatible
+        if (declIsPrimitive !== assignIsPrimitive) {
+            return { 
+                compatible: false, 
+                isDowncast: false, 
+                isUpcast: false,
+                message: `Cannot assign '${assignNorm}' to '${declNorm}'`
+            };
+        }
+        
+        // If both are primitives but different (and not numeric), they're not compatible
+        // Note: numeric types (int/float/bool) were already handled above
+        if (declIsPrimitive && assignIsPrimitive && declNorm !== assignNorm) {
+            return { 
+                compatible: false, 
+                isDowncast: false, 
+                isUpcast: false,
+                message: `Cannot assign '${assignNorm}' to '${declNorm}'`
+            };
+        }
+        
+        // If we can't determine the types (not in cache), assume compatible
+        const declExists = this.findAllClassesByName(declNorm).length > 0;
+        const assignExists = this.findAllClassesByName(assignNorm).length > 0;
+        
+        if (!declExists || !assignExists) {
+            return { compatible: true, isDowncast: false, isUpcast: false }; // Unknown types
+        }
+        
+        // No compatibility found - types are unrelated
+        return { 
+            compatible: false, 
+            isDowncast: false, 
+            isUpcast: false,
+            message: `Cannot assign '${assignNorm}' to '${declNorm}' - types are not related`
+        };
+    }
+
+    /**
+     * Check for type mismatches in variable assignments
+     * Checks both:
+     * - Declaration with init: Type varName = FunctionCall();
+     * - Re-assignment: varName = otherVar;
+     */
+    private checkTypeMismatches(doc: TextDocument, diags: Diagnostic[]): void {
+        const text = doc.getText();
+        const ast = this.ensure(doc);
+        
+        // Build a map of variable names to their types from the AST
+        const variableTypes = new Map<string, string>();
+        
+        // Collect types from all declarations in this file
+        const collectVarTypes = (nodes: any[], scope?: string) => {
+            for (const node of nodes) {
+                if (node.kind === 'VarDecl' && node.name && node.type?.identifier) {
+                    variableTypes.set(node.name, node.type.identifier);
+                }
+                if (node.kind === 'FunctionDecl') {
+                    // Collect parameters
+                    for (const param of node.parameters || []) {
+                        if (param.name && param.type?.identifier) {
+                            variableTypes.set(param.name, param.type.identifier);
+                        }
+                    }
+                    // Collect locals
+                    for (const local of node.locals || []) {
+                        if (local.name && local.type?.identifier) {
+                            variableTypes.set(local.name, local.type.identifier);
+                        }
+                    }
+                }
+                if (node.kind === 'ClassDecl') {
+                    // Collect class fields
+                    for (const member of node.members || []) {
+                        if (member.kind === 'VarDecl' && member.name && member.type?.identifier) {
+                            variableTypes.set(member.name, member.type.identifier);
+                        }
+                    }
+                }
+            }
+        };
+        
+        collectVarTypes(ast.body);
+        
+        // Also scan the raw text for variable declarations to catch any the AST missed
+        // Pattern: Type varName; or Type varName = ...
+        const varDeclScanPattern = /\b(\w+)\s+(\w+)\s*(?:=|;)/g;
+        let scanMatch;
+        while ((scanMatch = varDeclScanPattern.exec(text)) !== null) {
+            const typeName = scanMatch[1];
+            const varName = scanMatch[2];
+            // Skip keywords
+            if (!['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr'].includes(typeName)) {
+                // Only add if not already in map (AST takes precedence)
+                if (!variableTypes.has(varName)) {
+                    variableTypes.set(varName, typeName);
+                }
+            }
+        }
+        
+        // Pattern 1: Type varName = FunctionCall();
+        // e.g., int i = GetGame();
+        const funcAssignPattern = /\b(\w+)\s+(\w+)\s*=\s*(\w+)\s*\(/g;
+        
+        let match;
+        while ((match = funcAssignPattern.exec(text)) !== null) {
+            const declaredType = match[1];
+            const varName = match[2];
+            const funcName = match[3];
+            
+            // Skip if declared type is a keyword that's not a type
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum'].includes(declaredType)) {
+                continue;
+            }
+            
+            // Get the return type of the function
+            const returnType = this.resolveFunctionReturnType(funcName);
+            
+            if (returnType) {
+                this.addTypeMismatchDiagnostic(doc, diags, match.index, match[0].length, declaredType, returnType);
+            }
+        }
+        
+        // Pattern 2: Type varName = otherVar;
+        // e.g., int i = p; where p is PlayerBase
+        const varDeclAssignPattern = /\b(\w+)\s+(\w+)\s*=\s*(\w+)\s*;/g;
+        
+        while ((match = varDeclAssignPattern.exec(text)) !== null) {
+            const declaredType = match[1];
+            const varName = match[2];
+            const sourceVar = match[3];
+            
+            // Skip if declared type is a keyword
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else'].includes(declaredType)) {
+                continue;
+            }
+            
+            // Skip if source looks like a literal (number, true, false, null)
+            if (/^\d+$/.test(sourceVar) || ['true', 'false', 'null', 'NULL'].includes(sourceVar)) {
+                continue;
+            }
+            
+            // Look up the type of the source variable
+            const sourceType = variableTypes.get(sourceVar);
+            
+            if (sourceType) {
+                this.addTypeMismatchDiagnostic(doc, diags, match.index, match[0].length, declaredType, sourceType);
+            }
+        }
+        
+        // Pattern 3: varName = otherVar; (re-assignment, not declaration)
+        // Must ensure there's no type before the targetVar
+        const reassignPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*;/g;
+        
+        while ((match = reassignPattern.exec(text)) !== null) {
+            const leadingWhitespace = match[1];
+            const targetVar = match[2];
+            const sourceVar = match[3];
+            
+            // Skip keywords
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) {
+                continue;
+            }
+            
+            // Skip literals
+            if (/^\d+$/.test(sourceVar) || ['true', 'false', 'null', 'NULL'].includes(sourceVar)) {
+                continue;
+            }
+            
+            // Look up types for both variables
+            const targetType = variableTypes.get(targetVar);
+            const sourceType = variableTypes.get(sourceVar);
+            
+            if (targetType && sourceType) {
+                // Calculate actual start position (skip the leading delimiter and whitespace)
+                const actualStart = match.index + 1 + leadingWhitespace.length;
+                const actualLength = match[0].length - 1 - leadingWhitespace.length;
+                this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, sourceType);
+            }
+        }
+        
+        // Pattern 4: varName = FunctionCall(); (re-assignment with function call)
+        // e.g., i = GetGame(); where i is declared as int earlier
+        const reassignFuncPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*\(/g;
+        
+        while ((match = reassignFuncPattern.exec(text)) !== null) {
+            const leadingWhitespace = match[1];
+            const targetVar = match[2];
+            const funcName = match[3];
+            
+            // Skip keywords
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) {
+                continue;
+            }
+            
+            // Look up type of target variable and return type of function
+            const targetType = variableTypes.get(targetVar);
+            const returnType = this.resolveFunctionReturnType(funcName);
+            
+            if (targetType && returnType) {
+                // Calculate actual start position (skip the leading delimiter and whitespace)
+                const actualStart = match.index + 1 + leadingWhitespace.length;
+                const actualLength = match[0].length - 1 - leadingWhitespace.length;
+                this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, returnType);
+            }
+        }
+    }
+
+    /**
+     * Helper to add a type mismatch diagnostic if needed
+     */
+    private addTypeMismatchDiagnostic(
+        doc: TextDocument, 
+        diags: Diagnostic[], 
+        matchIndex: number, 
+        matchLength: number, 
+        targetType: string, 
+        sourceType: string
+    ): void {
+        const result = this.checkTypeCompatibility(targetType, sourceType);
+        
+        const startPos = doc.positionAt(matchIndex);
+        const endPos = doc.positionAt(matchIndex + matchLength);
+        
+        if (!result.compatible) {
+            // Type error - incompatible types
+            diags.push({
+                message: result.message || `Type mismatch: cannot assign '${sourceType}' to '${targetType}'`,
+                range: { start: startPos, end: endPos },
+                severity: DiagnosticSeverity.Error
+            });
+        } else if (result.isDowncast) {
+            // Warning - unsafe downcast
+            diags.push({
+                message: result.message || `Unsafe downcast from '${sourceType}' to '${targetType}'. Use '${targetType}.Cast(value)' or 'Class.CastTo(target, value)' instead.`,
+                range: { start: startPos, end: endPos },
+                severity: DiagnosticSeverity.Warning
+            });
+        }
+        // Upcast is fine - no warning needed
+    }
+
+    /**
+     * Check for multi-line statements which are NOT supported in Enforce Script.
+     * Each statement must be on a single line.
+     * 
+     * Detects patterns like:
+     *   Print("text" +
+     *       "more text");  // ERROR!
+     */
+    private checkMultiLineStatements(doc: TextDocument, diags: Diagnostic[]): void {
+        const text = doc.getText();
+        const lines = text.split('\n');
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Skip empty lines and comments
+            if (!line || line.startsWith('//')) continue;
+            
+            // Check if line ends with a continuation operator or unclosed construct
+            // These indicate a multi-line statement which is not allowed
+            
+            // Pattern 1: Line ends with binary operator (excluding comment lines)
+            // e.g., "text" +    or   a &&   or   b ||
+            const endsWithOperator = /[+\-*\/&|<>=!,]\s*$/.test(line) && !line.startsWith('//');
+            
+            // Pattern 2: Unclosed parenthesis (more ( than ))
+            const openParens = (line.match(/\(/g) || []).length;
+            const closeParens = (line.match(/\)/g) || []).length;
+            const unclosedParens = openParens > closeParens;
+            
+            // Pattern 3: Unclosed brackets
+            const openBrackets = (line.match(/\[/g) || []).length;
+            const closeBrackets = (line.match(/\]/g) || []).length;
+            const unclosedBrackets = openBrackets > closeBrackets;
+            
+            // Exclude lines that are valid multi-line constructs
+            // - Function/class declarations with { at end
+            // - Control flow with { at end
+            // - Lines ending with { or ; are fine
+            const endsWithBraceOrSemi = /[{};]\s*$/.test(line);
+            const isDeclarationStart = /^(class|enum|if|else|for|while|switch|foreach)\b/.test(line);
+            
+            // Report error if this looks like a multi-line statement
+            if ((endsWithOperator || unclosedParens || unclosedBrackets) && 
+                !endsWithBraceOrSemi && 
+                !isDeclarationStart &&
+                !line.endsWith('{') &&
+                i + 1 < lines.length) {
+                
+                // Check if next non-empty line continues this statement
+                let nextLineIdx = i + 1;
+                while (nextLineIdx < lines.length && !lines[nextLineIdx].trim()) {
+                    nextLineIdx++;
+                }
+                
+                if (nextLineIdx < lines.length) {
+                    const nextLine = lines[nextLineIdx].trim();
+                    // If next line doesn't start with { and isn't empty, it's a continuation
+                    if (nextLine && !nextLine.startsWith('{') && !nextLine.startsWith('//')) {
+                        diags.push({
+                            message: 'Multi-line statements are not supported in Enforce Script. Each statement must be on a single line.',
+                            range: {
+                                start: { line: i, character: 0 },
+                                end: { line: i, character: lines[i].length }
+                            },
+                            severity: DiagnosticSeverity.Error
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Check for unknown/undefined symbols in the AST
+     * Generates warnings for:
+     * - Unknown type names in variable declarations
+     * - Unknown base classes
+     * - Unknown function return types
+     */
+    private checkUnknownSymbols(ast: File, diags: Diagnostic[]): void {
+        // Only truly primitive/language types that aren't defined in any file
+        // Everything else should come from indexed files in P:\scripts
+        const primitives = new Set([
+            'void', 'int', 'float', 'bool', 'string', 'vector', 'typename',
+            'Class', 'auto', 'array', 'set', 'map', 'ref', 'autoptr', 
+            'proto', 'private', 'protected', 'static', 'const', 'owned',
+            'out', 'inout', 'notnull', 'modded', 'sealed', 'event', 'native'
+        ]);
+        
+        // Require a significant index before flagging unknown types
+        // This helps avoid false positives during initial indexing
+        // and for types wrapped in #ifdef that we can't see
+        const MIN_FILES_FOR_UNKNOWN_TYPE_CHECK = 500;
+        if (this.docCache.size < MIN_FILES_FOR_UNKNOWN_TYPE_CHECK) {
+            return; // Not enough files indexed to be confident
+        }
+        
+        // Check if a type exists
+        const typeExists = (typeName: string): boolean => {
+            if (!typeName) return true;
+            if (primitives.has(typeName)) return true;
+            
+            // Check for class, enum, or typedef with this name
+            for (const [uri, fileAst] of this.docCache) {
+                for (const node of fileAst.body) {
+                    if (node.name === typeName) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        
+        // Check a type node for unknown types
+        const checkType = (type: TypeNode | undefined): void => {
+            if (!type) return;
+            
+            if (!typeExists(type.identifier)) {
+                diags.push({
+                    message: `Unknown type '${type.identifier}'`,
+                    range: { start: type.start, end: type.end },
+                    severity: DiagnosticSeverity.Warning
+                });
+            }
+            
+            // Check generic arguments too
+            for (const arg of type.genericArgs || []) {
+                checkType(arg);
+            }
+        };
+        
+        // Walk the AST
+        for (const node of ast.body) {
+            // Check class declarations
+            if (node.kind === 'ClassDecl') {
+                const classNode = node as ClassDeclNode;
+                
+                // Check base class exists
+                if (classNode.base && !typeExists(classNode.base.identifier)) {
+                    diags.push({
+                        message: `Unknown base class '${classNode.base.identifier}'`,
+                        range: { start: classNode.base.start, end: classNode.base.end },
+                        severity: DiagnosticSeverity.Warning
+                    });
+                }
+                
+                // Check class members
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'VarDecl') {
+                        checkType((member as VarDeclNode).type);
+                    } else if (member.kind === 'FunctionDecl') {
+                        const func = member as FunctionDeclNode;
+                        checkType(func.returnType);
+                        for (const param of func.parameters || []) {
+                            checkType(param.type);
+                        }
+                    }
+                }
+            }
+            
+            // Check top-level variable declarations
+            if (node.kind === 'VarDecl') {
+                checkType((node as VarDeclNode).type);
+            }
+            
+            // Check top-level function declarations
+            if (node.kind === 'FunctionDecl') {
+                const func = node as FunctionDeclNode;
+                checkType(func.returnType);
+                for (const param of func.parameters || []) {
+                    checkType(param.type);
+                }
+            }
+        }
     }
 
     private toSymbolKindName(kind: string): SymbolEntry['kind'] {

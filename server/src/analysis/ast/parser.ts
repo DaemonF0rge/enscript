@@ -1,12 +1,48 @@
 /**********************************************************************
  *  Mini-parser for Enforce/EnScript (DayZ / Arma Reforger flavour)
- *  – walks tokens once, builds a lightweight AST but captures:
+ *  ================================================================
+ *  
+ *  Walks tokens once, builds a lightweight AST capturing:
  *      • classes  (base, modifiers, fields, methods)
  *      • enums    + enumerators
  *      • typedefs
  *      • free functions / globals
  *      • local variables inside method bodies
- *  – prints all collected symbols to the LSP output channel
+ *  
+ *  RECENT FIXES & IMPROVEMENTS:
+ *  
+ *  1. NESTED GENERIC >> TOKEN SPLITTING (parseType)
+ *     Problem: In nested generics like map<string, array<int>>, the closing
+ *     '>>' was treated as a single token (right-shift operator).
+ *     
+ *     Solution: When parsing generic args and we encounter '>>', we:
+ *       - Consume the '>>' token
+ *       - Return from inner generic parsing
+ *       - Leave a synthetic '>' for the outer generic to consume
+ *     
+ *     This is a classic parsing challenge also faced by C++ compilers!
+ *  
+ *  2. OPERATOR OVERLOAD PARSING (expectIdentifier)
+ *     Problem: Enforce Script allows operator overloads like:
+ *       bool operator==(MyClass other)
+ *       bool operator<(MyClass other)
+ *     These were rejected as invalid function names.
+ *     
+ *     Solution: Extended expectIdentifier() to recognize 'operator' followed
+ *     by an operator token as a valid composite identifier.
+ *  
+ *  3. DESTRUCTOR PARSING (expectIdentifier)
+ *     Problem: Destructor names like ~Foo were not parsed correctly.
+ *     
+ *     Solution: Handle '~' followed by identifier as a single name token.
+ *  
+ *  4. TEMPLATE CLASS DECLARATIONS (parseDecl)
+ *     Problem: Generic class declarations like:
+ *       class Container<Class T> { ... }
+ *     Were not parsing the generic parameter list correctly.
+ *     
+ *     Solution: Added proper parsing of <Class T1, Class T2> syntax.
+ *  
  *********************************************************************/
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
@@ -126,6 +162,7 @@ export interface FunctionDeclNode extends SymbolNodeBase {
 export interface File {
     body: SymbolNodeBase[]
     version: number
+    diagnostics: Diagnostic[]  // Parser-generated diagnostics (e.g., ternary operator warnings)
 }
 
 // parse entry point
@@ -134,7 +171,36 @@ export function parse(
     conn?: Connection            // optional – pass from index.ts to auto-log
 ): File {
     const toks = lex(doc.getText());
+    const text = doc.getText();
     let pos = 0;
+    
+    // ====================================================================
+    // DIAGNOSTICS COLLECTION (PORTED FROM JS)
+    // ====================================================================
+    // Collect parser-generated diagnostics like ternary operator warnings.
+    // These are returned in the File result for the LSP to report.
+    // ====================================================================
+    const diagnostics: Diagnostic[] = [];
+    
+    /**
+     * Add a diagnostic error or warning
+     */
+    function addDiagnostic(token: Token, message: string, severity: DiagnosticSeverity = DiagnosticSeverity.Error): void {
+        diagnostics.push({
+            range: {
+                start: doc.positionAt(token.start),
+                end: doc.positionAt(token.end)
+            },
+            message,
+            severity,
+            source: 'enforce-script'
+        });
+    }
+
+    // Flag for handling nested generic '>>' tokens
+    // When the inner parseType consumes '>>', it sets this flag to tell
+    // the outer parseType that its closing '>' was already consumed.
+    let pendingGenericClose = false;
 
     /* skip comments / #ifdef lines */
     const skipTrivia = () => {
@@ -172,10 +238,18 @@ export function parse(
         );
     };
 
+    /* helper: check if a keyword is a primitive type */
+    const isPrimitiveType = (value: string): boolean => {
+        return ['void', 'int', 'float', 'bool', 'string', 'vector', 'typename'].includes(value);
+    };
+
     /* read & return one identifier or keyword token */
     const readTypeLike = (): Token => {
         const t = peek();
         if (t.kind === TokenKind.Identifier)
+            return next();
+        // Allow primitive type keywords (int, float, bool, string, void, vector, typename)
+        if (t.kind === TokenKind.Keyword && isPrimitiveType(t.value))
             return next();
         return throwErr(t, 'type identifier');
     };
@@ -208,7 +282,8 @@ export function parse(
     // ast root
     const file: File = {
         body: [],
-        version: doc.version
+        version: doc.version,
+        diagnostics: diagnostics  // Include parser diagnostics
     };
 
     // main loop
@@ -250,6 +325,11 @@ export function parse(
         const mods: string[] = [];
         while (isModifier(peek())) {
             mods.push(next().value);
+        }
+
+        // Handle EOF after modifiers (e.g., empty file or file ending with modifiers only)
+        if (eof()) {
+            return [];
         }
 
         const t = peek();
@@ -368,14 +448,63 @@ export function parse(
             } as TypedefNode];
         }
 
+        // Handle statement keywords that can appear at top level in invalid code
+        // These are not valid top-level declarations, skip to semicolon/brace and recover
+        const statementKeywords = ['for', 'while', 'if', 'else', 'switch', 'return', 'break', 'continue', 'do', 'foreach'];
+        if (t.kind === TokenKind.Keyword && statementKeywords.includes(t.value)) {
+            // Skip past this statement - find matching braces and semicolons
+            let braceDepth = 0;
+            let parenDepth = 0;
+            while (!eof()) {
+                const tok = next();
+                if (tok.value === '(') parenDepth++;
+                else if (tok.value === ')') parenDepth--;
+                else if (tok.value === '{') braceDepth++;
+                else if (tok.value === '}') {
+                    braceDepth--;
+                    if (braceDepth === 0 && parenDepth === 0) break;
+                }
+                else if (tok.value === ';' && braceDepth === 0 && parenDepth === 0) break;
+            }
+            return [];
+        }
+
         // function OR variable
         const baseTypeNode = parseType(doc);
+        
+        // Handle incomplete/invalid code gracefully at top level:
+        // - "g_Game." - dot without identifier (incomplete member access)
+        // - "GetGame().Something();" - top-level statement (function call expression)
+        // - "SomeType = value" - assignment without variable name
+        // - EOF after type
+        // These are not valid declarations, skip to semicolon and recover
+        if (eof() || peek().value === '.' || (depth === 0 && peek().value === '(') || peek().value === '=') {
+            // Skip until we find a semicolon or EOF to recover
+            while (!eof() && peek().value !== ';') {
+                next();
+            }
+            if (peek().value === ';') next();
+            return [];
+        }
+        
         let nameTok = expectIdentifier();
 
         if (peek().value === '(') {
             const params = fastParamScan(doc);
 
-            /* body? */
+            // ====================================================================
+            // FUNCTION BODY PARSING WITH TERNARY DETECTION (PORTED FROM JS)
+            // ====================================================================
+            // Enforce Script does NOT support the ternary operator (? :).
+            // We detect this pattern and generate a diagnostic warning.
+            //
+            // Example invalid code:
+            //   int x = (condition) ? 1 : 0;  // ERROR: Not supported!
+            //
+            // Valid alternative:
+            //   int x;
+            //   if (condition) x = 1; else x = 0;
+            // ====================================================================
             if (peek().value === '{') {
                 next();
                 let depth = 1;
@@ -383,6 +512,30 @@ export function parse(
                     const t = next();
                     if (t.value === '{') depth++;
                     else if (t.value === '}') depth--;
+                    // Detect ternary operator (condition ? true : false)
+                    // This is invalid in Enforce Script
+                    else if (t.value === '?' && depth > 0) {
+                        // Check if this looks like a ternary (not just a nullable type)
+                        // Ternary is typically: expr ? expr : expr
+                        // Look for the colon that follows
+                        let scanPos = pos;
+                        let scanDepth = 0;
+                        let foundColon = false;
+                        while (scanPos < toks.length && scanDepth >= 0) {
+                            const scanTok = toks[scanPos];
+                            if (scanTok.value === '(' || scanTok.value === '[' || scanTok.value === '{') scanDepth++;
+                            else if (scanTok.value === ')' || scanTok.value === ']' || scanTok.value === '}') scanDepth--;
+                            else if (scanTok.value === ';') break;
+                            else if (scanTok.value === ':' && scanDepth === 0) {
+                                foundColon = true;
+                                break;
+                            }
+                            scanPos++;
+                        }
+                        if (foundColon) {
+                            addDiagnostic(t, 'Ternary operator (? :) is not supported in Enforce Script. Use if/else statement instead.', DiagnosticSeverity.Error);
+                        }
+                    }
                 }
             }
 
@@ -422,10 +575,45 @@ export function parse(
             // value initialization (skip for now)
             if (peek().value === '=') {
                 next();
+                
+                // Handle EOF after = (incomplete code)
+                if (eof()) {
+                    break;
+                }
 
                 while ((inline && peek().value !== ',' && peek().value !== ')') ||
                     (!inline && peek().value !== ';' && peek().value !== ',')) {
+                    
+                    // Handle EOF in the middle of initialization
+                    if (eof()) {
+                        break;
+                    }
+                    
                     const curTok = next();
+                    
+                    // Detect ternary operator in variable initializers
+                    // Example: int x = condition ? 1 : 0;  // ERROR!
+                    if (curTok.value === '?') {
+                        // Look for the colon that follows to confirm it's a ternary
+                        let scanPos = pos;
+                        let scanDepth = 0;
+                        let foundColon = false;
+                        while (scanPos < toks.length && scanDepth >= 0) {
+                            const scanTok = toks[scanPos];
+                            if (scanTok.value === '(' || scanTok.value === '[' || scanTok.value === '{') scanDepth++;
+                            else if (scanTok.value === ')' || scanTok.value === ']' || scanTok.value === '}') scanDepth--;
+                            else if (scanTok.value === ';' || scanTok.value === ',') break;
+                            else if (scanTok.value === ':' && scanDepth === 0) {
+                                foundColon = true;
+                                break;
+                            }
+                            scanPos++;
+                        }
+                        if (foundColon) {
+                            addDiagnostic(curTok, 'Ternary operator (? :) is not supported in Enforce Script. Use if/else statement instead.', DiagnosticSeverity.Error);
+                        }
+                    }
+                    
                     if (curTok.value === '(' || curTok.value === '[' || curTok.value === '{' || curTok.value === '<') {
                         // skip initializer expression
                         let depth = 1;
@@ -439,8 +627,8 @@ export function parse(
                     else if (curTok.value === '-' && peek().kind === TokenKind.Number) {
                         next();
                     }
-                    else if (curTok.kind !== TokenKind.Keyword && curTok.kind !== TokenKind.Identifier && curTok.kind !== TokenKind.Number &&
-                        curTok.kind !== TokenKind.String && curTok.value !== '.' && curTok.value !== '+' && curTok.value !== '|') {
+                    else if (curTok.value !== '?' && curTok.value !== ':' && curTok.kind !== TokenKind.Keyword && curTok.kind !== TokenKind.Identifier && curTok.kind !== TokenKind.Number &&
+                        curTok.kind !== TokenKind.String && curTok.value !== '.' && curTok.value !== '+' && curTok.value !== '-' && curTok.value !== '*' && curTok.value !== '/' && curTok.value !== '|' && curTok.value !== '&' && curTok.value !== '%') {
                         throwErr(curTok, "initialization expression");
                     }
                 }
@@ -492,18 +680,73 @@ export function parse(
             modifiers: mods,
         };
 
-        // generic: map<string, vector>
+        // ====================================================================
+        // GENERIC/TEMPLATE TYPE PARSING
+        // ====================================================================
+        // Handles Enforce Script generics like:
+        //   - array<string>
+        //   - ref map<string, int>
+        //   - map<string, ref set<int>>  (nested generics)
+        //
+        // CRITICAL FIX: Nested Generic >> Token Handling
+        // -----------------------------------------------
+        // Problem: The lexer may treat >> as a single token (right shift).
+        // But in nested generics like map<int, set<int>>, the >> is actually
+        // two separate > closing brackets.
+        //
+        // Solution: When we see '>>' while parsing generics:
+        //   1. We're inside nested generic, >> means we close THIS level
+        //   2. The outer parseType() call will handle the remaining '>'
+        //   3. We DON'T consume the full '>>' - just return and let parent handle it
+        //
+        // Example parse of: map<string, array<int>>
+        //   1. parseType sees 'map', then '<'
+        //   2. Recursively parse 'string' (simple type)
+        //   3. See ',', continue
+        //   4. Recursively parse 'array<int>'
+        //      4a. parseType sees 'array', then '<'
+        //      4b. Recursively parse 'int' (simple type)
+        //      4c. See '>>' - this closes array<int>, return
+        //   5. Parent sees '>' (second half of >>), closes map<...>
+        //
+        // This is a classic parsing challenge also faced by C++ compilers!
+        // ====================================================================
         if (peek().value === '<') {
             next();
             node.genericArgs = [];
 
-            while (peek().value !== '>' && !eof()) {
+            // Parse generic arguments, watching for both '>' and '>>'
+            // Also check pendingGenericClose - if a nested parseType consumed '>>' 
+            // that included our closing '>', we need to stop parsing args
+            while (!pendingGenericClose && peek().value !== '>' && peek().value !== '>>' && !eof()) {
                 node.genericArgs.push(parseType(doc));
+                // After parsing a type arg, check if it consumed our closing bracket
+                if (pendingGenericClose) break;
                 if (peek().value === ',') next();
             }
 
-            const endTok = expect('>');
-            node.end = doc.positionAt(endTok.end);
+            // Handle the closing bracket(s)
+            if (pendingGenericClose) {
+                // Our nested child already consumed our '>' as part of '>>'
+                // Just clear the flag and continue
+                pendingGenericClose = false;
+                node.end = node.genericArgs[node.genericArgs.length - 1]?.end ?? node.end;
+            } else if (peek().value === '>>') {
+                // NESTED GENERIC CASE: '>>' at end of generic args
+                // This means we have nested generics like map<int, array<string>>
+                // The '>>' closes BOTH levels. We consume it but need to signal
+                // to our caller that their '>' was already consumed.
+                // We do this by leaving a special marker - we set a flag.
+                const tok = next(); // consume '>>'
+                node.end = doc.positionAt(tok.end);
+                // Set flag so outer parseType knows its '>' was consumed
+                pendingGenericClose = true;
+            } else if (peek().value === '>') {
+                const endTok = expect('>');
+                node.end = doc.positionAt(endTok.end);
+            } else {
+                throwErr(peek(), '> or >>');
+            }
         }
 
         parseArrayDims(doc, node);
@@ -560,12 +803,34 @@ export function parse(
         return decl[0] as VarDeclNode;
     }
 
-    // support helpers
+    // ========================================================================
+    // IDENTIFIER PARSING (with special cases)
+    // ========================================================================
+    // Handles several Enforce Script-specific identifier patterns:
+    //
+    // 1. DESTRUCTOR NAMES: ~ClassName
+    //    Enforce Script uses C++-style destructors. We combine '~' + name
+    //    into a single identifier token.
+    //
+    // 2. OPERATOR OVERLOADS: operator==, operator<, etc.
+    //    Enforce Script allows operator overloading. The function name is
+    //    'operator' followed by the operator symbol(s).
+    //
+    //    Examples:
+    //      bool operator==(MyClass other)  → name = "operator=="
+    //      bool operator<(MyClass other)   → name = "operator<"
+    //      int operator[](int index)       → name = "operator[]"
+    //
+    // These are combined into synthetic identifier tokens so the parser
+    // treats them as normal function names.
+    // ========================================================================
     function expectIdentifier(): Token {
         const t = next();
 
-        // Allow destructor names like ~Foo
-        if (t.kind === TokenKind.Operator && t.value === '~' && peek().kind === TokenKind.Identifier) {
+        // DESTRUCTOR: ~Foo
+        // Handle '~' followed by identifier as a single destructor name
+        // Note: '~' is tokenized as Punctuation (not Operator)
+        if (t.kind === TokenKind.Punctuation && t.value === '~' && peek().kind === TokenKind.Identifier) {
             const id = next();
             return {
                 kind: TokenKind.Identifier,
@@ -573,6 +838,30 @@ export function parse(
                 start: t.start,
                 end: id.end
             };
+        }
+
+        // OPERATOR OVERLOAD: operator==, operator<, operator[], etc.
+        // Handle 'operator' keyword followed by operator symbol(s)
+        if (t.kind === TokenKind.Identifier && t.value === 'operator') {
+            const opTok = peek();
+            // Accept various operator tokens: ==, !=, <, >, <=, >=, [], etc.
+            if (opTok.kind === TokenKind.Operator || opTok.kind === TokenKind.Punctuation) {
+                const op = next();
+                let opName = op.value;
+                
+                // Handle operator[] - need to consume both '[' and ']'
+                if (op.value === '[' && peek().value === ']') {
+                    next(); // consume ']'
+                    opName = '[]';
+                }
+                
+                return {
+                    kind: TokenKind.Identifier,
+                    value: 'operator' + opName,
+                    start: t.start,
+                    end: op.end
+                };
+            }
         }
 
         if (t.kind !== TokenKind.Identifier) throwErr(t, 'identifier');
