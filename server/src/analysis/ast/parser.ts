@@ -71,7 +71,7 @@ export class ParseError extends Error {
 }
 
 // config tables
-const modifiers = new Set(['override', 'proto', 'native', 'modded', 'owned', 'ref', 'reference', 'public', 'private', 'protected', 'static', 'const', 'out', 'inout', 'notnull', 'external', 'volatile', 'local', 'autoptr', 'event']);
+const modifiers = new Set(['override', 'proto', 'native', 'modded', 'owned', 'ref', 'reference', 'public', 'private', 'protected', 'static', 'const', 'out', 'inout', 'notnull', 'external', 'volatile', 'local', 'autoptr', 'event', 'sealed', 'abstract', 'final']);
 
 const isModifier = (t: Token) =>
     t.kind === TokenKind.Keyword && modifiers.has(t.value);
@@ -300,16 +300,6 @@ export function parse(
         file.body.push(...nodes);
     }
 
-    /* pretty-log for debugging */
-    console.info(
-        `parsed ${file.body.length} top-level symbols from ${doc.uri}`
-    );
-    file.body.forEach((n) =>
-        console.info(
-            `  • ${n.kind}  ${'name' in n ? (n as any).name : ''}`
-        )
-    );
-
     return file;
 
     // declaration parser (recursive)
@@ -329,6 +319,12 @@ export function parse(
 
         // Handle EOF after modifiers (e.g., empty file or file ending with modifiers only)
         if (eof()) {
+            return [];
+        }
+
+        // Handle standalone annotations with no declaration: [Obsolete("...")]; 
+        if (annotations.length > 0 && peek().value === ';') {
+            next(); // consume the semicolon
             return [];
         }
 
@@ -628,7 +624,7 @@ export function parse(
                         next();
                     }
                     else if (curTok.value !== '?' && curTok.value !== ':' && curTok.kind !== TokenKind.Keyword && curTok.kind !== TokenKind.Identifier && curTok.kind !== TokenKind.Number &&
-                        curTok.kind !== TokenKind.String && curTok.value !== '.' && curTok.value !== '+' && curTok.value !== '-' && curTok.value !== '*' && curTok.value !== '/' && curTok.value !== '|' && curTok.value !== '&' && curTok.value !== '%') {
+                        curTok.kind !== TokenKind.String && curTok.value !== '.' && curTok.value !== '+' && curTok.value !== '-' && curTok.value !== '*' && curTok.value !== '/' && curTok.value !== '|' && curTok.value !== '&' && curTok.value !== '%' && curTok.value !== '~' && curTok.value !== '!' && curTok.value !== '^' && curTok.value !== '<<' && curTok.value !== '>>' && curTok.value !== '==' && curTok.value !== '!=' && curTok.value !== '<=' && curTok.value !== '>=' && curTok.value !== '<' && curTok.value !== '>') {
                         throwErr(curTok, "initialization expression");
                     }
                 }
@@ -842,10 +838,17 @@ export function parse(
 
         // OPERATOR OVERLOAD: operator==, operator<, operator[], etc.
         // Handle 'operator' keyword followed by operator symbol(s)
+        // NOTE: 'operator' is also used as a regular variable/parameter name
+        // in DayZ scripts (e.g., `int operator`), so we must only match
+        // actual operator symbols, not delimiters like ) , ; { }
         if (t.kind === TokenKind.Identifier && t.value === 'operator') {
             const opTok = peek();
-            // Accept various operator tokens: ==, !=, <, >, <=, >=, [], etc.
-            if (opTok.kind === TokenKind.Operator || opTok.kind === TokenKind.Punctuation) {
+            const validOpOverloads = new Set([
+                '==', '!=', '<=', '>=', '<<', '>>',
+                '<', '>', '+', '-', '*', '/', '%',
+                '&', '|', '^', '~', '!', '[',
+            ]);
+            if (validOpOverloads.has(opTok.value)) {
                 const op = next();
                 let opName = op.value;
                 
@@ -864,7 +867,14 @@ export function parse(
             }
         }
 
-        if (t.kind !== TokenKind.Identifier) throwErr(t, 'identifier');
+        if (t.kind !== TokenKind.Identifier) {
+            // Allow type-keywords as identifiers (e.g., class string, class int)
+            // These are valid class/variable names in Enforce Script (defined in enconvert.c, enstring.c)
+            if (t.kind === TokenKind.Keyword && isPrimitiveType(t.value)) {
+                return { ...t, kind: TokenKind.Identifier };
+            }
+            throwErr(t, 'identifier');
+        }
         return t;
     }
 

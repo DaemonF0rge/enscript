@@ -273,7 +273,6 @@ export class Analyzer {
             const hasParens = !!dotMatch[2]; // true if it's a function call like GetGame()
             const prefix = dotMatch[3] || '';
             
-            console.info(`Completion: matched "${name}" hasParens=${hasParens} prefix="${prefix}"`);
             
             // Handle 'this' keyword
             if (name === 'this') {
@@ -304,7 +303,9 @@ export class Analyzer {
             
             if (varType) {
                 // Get methods/fields for this type (including inherited)
-                return this.getClassMemberCompletions(varType, prefix);
+                const members = this.getClassMemberCompletions(varType, prefix);
+                return members;
+            } else {
             }
             
             // If name looks like a class name (starts with uppercase), 
@@ -440,12 +441,10 @@ export class Analyzer {
     };
 
     private resolveVariableType(doc: TextDocument, pos: Position, varName: string): string | null {
-        console.info(`resolveVariableType: looking for "${varName}"`);
         
         // Check for known variable type overrides first
         const knownType = Analyzer.KNOWN_VARIABLE_TYPES[varName];
         if (knownType) {
-            console.info(`  Using known variable type for ${varName} -> ${knownType}`);
             return knownType;
         }
         
@@ -459,7 +458,6 @@ export class Analyzer {
             // Example: void SomeFunc(PlayerBase p) { p. } → type is "PlayerBase"
             for (const param of containingFunc.parameters || []) {
                 if (param.name === varName) {
-                    console.info(`  Found param ${varName} -> ${param.type?.identifier}`);
                     return param.type?.identifier || null;
                 }
             }
@@ -467,7 +465,6 @@ export class Analyzer {
             // Check local variables
             for (const local of containingFunc.locals || []) {
                 if (local.name === varName) {
-                    console.info(`  Found local ${varName} -> ${local.type?.identifier}`);
                     return local.type?.identifier || null;
                 }
             }
@@ -481,7 +478,6 @@ export class Analyzer {
             for (const classNode of classHierarchy) {
                 for (const member of classNode.members || []) {
                     if (member.kind === 'VarDecl' && member.name === varName) {
-                        console.info(`  Found field ${varName} in ${classNode.name} -> ${(member as VarDeclNode).type?.identifier}`);
                         return (member as VarDeclNode).type?.identifier || null;
                     }
                 }
@@ -492,7 +488,6 @@ export class Analyzer {
         for (const [uri, fileAst] of this.docCache) {
             for (const node of fileAst.body) {
                 if (node.kind === 'VarDecl' && node.name === varName) {
-                    console.info(`  Found global ${varName} -> ${(node as VarDeclNode).type?.identifier}`);
                     return (node as VarDeclNode).type?.identifier || null;
                 }
             }
@@ -504,14 +499,12 @@ export class Analyzer {
         // Pattern: Type varName; or Type varName =
         const varDeclMatch = text.match(new RegExp(`(\\w+)\\s+${varName}\\s*[;=]`));
         if (varDeclMatch) {
-            console.info(`  Found via regex ${varName} -> ${varDeclMatch[1]}`);
             return varDeclMatch[1];
         }
         
         // Pattern: (Type varName) or (Type varName,) - function parameters
         const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)\\s+${varName}\\s*[,)]`));
         if (paramMatch) {
-            console.info(`  Found param via regex ${varName} -> ${paramMatch[1]}`);
             return paramMatch[1];
         }
         
@@ -540,12 +533,10 @@ export class Analyzer {
      * Searches top-level functions and class methods across all indexed files
      */
     private resolveFunctionReturnType(funcName: string): string | null {
-        console.info(`resolveFunctionReturnType: looking for "${funcName}" in ${this.docCache.size} indexed files`);
         
         // Check for known overrides first (e.g., GetGame() returns CGame, not Game)
         const knownType = Analyzer.KNOWN_RETURN_TYPES[funcName];
         if (knownType) {
-            console.info(`  Using known return type for ${funcName} -> ${knownType}`);
             return knownType;
         }
         
@@ -556,10 +547,8 @@ export class Analyzer {
                 if (node.kind === 'FunctionDecl' && node.name === funcName) {
                     const func = node as FunctionDeclNode;
                     const returnType = func.returnType?.identifier;
-                    console.info(`  Found top-level function ${funcName} -> ${returnType}`);
-                    // Skip void functions
-                    if (returnType && returnType !== 'void') {
-                        return returnType;
+                    if (returnType) {
+                        return returnType;  // Return 'void' too - we want to detect void assignments
                     }
                 }
                 
@@ -569,9 +558,8 @@ export class Analyzer {
                         if (member.kind === 'FunctionDecl' && member.name === funcName) {
                             const func = member as FunctionDeclNode;
                             const returnType = func.returnType?.identifier;
-                            console.info(`  Found ${funcName} in class ${node.name} -> ${returnType}`);
-                            if (returnType && returnType !== 'void') {
-                                return returnType;
+                            if (returnType) {
+                                return returnType;  // Return 'void' too
                             }
                         }
                     }
@@ -579,8 +567,124 @@ export class Analyzer {
             }
         }
         
-        console.info(`  ${funcName} not found in ${this.docCache.size} cached documents`);
         return null;
+    }
+
+    /**
+     * Resolve the return type of a method within a specific class hierarchy
+     * @param className The class to search in (and its parent classes)
+     * @param methodName The method name to find
+     */
+    private resolveMethodReturnType(className: string, methodName: string): string | null {
+        const visited = new Set<string>();
+        const classesToSearch = this.getClassHierarchyOrdered(className, visited);
+        
+        for (const classNode of classesToSearch) {
+            for (const member of classNode.members || []) {
+                if (member.kind === 'FunctionDecl' && member.name === methodName) {
+                    const func = member as FunctionDeclNode;
+                    const returnType = func.returnType?.identifier;
+                    if (returnType) {
+                        return returnType;  // Return 'void' too - we want to detect void assignments
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Resolve the final return type of a method chain like "U().Msg().SetMeta(...)"
+     * Parses the chain and follows each call to determine the final return type.
+     * @param chainText The full chain text starting from the first function
+     * @returns The return type of the final call in the chain, or null if unresolved
+     */
+    private resolveChainReturnType(chainText: string): string | null {
+        // Parse the chain: extract each function/method call in sequence
+        // Examples:
+        //   "U().Msg().SetMeta(foo, bar)" -> ["U", "Msg", "SetMeta"]
+        //   "GetGame().GetTime()" -> ["GetGame", "GetTime"]
+        
+        const calls: string[] = [];
+        let remaining = chainText.trim();
+        
+        // First call: funcName(...)
+        const firstMatch = remaining.match(/^(\w+)\s*\(/);
+        if (!firstMatch) {
+            return null;
+        }
+        calls.push(firstMatch[1]);
+        
+        // Skip past the first call's arguments
+        remaining = remaining.substring(firstMatch[0].length);
+        let parenDepth = 1;
+        let i = 0;
+        
+        while (i < remaining.length && parenDepth > 0) {
+            if (remaining[i] === '(') parenDepth++;
+            else if (remaining[i] === ')') parenDepth--;
+            i++;
+        }
+        
+        remaining = remaining.substring(i).trim();
+        
+        // Continue parsing chained calls: .methodName(...)
+        while (remaining.startsWith('.')) {
+            remaining = remaining.substring(1).trim();
+            
+            const methodMatch = remaining.match(/^(\w+)\s*\(/);
+            if (!methodMatch) {
+                // Might be a property access, not a method call
+                const propMatch = remaining.match(/^(\w+)/);
+                if (propMatch) {
+                    calls.push(propMatch[1]);
+                }
+                break;
+            }
+            
+            calls.push(methodMatch[1]);
+            
+            // Skip past this call's arguments
+            remaining = remaining.substring(methodMatch[0].length);
+            parenDepth = 1;
+            i = 0;
+            
+            while (i < remaining.length && parenDepth > 0) {
+                if (remaining[i] === '(') parenDepth++;
+                else if (remaining[i] === ')') parenDepth--;
+                i++;
+            }
+            
+            remaining = remaining.substring(i).trim();
+        }
+        
+        if (calls.length === 0) {
+            return null;
+        }
+        
+        
+        // Resolve the chain step by step
+        // First call is a function (global or static)
+        let currentType = this.resolveFunctionReturnType(calls[0]);
+        if (!currentType) {
+            return null;
+        }
+        
+        
+        // Each subsequent call is a method on the current type
+        for (let j = 1; j < calls.length; j++) {
+            const methodName = calls[j];
+            const nextType = this.resolveMethodReturnType(currentType, methodName);
+            
+            if (!nextType) {
+                return null;
+            }
+            
+            currentType = nextType;
+        }
+        
+        return currentType;
     }
 
     /**
@@ -639,12 +743,10 @@ export class Analyzer {
         const results: CompletionResult[] = [];
         const seen = new Set<string>(); // Deduplicate by name
         
-        console.info(`getClassMemberCompletions: "${className}" prefix="${prefix}"`);
         
         // Get the complete class hierarchy including modded classes
         const classHierarchy = this.getClassHierarchyOrdered(className, new Set());
         
-        console.info(`  Class hierarchy: [${classHierarchy.map(c => c.name).join(', ')}]`);
         
         for (const classNode of classHierarchy) {
             for (const member of classNode.members || []) {
@@ -797,15 +899,27 @@ export class Analyzer {
         const text = doc.getText();
 
         const token = getTokenAtPosition(text, offset);
-        if (!token || token.kind !== TokenKind.Identifier) return [];
+        if (!token) return [];
+        
+        // Allow identifiers AND type-keywords (string, int, float, bool, vector, typename)
+        // These are keywords in the lexer but also real classes defined in enconvert.c / enstring.c
+        const typeKeywords = new Set(['string', 'int', 'float', 'bool', 'vector', 'typename', 'void']);
+        if (token.kind !== TokenKind.Identifier && 
+            !(token.kind === TokenKind.Keyword && typeKeywords.has(token.value))) {
+            return [];
+        }
 
         const name = token.value;
-        console.info(`resolveDefinitions: "${name}"`);
 
-        // Check if this is a member access (e.g., player.GetInputType)
+        // Check if this is a member access (e.g., player.GetInputType or GetGame().GetTime())
         // Look backwards from the token start to find a dot
         const textBeforeToken = text.substring(0, token.start);
+        
+        // Pattern 1: variable.method (e.g., player.GetInputType)
         const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
+        
+        // Pattern 2: functionCall().method (e.g., GetGame().GetTime())
+        const chainedCallMatch = textBeforeToken.match(/(\w+)\s*\([^)]*\)\s*\.\s*$/);
         
         if (memberMatch) {
             // MEMBER ACCESS: Resolve the variable type and search only that class hierarchy
@@ -822,6 +936,19 @@ export class Analyzer {
             // If varName looks like a class (uppercase), try static member lookup
             if (varName[0] === varName[0].toUpperCase()) {
                 const classMatches = this.findMemberInClassHierarchy(varName, name);
+                if (classMatches.length > 0) {
+                    return classMatches;
+                }
+            }
+        }
+        
+        if (chainedCallMatch) {
+            // CHAINED CALL: Resolve the return type of the function call
+            const funcName = chainedCallMatch[1];
+            const returnType = this.resolveFunctionReturnType(funcName);
+            
+            if (returnType) {
+                const classMatches = this.findMemberInClassHierarchy(returnType, name);
                 if (classMatches.length > 0) {
                     return classMatches;
                 }
@@ -981,14 +1108,12 @@ export class Analyzer {
             for (const node of ast.body) {
                 if (node.kind === 'ClassDecl' && node.name === className) {
                     const classNode = node as ClassDeclNode;
-                    console.info(`  findAllClassesByName("${className}"): found in ${uri} (modded=${classNode.modifiers?.includes('modded')}, members=${classNode.members?.length || 0})`);
                     matches.push(classNode);
                 }
             }
         }
         
         if (matches.length === 0) {
-            console.info(`  findAllClassesByName("${className}"): NO MATCHES FOUND`);
         }
         
         return matches;
@@ -1227,7 +1352,9 @@ export class Analyzer {
         const varDeclPattern = /\b(int|float|bool|string|auto|vector|Man|PlayerBase|\w+)\s+(\w+)\s*(?:=|;|,|\)|<)/g;
         
         // Pattern to detect function declarations
-        const funcDeclPattern = /\b(void|int|float|bool|string|auto|override\s+\w+|\w+)\s+(\w+)\s*\([^)]*\)\s*\{?\s*$/;
+        // Must have: optional modifiers, return type (including generics), function name, parentheses for params
+        // Excludes: array access like m_Foo[0] and assignments
+        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+|[\w<>,\s]+)\s+(\w+)\s*\([^)]*\)\s*\{?\s*$/;
         
         // Pattern to detect for/foreach/while loops (their vars go to parent scope in Enforce)
         const loopPattern = /\b(for|foreach|while)\s*\(/;
@@ -1245,23 +1372,80 @@ export class Analyzer {
         let inClass = false;
         let classBraceDepth = 0;
         
+        // Track block comments
+        let inBlockComment = false;
+        
         // Process line by line to track scope
         const lines = text.split('\n');
         
         for (let lineNum = 0; lineNum < lines.length; lineNum++) {
             const line = lines[lineNum];
+            const trimmedLine = line.trim();
+            
+            // Handle block comments /* ... */
+            if (inBlockComment) {
+                if (line.includes('*/')) {
+                    inBlockComment = false;
+                }
+                continue; // Skip lines inside block comments
+            }
+            
+            // Check for block comment start
+            if (trimmedLine.startsWith('/*') || trimmedLine.startsWith('/**')) {
+                if (line.includes('*/')) {
+                    // Single-line block comment like /* foo */ - skip entire line
+                    continue;
+                } else {
+                    // Multi-line block comment starts here
+                    inBlockComment = true;
+                    continue;
+                }
+            }
+            
+            // Skip lines that are just block comment content
+            if (trimmedLine.startsWith('*') && !trimmedLine.startsWith('*/')) {
+                continue;
+            }
+            
+            // Skip lines containing doc comment markers (they may contain signature examples)
+            if (trimmedLine.includes('@param') || trimmedLine.includes('@note') || 
+                trimmedLine.includes('@return') || trimmedLine.includes('@usage') ||
+                trimmedLine.includes('@example') || trimmedLine.includes('@code')) {
+                continue;
+            }
+            
+            // Strip trailing comments for pattern matching
+            // Use indexOf for reliability
+            const commentIdx = line.indexOf('//');
+            let lineNoComment = (commentIdx >= 0 ? line.substring(0, commentIdx) : line);
+            
+            // Also strip inline block comments like: code /* comment */ more code
+            lineNoComment = lineNoComment.replace(/\/\*.*?\*\//g, '');
+            
+            // Strip string literals to avoid detecting patterns inside strings
+            // e.g., "string cbFunction" in debug messages
+            lineNoComment = lineNoComment.replace(/"(?:[^"\\]|\\.)*"/g, '""');  // Replace "..." with ""
+            lineNoComment = lineNoComment.replace(/'(?:[^'\\]|\\.)*'/g, "''");  // Replace '...' with ''
+            
+            lineNoComment = lineNoComment.trim();
             
             // Check if this line starts a class
-            if (classDeclPattern.test(line.trim()) && !inClass) {
+            if (classDeclPattern.test(lineNoComment)) {
+                // Starting a new class - reset all class-related state
                 inClass = true;
                 classBraceDepth = braceDepth;
                 classFieldScope = new Map(); // Fresh class field scope
+                // Reset scope stack to just global scope
+                scopeStack = [new Map()];
+                inFunction = false;
             }
             
             // Check if this line starts a new function
-            if (funcDeclPattern.test(line.trim())) {
-                // New function - reset to: global scope + class fields + new function scope
-                scopeStack = [scopeStack[0], classFieldScope, new Map()];
+            const isFuncDecl = funcDeclPattern.test(lineNoComment);
+            if (isFuncDecl) {
+                // New function - reset to: global scope + class fields (copy) + new function scope
+                // We must copy classFieldScope to avoid it being modified by function-local variables
+                scopeStack = [scopeStack[0], new Map(classFieldScope), new Map()];
                 inFunction = true;
                 functionBraceDepth = braceDepth;
             }
@@ -1273,10 +1457,13 @@ export class Analyzer {
             // FIRST: Find variable declarations on this line BEFORE processing braces
             // This ensures for loop variables (int j in "for (int j = 0...") 
             // are added to the current scope before we push a new scope for {
+            // Use lineNoComment to avoid matching variables in comments
             let match;
             varDeclPattern.lastIndex = 0;
             
-            while ((match = varDeclPattern.exec(line)) !== null) {
+            // Use lineNoComment but keep original line for position calculation
+            const lineForVars = lineNoComment;
+            while ((match = varDeclPattern.exec(lineForVars)) !== null) {
                 const typeName = match[1];
                 const varName = match[2];
                 
@@ -1292,7 +1479,8 @@ export class Analyzer {
                 
                 // Check all scopes in the stack for existing declaration
                 let foundDuplicate = false;
-                for (const scope of scopeStack) {
+                for (let si = 0; si < scopeStack.length; si++) {
+                    const scope = scopeStack[si];
                     const existing = scope.get(varName);
                     if (existing) {
                         const startPos = { line: lineNum, character: match.index + match[1].length + 1 };
@@ -1379,23 +1567,11 @@ export class Analyzer {
             return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
-        // Primitive type compatibility
-        const numericTypes = new Set(['int', 'float', 'bool']);
-        if (numericTypes.has(declNorm) && numericTypes.has(assignNorm)) {
-            // int/float/bool are compatible with each other (implicit conversion)
-            return { compatible: true, isDowncast: false, isUpcast: false };
-        }
+        // Case-insensitive comparison for primitive names (e.g. String vs string)
+        const declLower = declNorm.toLowerCase();
+        const assignLower = assignNorm.toLowerCase();
         
-        // string is only compatible with string
-        if (declNorm === 'string' || assignNorm === 'string') {
-            if (declNorm !== assignNorm) {
-                return { 
-                    compatible: false, 
-                    isDowncast: false, 
-                    isUpcast: false,
-                    message: `Cannot convert '${assignNorm}' to 'string'`
-                };
-            }
+        if (declLower === assignLower) {
             return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
@@ -1409,7 +1585,7 @@ export class Analyzer {
             };
         }
         
-        // auto/typename/Class are wildcards
+        // auto/typename/Class are wildcards - always compatible
         if (declNorm === 'auto' || assignNorm === 'auto' ||
             declNorm === 'typename' || assignNorm === 'typename' ||
             declNorm === 'Class' || assignNorm === 'Class') {
@@ -1422,9 +1598,11 @@ export class Analyzer {
             return { compatible: bothArrays, isDowncast: false, isUpcast: false };
         }
         
-        // Check class hierarchy
-        // UPCAST: Assigning derived (child) to base (parent) - ALWAYS SAFE
-        // Example: Man m = playerBase; where PlayerBase extends Man
+        // --- TRY INDEXED CLASS HIERARCHY FIRST ---
+        // If types are indexed as classes (including primitives like string, int from enconvert.c),
+        // use the hierarchy to determine compatibility before falling back to hardcoded rules.
+        
+        // Check class hierarchy for UPCAST
         const assignedHierarchy = this.getClassHierarchyOrdered(assignNorm, new Set());
         for (const classNode of assignedHierarchy) {
             if (classNode.name === declNorm) {
@@ -1433,16 +1611,12 @@ export class Analyzer {
             }
         }
         
-        // DOWNCAST: Assigning base (parent) to derived (child) - REQUIRES CAST
-        // Example: PlayerBase p = man; where Man is parent of PlayerBase
-        // Should use: PlayerBase p = PlayerBase.Cast(man);
-        // Or: Class.CastTo(p, man);
+        // Check class hierarchy for DOWNCAST
         const declaredHierarchy = this.getClassHierarchyOrdered(declNorm, new Set());
         for (const classNode of declaredHierarchy) {
             if (classNode.name === assignNorm) {
-                // assignedType is a parent of declaredType - this is a downcast (risky)
                 return { 
-                    compatible: true, // Technically compiles but risky
+                    compatible: true,
                     isDowncast: true, 
                     isUpcast: false,
                     message: `Unsafe downcast from '${assignNorm}' to '${declNorm}'. Use '${declNorm}.Cast(value)' or 'Class.CastTo(target, value)' instead.`
@@ -1450,11 +1624,32 @@ export class Analyzer {
             }
         }
         
-        // Check primitive types BEFORE checking if classes exist
-        // Primitives won't be found as classes, so we need to handle them first
-        const primitiveTypes = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
-        const declIsPrimitive = primitiveTypes.has(declNorm);
-        const assignIsPrimitive = primitiveTypes.has(assignNorm);
+        // --- FALLBACK: hardcoded primitive compatibility ---
+        // Only used if types aren't found in the indexed class hierarchy
+        
+        // Numeric types are compatible with each other (implicit conversion)
+        const numericTypes = new Set(['int', 'float', 'bool']);
+        if (numericTypes.has(declLower) && numericTypes.has(assignLower)) {
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // Hardcoded primitives - used as fallback when not indexed
+        const hardcodedPrimitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
+        const declIsPrimitive = hardcodedPrimitives.has(declLower);
+        const assignIsPrimitive = hardcodedPrimitives.has(assignLower);
+        
+        // string is only compatible with string
+        if (declLower === 'string' || assignLower === 'string') {
+            if (declLower !== assignLower) {
+                return { 
+                    compatible: false, 
+                    isDowncast: false, 
+                    isUpcast: false,
+                    message: `Cannot convert '${assignNorm}' to '${declNorm}'`
+                };
+            }
+            return { compatible: true, isDowncast: false, isUpcast: false };
+        }
         
         // Primitive vs class (or vice versa) is never compatible
         if (declIsPrimitive !== assignIsPrimitive) {
@@ -1504,34 +1699,129 @@ export class Analyzer {
         const text = doc.getText();
         const ast = this.ensure(doc);
         
-        // Build a map of variable names to their types from the AST
-        const variableTypes = new Map<string, string>();
+        // Scoped variable tracking - each variable knows its valid line range
+        interface ScopedVar {
+            type: string;
+            startLine: number;
+            endLine: number;  // -1 means class field (valid everywhere in class)
+            isClassField: boolean;
+        }
         
-        // Collect types from all declarations in this file
-        const collectVarTypes = (nodes: any[], scope?: string) => {
-            for (const node of nodes) {
-                if (node.kind === 'VarDecl' && node.name && node.type?.identifier) {
-                    variableTypes.set(node.name, node.type.identifier);
+        // Map of variable name -> array of scoped declarations
+        const scopedVars = new Map<string, ScopedVar[]>();
+        
+        // Helper to add a scoped variable
+        const addScopedVar = (name: string, type: string, startLine: number, endLine: number, isClassField: boolean) => {
+            if (!scopedVars.has(name)) {
+                scopedVars.set(name, []);
+            }
+            scopedVars.get(name)!.push({ type, startLine, endLine, isClassField });
+        };
+        
+        // Helper to get the type of a variable at a specific line
+        const getVarTypeAtLine = (name: string, line: number): string | undefined => {
+            const vars = scopedVars.get(name);
+            if (!vars) return undefined;
+            
+            // Find the most specific scope that contains this line
+            // Priority: 1) local vars in range, 2) class fields in range
+            let bestMatch: ScopedVar | undefined;
+            
+            for (const v of vars) {
+                // ALL variables (including class fields) must have the line within their scope range
+                if (line < v.startLine || line > v.endLine) {
+                    continue;
                 }
+                
+                if (v.isClassField) {
+                    // Class field in range - prefer smaller (more specific) scope
+                    if (!bestMatch || (bestMatch.isClassField && 
+                        (v.endLine - v.startLine) < (bestMatch.endLine - bestMatch.startLine))) {
+                        bestMatch = v;
+                    }
+                } else {
+                    // Local variable in range - prefer over class fields
+                    // and prefer smaller (more specific) ranges
+                    if (!bestMatch || bestMatch.isClassField || 
+                        (v.endLine - v.startLine) < (bestMatch.endLine - bestMatch.startLine)) {
+                        bestMatch = v;
+                    }
+                }
+            }
+            
+            return bestMatch?.type;
+        };
+        
+        // Collect types from all declarations in this file with proper scoping
+        const collectVarTypes = (nodes: any[], classStartLine?: number, classEndLine?: number) => {
+            for (const node of nodes) {
+                // Top-level var declarations (globals)
+                if (node.kind === 'VarDecl' && node.name && node.type?.identifier) {
+                    const startLine = node.start?.line ?? 0;
+                    addScopedVar(node.name, node.type.identifier, startLine, Number.MAX_SAFE_INTEGER, false);
+                }
+                
                 if (node.kind === 'FunctionDecl') {
-                    // Collect parameters
+                    const funcStart = node.start?.line ?? 0;
+                    const funcEnd = node.end?.line ?? Number.MAX_SAFE_INTEGER;
+                    
+                    // Collect parameters - scoped to this function
                     for (const param of node.parameters || []) {
                         if (param.name && param.type?.identifier) {
-                            variableTypes.set(param.name, param.type.identifier);
+                            addScopedVar(param.name, param.type.identifier, funcStart, funcEnd, false);
                         }
                     }
-                    // Collect locals
+                    // Collect locals - scoped to this function
                     for (const local of node.locals || []) {
                         if (local.name && local.type?.identifier) {
-                            variableTypes.set(local.name, local.type.identifier);
+                            const localStart = local.start?.line ?? funcStart;
+                            addScopedVar(local.name, local.type.identifier, localStart, funcEnd, false);
                         }
                     }
                 }
+                
                 if (node.kind === 'ClassDecl') {
-                    // Collect class fields
+                    const clsStart = node.start?.line ?? 0;
+                    const clsEnd = node.end?.line ?? Number.MAX_SAFE_INTEGER;
+                    
+                    // Collect class fields - they're accessible anywhere in the class
                     for (const member of node.members || []) {
                         if (member.kind === 'VarDecl' && member.name && member.type?.identifier) {
-                            variableTypes.set(member.name, member.type.identifier);
+                            addScopedVar(member.name, member.type.identifier, clsStart, clsEnd, true);
+                        }
+                        // Also process methods within the class
+                        if (member.kind === 'FunctionDecl') {
+                            const funcStart = member.start?.line ?? clsStart;
+                            const funcEnd = member.end?.line ?? clsEnd;
+                            
+                            for (const param of member.parameters || []) {
+                                if (param.name && param.type?.identifier) {
+                                    addScopedVar(param.name, param.type.identifier, funcStart, funcEnd, false);
+                                }
+                            }
+                            for (const local of member.locals || []) {
+                                if (local.name && local.type?.identifier) {
+                                    const localStart = local.start?.line ?? funcStart;
+                                    addScopedVar(local.name, local.type.identifier, localStart, funcEnd, false);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Also collect inherited fields from parent classes
+                    // This ensures fields from base classes are accessible in derived classes
+                    if (node.base?.identifier) {
+                        const parentClasses = this.getClassHierarchyOrdered(node.base.identifier, new Set());
+                        for (const parentClass of parentClasses) {
+                            for (const member of parentClass.members || []) {
+                                if (member.kind === 'VarDecl' && member.name) {
+                                    const varMember = member as VarDeclNode;
+                                    if (varMember.type?.identifier) {
+                                        // Add inherited fields with the child class's scope
+                                        addScopedVar(member.name, varMember.type.identifier, clsStart, clsEnd, true);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1540,28 +1830,200 @@ export class Analyzer {
         
         collectVarTypes(ast.body);
         
-        // Also scan the raw text for variable declarations to catch any the AST missed
-        // Pattern: Type varName; or Type varName = ...
-        const varDeclScanPattern = /\b(\w+)\s+(\w+)\s*(?:=|;)/g;
-        let scanMatch;
-        while ((scanMatch = varDeclScanPattern.exec(text)) !== null) {
-            const typeName = scanMatch[1];
-            const varName = scanMatch[2];
-            // Skip keywords
-            if (!['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr'].includes(typeName)) {
-                // Only add if not already in map (AST takes precedence)
-                if (!variableTypes.has(varName)) {
-                    variableTypes.set(varName, typeName);
+        // The parser doesn't parse function bodies (locals is always []),
+        // so we need to scan for local variable declarations using regex.
+        // We scan the text line-by-line, tracking which function scope we're in.
+        {
+            const lines = text.split('\n');
+            let inBlockComment = false;
+            
+            // For each function in the AST, scan its body for local declarations
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl') {
+                    const classNode = node as ClassDeclNode;
+                    for (const member of classNode.members || []) {
+                        if (member.kind === 'FunctionDecl') {
+                            const func = member as FunctionDeclNode;
+                            const funcStart = func.start?.line ?? 0;
+                            const funcEnd = func.end?.line ?? 0;
+                            if (funcEnd <= funcStart) continue;
+                            
+                            // Scan lines within this function for variable declarations
+                            for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
+                                let line = lines[lineIdx];
+                                
+                                // Handle block comments
+                                if (inBlockComment) {
+                                    if (line.includes('*/')) inBlockComment = false;
+                                    continue;
+                                }
+                                if (line.trimStart().startsWith('/*')) {
+                                    if (!line.includes('*/')) inBlockComment = true;
+                                    continue;
+                                }
+                                
+                                // Strip comments and strings
+                                const commentIdx = line.indexOf('//');
+                                if (commentIdx >= 0) line = line.substring(0, commentIdx);
+                                line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+                                line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
+                                line = line.trim();
+                                
+                                // Skip empty, control flow, return, etc.
+                                if (!line) continue;
+                                
+                                // Match: Type varName; or Type varName = ...;
+                                // Must start with a type (capitalized or known primitive)
+                                // Exclude: keywords, function calls, return statements
+                                const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
+                                let m;
+                                while ((m = localDeclPattern.exec(line)) !== null) {
+                                    const typeName = m[1];
+                                    const varName = m[2];
+                                    
+                                    // Skip if type is a keyword/modifier
+                                    if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
+                                         'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
+                                         'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
+                                        continue;
+                                    }
+                                    // Skip if varName is a keyword
+                                    if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
+                                        continue;
+                                    }
+                                    
+                                    addScopedVar(varName, typeName, lineIdx, funcEnd, false);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also scan top-level functions
+                if (node.kind === 'FunctionDecl') {
+                    const func = node as FunctionDeclNode;
+                    const funcStart = func.start?.line ?? 0;
+                    const funcEnd = func.end?.line ?? 0;
+                    if (funcEnd <= funcStart) continue;
+                    
+                    for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
+                        let line = lines[lineIdx];
+                        
+                        if (inBlockComment) {
+                            if (line.includes('*/')) inBlockComment = false;
+                            continue;
+                        }
+                        if (line.trimStart().startsWith('/*')) {
+                            if (!line.includes('*/')) inBlockComment = true;
+                            continue;
+                        }
+                        
+                        const commentIdx = line.indexOf('//');
+                        if (commentIdx >= 0) line = line.substring(0, commentIdx);
+                        line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+                        line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
+                        line = line.trim();
+                        
+                        if (!line) continue;
+                        
+                        const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
+                        let m;
+                        while ((m = localDeclPattern.exec(line)) !== null) {
+                            const typeName = m[1];
+                            const varName = m[2];
+                            
+                            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
+                                 'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
+                                 'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
+                                continue;
+                            }
+                            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
+                                continue;
+                            }
+                            
+                            addScopedVar(varName, typeName, lineIdx, funcEnd, false);
+                        }
+                    }
                 }
             }
         }
         
+        // Helper to check if a position is inside a comment or string
+        const isInsideCommentOrString = (position: number): boolean => {
+            // Check single-line comments
+            let lineStart = text.lastIndexOf('\n', position) + 1;
+            let lineEnd = text.indexOf('\n', position);
+            if (lineEnd === -1) lineEnd = text.length;
+            const line = text.substring(lineStart, lineEnd);
+            const posInLine = position - lineStart;
+            
+            // Check if there's a // before this position on the same line
+            const commentIdx = line.indexOf('//');
+            if (commentIdx >= 0 && commentIdx < posInLine) {
+                return true;
+            }
+            
+            // Check block comments - scan backwards for /* that isn't closed
+            let i = position - 1;
+            while (i >= 0) {
+                if (i > 0 && text[i-1] === '*' && text[i] === '/') {
+                    // Found end of block comment, we're outside
+                    break;
+                }
+                if (i > 0 && text[i-1] === '/' && text[i] === '*') {
+                    // Found start of block comment, we're inside
+                    return true;
+                }
+                i--;
+            }
+            
+            // Check strings - count unescaped quotes before position on same line
+            let inString = false;
+            let stringChar = '';
+            for (let j = 0; j < posInLine; j++) {
+                const ch = line[j];
+                if (!inString && (ch === '"' || ch === "'")) {
+                    inString = true;
+                    stringChar = ch;
+                } else if (inString && ch === stringChar && (j === 0 || line[j-1] !== '\\')) {
+                    inString = false;
+                }
+            }
+            return inString;
+        };
+        
+        // For variable type scanning, we can still use stripped text since we just need types
+        const textForScanning = text
+            .replace(/\/\/.*$/gm, '')  // Remove single-line comments
+            .replace(/\/\*[\s\S]*?\*\//g, '')  // Remove multi-line comments
+            .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // Replace "..." with ""
+            .replace(/'(?:[^'\\]|\\.)*'/g, "''");  // Replace '...' with ''
+        
+        // Helper to get line number from character position
+        const getLineFromPos = (pos: number): number => {
+            let line = 0;
+            for (let i = 0; i < pos && i < text.length; i++) {
+                if (text[i] === '\n') line++;
+            }
+            return line;
+        };
+        
         // Pattern 1: Type varName = FunctionCall();
         // e.g., int i = GetGame();
-        const funcAssignPattern = /\b(\w+)\s+(\w+)\s*=\s*(\w+)\s*\(/g;
+        // Use [ \t]+ between type and varName to prevent matching across line breaks
+        const funcAssignPattern = /\b(\w+)[ \t]+(\w+)\s*=\s*(\w+)\s*\(/g;
         
         let match;
         while ((match = funcAssignPattern.exec(text)) !== null) {
+            // Skip if inside comment or string
+            if (isInsideCommentOrString(match.index)) {
+                continue;
+            }
+            
+            // Skip if the match spans multiple lines (regex \s* can cross newlines)
+            if (match[0].includes('\n')) {
+                continue;
+            }
+            
             const declaredType = match[1];
             const varName = match[2];
             const funcName = match[3];
@@ -1571,22 +2033,93 @@ export class Analyzer {
                 continue;
             }
             
-            // Get the return type of the function
-            const returnType = this.resolveFunctionReturnType(funcName);
+            // Check if this is a method chain like GetGame().GetTime()
+            // Look at what comes after this match
+            const afterMatch = text.substring(match.index + match[0].length);
+            // Find the closing paren and see if there's a dot after
+            let parenDepth = 1;
+            let chainDetected = false;
+            for (let i = 0; i < afterMatch.length && parenDepth > 0; i++) {
+                if (afterMatch[i] === '(') parenDepth++;
+                else if (afterMatch[i] === ')') parenDepth--;
+                if (parenDepth === 0) {
+                    // Check if there's a dot after the closing paren
+                    const remainder = afterMatch.substring(i + 1).trim();
+                    if (remainder.startsWith('.')) {
+                        chainDetected = true;
+                    }
+                    break;
+                }
+            }
+            
+            // Resolve return type - either single function or full chain
+            let returnType: string | null;
+            let highlightLength = match[0].length;  // Default to just the match
+            
+            if (chainDetected) {
+                // Find the end of the full statement (semicolon or closing paren+semicolon)
+                // Much simpler: just find where the statement ends
+                const stmtEnd = afterMatch.indexOf(';');
+                let chainEnd = stmtEnd >= 0 ? stmtEnd : afterMatch.length;
+                
+                // For highlighting, we want to include up to but not including the semicolon
+                // But we need to find where the actual chain ends (last closing paren before semicolon)
+                let lastParen = chainEnd;
+                for (let i = chainEnd - 1; i >= 0; i--) {
+                    if (afterMatch[i] === ')') {
+                        lastParen = i + 1;
+                        break;
+                    }
+                }
+                chainEnd = lastParen;
+                
+                const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
+                returnType = this.resolveChainReturnType(fullChainText);
+                highlightLength = match[0].length + chainEnd;
+            } else {
+                // Get the return type of the single function
+                // Need to find where single function call ends
+                let singleEnd = 0;
+                let depth = 1;
+                for (let i = 0; i < afterMatch.length && depth > 0; i++) {
+                    if (afterMatch[i] === '(') depth++;
+                    else if (afterMatch[i] === ')') depth--;
+                    if (depth === 0) {
+                        singleEnd = i + 1;
+                        break;
+                    }
+                }
+                returnType = this.resolveFunctionReturnType(funcName);
+                highlightLength = match[0].length + singleEnd;
+            }
             
             if (returnType) {
-                this.addTypeMismatchDiagnostic(doc, diags, match.index, match[0].length, declaredType, returnType);
+                this.addTypeMismatchDiagnostic(doc, diags, match.index, highlightLength, declaredType, returnType);
             }
         }
         
         // Pattern 2: Type varName = otherVar;
         // e.g., int i = p; where p is PlayerBase
-        const varDeclAssignPattern = /\b(\w+)\s+(\w+)\s*=\s*(\w+)\s*;/g;
+        // Use [ \t]+ between type and varName to prevent matching across line breaks
+        const varDeclAssignPattern = /\b(\w+)[ \t]+(\w+)\s*=\s*(\w+)\s*;/g;
         
         while ((match = varDeclAssignPattern.exec(text)) !== null) {
+            // Skip if inside comment or string
+            if (isInsideCommentOrString(match.index)) {
+                continue;
+            }
+            
             const declaredType = match[1];
             const varName = match[2];
             const sourceVar = match[3];
+            
+            // Skip if the core assignment part spans multiple lines
+            // Build the core: "Type varName = source;" - check this for newlines
+            const coreP2 = declaredType + ' ' + varName + match[0].substring(match[0].indexOf(varName) + varName.length);
+            if (coreP2.includes('\n')) {
+                continue;
+            }
+            
             
             // Skip if declared type is a keyword
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else'].includes(declaredType)) {
@@ -1598,8 +2131,9 @@ export class Analyzer {
                 continue;
             }
             
-            // Look up the type of the source variable
-            const sourceType = variableTypes.get(sourceVar);
+            // Look up the type of the source variable at this line
+            const lineNum = getLineFromPos(match.index);
+            const sourceType = getVarTypeAtLine(sourceVar, lineNum);
             
             if (sourceType) {
                 this.addTypeMismatchDiagnostic(doc, diags, match.index, match[0].length, declaredType, sourceType);
@@ -1611,9 +2145,21 @@ export class Analyzer {
         const reassignPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*;/g;
         
         while ((match = reassignPattern.exec(text)) !== null) {
+            // Skip if inside comment or string
+            if (isInsideCommentOrString(match.index)) {
+                continue;
+            }
+            
             const leadingWhitespace = match[1];
             const targetVar = match[2];
             const sourceVar = match[3];
+            
+            // Skip if the core assignment part spans multiple lines
+            // Core is "targetVar = sourceVar;" - exclude leading delimiter + whitespace
+            const coreP3 = match[0].substring(1 + leadingWhitespace.length);
+            if (coreP3.includes('\n')) {
+                continue;
+            }
             
             // Skip keywords
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) {
@@ -1625,11 +2171,22 @@ export class Analyzer {
                 continue;
             }
             
-            // Look up types for both variables
-            const targetType = variableTypes.get(targetVar);
-            const sourceType = variableTypes.get(sourceVar);
+            // Look up types for both variables at this line
+            const lineNum = getLineFromPos(match.index);
+            const targetType = getVarTypeAtLine(targetVar, lineNum);
+            const sourceType = getVarTypeAtLine(sourceVar, lineNum);
             
+            // Only check if we have confident types for both
+            // Skip if either type looks like a generic parameter (single letter) or class name
             if (targetType && sourceType) {
+                // Skip generic type parameters and potential misparses
+                if (/^[A-Z]$/.test(targetType) || /^[A-Z]$/.test(sourceType)) {
+                    continue;
+                }
+                // Skip if types are identical (even if both are wrong, at least they match)
+                if (targetType === sourceType) {
+                    continue;
+                }
                 // Calculate actual start position (skip the leading delimiter and whitespace)
                 const actualStart = match.index + 1 + leadingWhitespace.length;
                 const actualLength = match[0].length - 1 - leadingWhitespace.length;
@@ -1642,23 +2199,89 @@ export class Analyzer {
         const reassignFuncPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*\(/g;
         
         while ((match = reassignFuncPattern.exec(text)) !== null) {
+            // Skip if inside comment or string
+            if (isInsideCommentOrString(match.index)) {
+                continue;
+            }
+            
             const leadingWhitespace = match[1];
             const targetVar = match[2];
             const funcName = match[3];
             
+            // Skip if the core assignment part spans multiple lines
+            // Core is "targetVar = funcName(" - exclude leading delimiter + whitespace
+            const coreP4 = match[0].substring(1 + leadingWhitespace.length);
+            if (coreP4.includes('\n')) {
+                continue;
+            }
             // Skip keywords
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) {
                 continue;
             }
             
-            // Look up type of target variable and return type of function
-            const targetType = variableTypes.get(targetVar);
-            const returnType = this.resolveFunctionReturnType(funcName);
+            // Check if this is a method chain like U().Msg().SetMeta()
+            const afterMatch = text.substring(match.index + match[0].length);
+            let parenDepth = 1;
+            let chainDetected = false;
+            for (let i = 0; i < afterMatch.length && parenDepth > 0; i++) {
+                if (afterMatch[i] === '(') parenDepth++;
+                else if (afterMatch[i] === ')') parenDepth--;
+                if (parenDepth === 0) {
+                    const remainder = afterMatch.substring(i + 1).trim();
+                    if (remainder.startsWith('.')) {
+                        chainDetected = true;
+                    }
+                    break;
+                }
+            }
+            
+            // Look up type of target variable at this line and resolve return type (single or chain)
+            const lineNum = getLineFromPos(match.index);
+            const targetType = getVarTypeAtLine(targetVar, lineNum);
+            let returnType: string | null;
+            let chainEnd = 0;
+            
+            if (chainDetected) {
+                // Find the end of the full statement (semicolon)
+                const stmtEnd = afterMatch.indexOf(';');
+                chainEnd = stmtEnd >= 0 ? stmtEnd : afterMatch.length;
+                
+                // Find where the actual chain ends (last closing paren before semicolon)
+                for (let i = chainEnd - 1; i >= 0; i--) {
+                    if (afterMatch[i] === ')') {
+                        chainEnd = i + 1;
+                        break;
+                    }
+                }
+                
+                const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
+                returnType = this.resolveChainReturnType(fullChainText);
+            } else {
+                // Find where single function call ends
+                let depth = 1;
+                for (let i = 0; i < afterMatch.length && depth > 0; i++) {
+                    if (afterMatch[i] === '(') depth++;
+                    else if (afterMatch[i] === ')') depth--;
+                    if (depth === 0) {
+                        chainEnd = i + 1;
+                        break;
+                    }
+                }
+                returnType = this.resolveFunctionReturnType(funcName);
+            }
             
             if (targetType && returnType) {
+                // Skip if either type is a generic parameter (single uppercase letter like T, K, V)
+                if (/^[A-Z]$/.test(targetType) || /^[A-Z]$/.test(returnType)) {
+                    continue;
+                }
+                // Skip if types are identical
+                if (targetType === returnType) {
+                    continue;
+                }
                 // Calculate actual start position (skip the leading delimiter and whitespace)
                 const actualStart = match.index + 1 + leadingWhitespace.length;
-                const actualLength = match[0].length - 1 - leadingWhitespace.length;
+                const actualLength = match[0].length - 1 - leadingWhitespace.length + chainEnd;
                 this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, returnType);
             }
         }
@@ -1710,43 +2333,53 @@ export class Analyzer {
         const text = doc.getText();
         const lines = text.split('\n');
         
+        // Track if we're inside a block comment
+        let inBlockComment = false;
+        
+        // Track brace depth - anything inside {} is fine (enums, class bodies, arrays)
+        // Only unclosed () across lines is the actual multi-line statement problem
+        let braceDepth = 0;
+        
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].trim();
             
-            // Skip empty lines and comments
+            // Skip empty lines and single-line comments
             if (!line || line.startsWith('//')) continue;
             
-            // Check if line ends with a continuation operator or unclosed construct
-            // These indicate a multi-line statement which is not allowed
+            // Skip lines that are just comment content (start with *)
+            if (line.startsWith('*')) continue;
             
-            // Pattern 1: Line ends with binary operator (excluding comment lines)
-            // e.g., "text" +    or   a &&   or   b ||
-            const endsWithOperator = /[+\-*\/&|<>=!,]\s*$/.test(line) && !line.startsWith('//');
+            // Track block comments /* ... */
+            if (line.includes('/*')) {
+                inBlockComment = true;
+            }
+            if (line.includes('*/')) {
+                inBlockComment = false;
+                continue;
+            }
+            if (inBlockComment) {
+                continue;
+            }
             
-            // Pattern 2: Unclosed parenthesis (more ( than ))
+            // Track brace depth
+            const openBraces = (line.match(/\{/g) || []).length;
+            const closeBraces = (line.match(/\}/g) || []).length;
+            braceDepth += openBraces - closeBraces;
+            
+            // Only check for unclosed parentheses - this is the real multi-line issue
+            // e.g., Print("text" +
+            //         "more");   <-- not allowed in Enforce Script
             const openParens = (line.match(/\(/g) || []).length;
             const closeParens = (line.match(/\)/g) || []).length;
             const unclosedParens = openParens > closeParens;
             
-            // Pattern 3: Unclosed brackets
-            const openBrackets = (line.match(/\[/g) || []).length;
-            const closeBrackets = (line.match(/\]/g) || []).length;
-            const unclosedBrackets = openBrackets > closeBrackets;
+            // Skip lines ending with { or ; or } - those are complete
+            const endsWithTerminator = /[{};]\s*$/.test(line);
             
-            // Exclude lines that are valid multi-line constructs
-            // - Function/class declarations with { at end
-            // - Control flow with { at end
-            // - Lines ending with { or ; are fine
-            const endsWithBraceOrSemi = /[{};]\s*$/.test(line);
-            const isDeclarationStart = /^(class|enum|if|else|for|while|switch|foreach)\b/.test(line);
+            // Skip declaration starts (class, if, for, etc.)
+            const isDeclarationStart = /^(class|modded|enum|struct|typedef|if|else|for|while|switch|foreach)\b/.test(line);
             
-            // Report error if this looks like a multi-line statement
-            if ((endsWithOperator || unclosedParens || unclosedBrackets) && 
-                !endsWithBraceOrSemi && 
-                !isDeclarationStart &&
-                !line.endsWith('{') &&
-                i + 1 < lines.length) {
-                
+            if (unclosedParens && !endsWithTerminator && !isDeclarationStart && i + 1 < lines.length) {
                 // Check if next non-empty line continues this statement
                 let nextLineIdx = i + 1;
                 while (nextLineIdx < lines.length && !lines[nextLineIdx].trim()) {
@@ -1755,7 +2388,6 @@ export class Analyzer {
                 
                 if (nextLineIdx < lines.length) {
                     const nextLine = lines[nextLineIdx].trim();
-                    // If next line doesn't start with { and isn't empty, it's a continuation
                     if (nextLine && !nextLine.startsWith('{') && !nextLine.startsWith('//')) {
                         diags.push({
                             message: 'Multi-line statements are not supported in Enforce Script. Each statement must be on a single line.',
@@ -1785,8 +2417,22 @@ export class Analyzer {
             'void', 'int', 'float', 'bool', 'string', 'vector', 'typename',
             'Class', 'auto', 'array', 'set', 'map', 'ref', 'autoptr', 
             'proto', 'private', 'protected', 'static', 'const', 'owned',
-            'out', 'inout', 'notnull', 'modded', 'sealed', 'event', 'native'
+            'out', 'inout', 'notnull', 'modded', 'sealed', 'event', 'native',
+            // Common generic type parameter names - these are placeholders, not real types
+            'T', 'T1', 'T2', 'T3', 'TKey', 'TValue', 'TItem', 'TElement'
         ]);
+        
+        // Collect generic type parameters from the current file's class declarations
+        // so that template classes like Container<Class T> work correctly
+        const genericParams = new Set<string>();
+        for (const node of ast.body) {
+            if (node.kind === 'ClassDecl') {
+                const classNode = node as ClassDeclNode;
+                for (const gv of classNode.genericVars || []) {
+                    genericParams.add(gv);
+                }
+            }
+        }
         
         // Require a significant index before flagging unknown types
         // This helps avoid false positives during initial indexing
@@ -1800,8 +2446,17 @@ export class Analyzer {
         const typeExists = (typeName: string): boolean => {
             if (!typeName) return true;
             if (primitives.has(typeName)) return true;
+            if (genericParams.has(typeName)) return true;  // Generic type parameter
+            
+            // Single uppercase letters are likely generic type parameters
+            if (/^[A-Z]$/.test(typeName)) return true;
             
             // Check for class, enum, or typedef with this name
+            // Use the class finder methods for consistency with hover/go-to-definition
+            if (this.findClassByName(typeName)) return true;
+            if (this.findEnumByName(typeName)) return true;
+            
+            // Also check typedefs and any top-level symbol with matching name
             for (const [uri, fileAst] of this.docCache) {
                 for (const node of fileAst.body) {
                     if (node.name === typeName) {
@@ -1809,6 +2464,14 @@ export class Analyzer {
                     }
                 }
             }
+            
+            // Also check current file's AST (in case it wasn't cached yet)
+            for (const node of ast.body) {
+                if (node.name === typeName) {
+                    return true;
+                }
+            }
+            
             return false;
         };
         
