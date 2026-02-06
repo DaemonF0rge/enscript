@@ -73,6 +73,40 @@ connection.onInitialized(async () => {
     }
 
     console.log('Indexing complete.');
+    
+    // Notify client that indexing is complete - trigger refresh of open files
+    connection.sendNotification('enscript/indexingComplete', { 
+        fileCount: allFiles.length,
+        workspaceRoot: workspaceRoot 
+    });
+});
+
+// Handle request to check all workspace files
+connection.onRequest('enscript/checkWorkspace', async () => {
+    console.log(`Checking all workspace files in ${workspaceRoot}...`);
+    
+    const files = await findAllFiles(workspaceRoot, ['.c']);
+    const allDiagnostics: Array<{ uri: string; diagnostics: any[] }> = [];
+    
+    for (const filePath of files) {
+        const uri = url.pathToFileURL(filePath).toString();
+        const text = await readFileUtf8(filePath);
+        const doc = TextDocument.create(uri, 'enscript', 1, text);
+        
+        const diagnostics = Analyzer.instance().runDiagnostics(doc);
+        if (diagnostics.length > 0) {
+            allDiagnostics.push({ uri, diagnostics });
+            // Publish diagnostics so they show in Problems panel
+            connection.sendDiagnostics({ uri, diagnostics });
+        }
+    }
+    
+    console.log(`Checked ${files.length} files, found issues in ${allDiagnostics.length} files`);
+    return { 
+        filesChecked: files.length, 
+        filesWithIssues: allDiagnostics.length,
+        totalIssues: allDiagnostics.reduce((sum, d) => sum + d.diagnostics.length, 0)
+    };
 });
 
 // Wire all feature handlers.

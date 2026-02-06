@@ -46,6 +46,10 @@
             {
                 "command": "enscript.dumpDiagnostics",
                 "title": "Enscript: Dump Diagnostics"
+            },
+            {
+                "command": "enscript.checkWorkspace",
+                "title": "Enscript: Check All Workspace Files"
             }
         ],
         "configuration": {

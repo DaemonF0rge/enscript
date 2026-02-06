@@ -38,9 +38,44 @@ export async function activate(context: vscode.ExtensionContext) {
     );
     client.start();
     context.subscriptions.push(client);
+    
+    // Listen for indexing complete notification - refresh diagnostics on open files
+    client.onNotification('enscript/indexingComplete', (params: { fileCount: number }) => {
+        vscode.window.showInformationMessage(`Enscript: Indexed ${params.fileCount} files. Refreshing diagnostics...`);
+        
+        // Trigger a re-validation of all open enscript documents
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.languageId === 'enscript') {
+                // Force a change event by doing a no-op edit
+                const edit = new vscode.WorkspaceEdit();
+                // Insert and immediately remove an empty string to trigger didChangeContent
+                edit.insert(doc.uri, new vscode.Position(0, 0), '');
+                vscode.workspace.applyEdit(edit);
+            }
+        }
+    });
 
     context.subscriptions.push(
         vscode.commands.registerCommand('enscript.restartServer', () => client?.restart())
+    );
+    
+    context.subscriptions.push(
+        vscode.commands.registerCommand('enscript.checkWorkspace', async () => {
+            vscode.window.showInformationMessage('Enscript: Checking all workspace files...');
+            
+            const response = await client?.sendRequest('enscript/checkWorkspace') as { 
+                filesChecked: number; 
+                filesWithIssues: number; 
+                totalIssues: number 
+            } | undefined;
+            
+            if (response) {
+                vscode.window.showInformationMessage(
+                    `Enscript: Checked ${response.filesChecked} files. ` +
+                    `Found ${response.totalIssues} issues in ${response.filesWithIssues} files.`
+                );
+            }
+        })
     );
 
     context.subscriptions.push(

@@ -11,6 +11,10 @@ export async function findAllFiles(dir: string, extensions: string[], files: str
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
+            // Skip node_modules, .git, and other non-script directories
+            if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === '.svn') {
+                continue;
+            }
             await findAllFiles(fullPath, extensions, files);
         } else if (extensions.some(ext => entry.name.endsWith(ext))) {
             files.push(fullPath);
