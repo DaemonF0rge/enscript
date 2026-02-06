@@ -238,18 +238,20 @@ export class Analyzer {
                 const fsPath = url.fileURLToPath(err.uri);          // file:/// → p:\foo\bar.c
                 console.error(`${fsPath}:${err.line}:${err.column}  ${err.message}`);
 
-                // // also publish a real diagnostic so the Problems panel shows it
-                // const diagnostic: Diagnostic = {
-                //     message: err.message,
-                //     range: {
-                //         start: { line: err.line - 1, character: err.column - 1 },
-                //         end:   { line: err.line - 1, character: err.column     }
-                //     },
-                //     severity: DiagnosticSeverity.Error,
-                //     source:   'parser'
-                // };
-                // connection.sendDiagnostics({ uri: err.uri, diagnostics: [diagnostic] });
-                // Stack trace removed to reduce noise during indexing
+                // Return stub with parse error diagnostic attached
+                // so runDiagnostics() picks it up via ast.diagnostics
+                const parseErrorDiag: Diagnostic = {
+                    message: `${err.message} (parse error — other diagnostics for this file are suppressed until this is fixed)`,
+                    range: {
+                        start: { line: err.line - 1, character: err.column - 1 },
+                        end:   { line: err.line - 1, character: err.column     }
+                    },
+                    severity: DiagnosticSeverity.Error,
+                    source: 'enfusion-script'
+                };
+                const stub: File = { body: [], version: doc.version, diagnostics: [parseErrorDiag] };
+                this.docCache.set(normalizeUri(doc.uri), stub);
+                return stub;
             } else {
                 // unexpected failure
                 console.error(String(err));
@@ -368,10 +370,39 @@ export class Analyzer {
             const varType = this.resolveVariableType(doc, pos, name);
             
             if (varType) {
+                // ================================================================
+                // TYPEDEF + TEMPLATE TYPE RESOLUTION FOR COMPLETIONS
+                // ================================================================
+                // When a variable has a typedef'd type (e.g., testMapType → map<string, string>),
+                // we need to:
+                //   1. Resolve the typedef to the underlying class name
+                //   2. Build a template substitution map (TKey→string, TValue→string)
+                //   3. Pass the map to getClassMemberCompletions so it can replace
+                //      generic param names with concrete types in the completion details
+                //
+                // This also handles direct generic declarations like: map<string, int> myMap;
+                // In that case we get the TypeNode (which has genericArgs) and build the map.
+                // ================================================================
+                const typedefNode = this.resolveTypedefNode(varType);
+                let resolvedType: string;
+                let tplMap: Map<string, string> | undefined;
+                
+                if (typedefNode) {
+                    // Typedef path: e.g., testMapType → oldType is map<string, string>
+                    resolvedType = typedefNode.oldType.identifier;
+                    tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
+                } else {
+                    resolvedType = varType;
+                    // Direct generic path: e.g., map<string, int> myMap
+                    // resolveVariableTypeNode returns the full TypeNode with genericArgs
+                    const varTypeNode = this.resolveVariableTypeNode(doc, pos, name);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        tplMap = this.buildTemplateMap(resolvedType, varTypeNode.genericArgs);
+                    }
+                }
                 // Get methods/fields for this type (including inherited)
-                const members = this.getClassMemberCompletions(varType, prefix);
+                const members = this.getClassMemberCompletions(resolvedType, prefix, tplMap);
                 return members;
-            } else {
             }
             
             // If name looks like a class name (starts with uppercase), 
@@ -495,10 +526,6 @@ export class Analyzer {
     }
 
     /**
-     * Resolve the type of a variable at a given position
-     * Checks: function parameters, local variables, class fields
-     */
-    /**
      * Known DayZ global variables that have a more specific type than declared.
      * Example: g_Game is declared as "Game" but is actually "CGame"
      */
@@ -506,6 +533,11 @@ export class Analyzer {
         'g_Game': 'CGame',
     };
 
+    /**
+     * Resolve the type of a variable at a given position.
+     * Checks known overrides, then delegates AST lookup to resolveVariableTypeNode,
+     * and falls back to regex patterns for variables the AST misses.
+     */
     private resolveVariableType(doc: TextDocument, pos: Position, varName: string): string | null {
         
         // Check for known variable type overrides first
@@ -514,52 +546,14 @@ export class Analyzer {
             return knownType;
         }
         
-        const ast = this.ensure(doc);
-        
-        // Find which function we're inside
-        const containingFunc = this.findContainingFunction(ast, pos);
-        
-        if (containingFunc) {
-            // Check function parameters first
-            // Example: void SomeFunc(PlayerBase p) { p. } → type is "PlayerBase"
-            for (const param of containingFunc.parameters || []) {
-                if (param.name === varName) {
-                    return param.type?.identifier || null;
-                }
-            }
-            
-            // Check local variables
-            for (const local of containingFunc.locals || []) {
-                if (local.name === varName) {
-                    return local.type?.identifier || null;
-                }
-            }
+        // Delegate the AST-based lookup to resolveVariableTypeNode
+        const typeNode = this.resolveVariableTypeNode(doc, pos, varName);
+        if (typeNode) {
+            return typeNode.identifier || null;
         }
         
-        // Check if we're inside a class - look for fields + inherited fields
-        const containingClass = this.findContainingClass(ast, pos);
-        if (containingClass) {
-            // Check current class and all parent classes (including modded)
-            const classHierarchy = this.getClassHierarchyOrdered(containingClass.name, new Set());
-            for (const classNode of classHierarchy) {
-                for (const member of classNode.members || []) {
-                    if (member.kind === 'VarDecl' && member.name === varName) {
-                        return (member as VarDeclNode).type?.identifier || null;
-                    }
-                }
-            }
-        }
-        
-        // Check global variables in ALL indexed files
-        for (const [uri, fileAst] of this.docCache) {
-            for (const node of fileAst.body) {
-                if (node.kind === 'VarDecl' && node.name === varName) {
-                    return (node as VarDeclNode).type?.identifier || null;
-                }
-            }
-        }
-        
-        // Try scanning the current document for variable declarations
+        // Regex fallbacks for cases the AST-based lookup misses
+        // (e.g., variables in unparsed regions)
         const text = doc.getText();
         
         // Pattern: Type varName; or Type varName =
@@ -584,6 +578,53 @@ export class Analyzer {
     }
 
     /**
+     * Resolve a variable's full TypeNode (including genericArgs).
+     * Unlike resolveVariableType() which returns just the type name string,
+     * this returns the complete TypeNode so we can access generic type arguments.
+     * 
+     * This is needed for direct generic declarations like:
+     *   map<string, int> myMap;  →  TypeNode { identifier: "map", genericArgs: ["string", "int"] }
+     * 
+     * Search order: function params → function locals → class fields → global variables
+     * @returns The full TypeNode or null if not found
+     */
+    private resolveVariableTypeNode(doc: TextDocument, pos: Position, varName: string): TypeNode | null {
+        const ast = this.ensure(doc);
+        
+        const containingFunc = this.findContainingFunction(ast, pos);
+        if (containingFunc) {
+            for (const param of containingFunc.parameters || []) {
+                if (param.name === varName && param.type) return param.type;
+            }
+            for (const local of containingFunc.locals || []) {
+                if (local.name === varName && local.type) return local.type;
+            }
+        }
+        
+        const containingClass = this.findContainingClass(ast, pos);
+        if (containingClass) {
+            const classHierarchy = this.getClassHierarchyOrdered(containingClass.name, new Set());
+            for (const classNode of classHierarchy) {
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'VarDecl' && member.name === varName && (member as VarDeclNode).type) {
+                        return (member as VarDeclNode).type!;
+                    }
+                }
+            }
+        }
+        
+        for (const [uri, fileAst] of this.docCache) {
+            for (const node of fileAst.body) {
+                if (node.kind === 'VarDecl' && node.name === varName && (node as VarDeclNode).type) {
+                    return (node as VarDeclNode).type!;
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    /**
      * Known DayZ singleton functions that return a more specific type than declared.
      * These functions are declared to return base class but actually return derived class.
      * Example: GetGame() is declared as returning "Game" but actually returns "CGame"
@@ -599,11 +640,19 @@ export class Analyzer {
      * Searches top-level functions and class methods across all indexed files
      */
     private resolveFunctionReturnType(funcName: string): string | null {
+        return this.resolveFunctionReturnTypeNode(funcName)?.identifier ?? null;
+    }
+
+    /**
+     * Resolve the return type of a global/static function, returning full TypeNode info.
+     */
+    private resolveFunctionReturnTypeNode(funcName: string): TypeNode | null {
         
         // Check for known overrides first (e.g., GetGame() returns CGame, not Game)
         const knownType = Analyzer.KNOWN_RETURN_TYPES[funcName];
         if (knownType) {
-            return knownType;
+            // Return a synthetic TypeNode for known types
+            return { kind: 'Type', identifier: knownType, arrayDims: [], modifiers: [], uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
         }
         
         // Search all indexed documents for a function with this name
@@ -612,9 +661,8 @@ export class Analyzer {
                 // Top-level function
                 if (node.kind === 'FunctionDecl' && node.name === funcName) {
                     const func = node as FunctionDeclNode;
-                    const returnType = func.returnType?.identifier;
-                    if (returnType) {
-                        return returnType;  // Return 'void' too - we want to detect void assignments
+                    if (func.returnType?.identifier) {
+                        return func.returnType;
                     }
                 }
                 
@@ -623,9 +671,8 @@ export class Analyzer {
                     for (const member of (node as ClassDeclNode).members || []) {
                         if (member.kind === 'FunctionDecl' && member.name === funcName) {
                             const func = member as FunctionDeclNode;
-                            const returnType = func.returnType?.identifier;
-                            if (returnType) {
-                                return returnType;  // Return 'void' too
+                            if (func.returnType?.identifier) {
+                                return func.returnType;
                             }
                         }
                     }
@@ -642,16 +689,33 @@ export class Analyzer {
      * @param methodName The method name to find
      */
     private resolveMethodReturnType(className: string, methodName: string): string | null {
+        const result = this.resolveMethodReturnTypeNode(className, methodName);
+        return result?.identifier ?? null;
+    }
+
+    /**
+     * Resolve the return type of a method/field within a class hierarchy, returning full type info.
+     * Includes genericArgs for template types like map<string, int>.
+     */
+    private resolveMethodReturnTypeNode(className: string, methodName: string): TypeNode | null {
+        // Resolve typedefs first (e.g., testMapType → map)
+        const resolvedClass = this.resolveTypedef(className);
         const visited = new Set<string>();
-        const classesToSearch = this.getClassHierarchyOrdered(className, visited);
+        const classesToSearch = this.getClassHierarchyOrdered(resolvedClass, visited);
         
         for (const classNode of classesToSearch) {
             for (const member of classNode.members || []) {
                 if (member.kind === 'FunctionDecl' && member.name === methodName) {
                     const func = member as FunctionDeclNode;
-                    const returnType = func.returnType?.identifier;
-                    if (returnType) {
-                        return returnType;  // Return 'void' too - we want to detect void assignments
+                    if (func.returnType?.identifier) {
+                        return func.returnType;
+                    }
+                }
+                // Also check fields (VarDecl members)
+                if (member.kind === 'VarDecl' && member.name === methodName) {
+                    const varNode = member as VarDeclNode;
+                    if (varNode.type?.identifier) {
+                        return varNode.type;
                     }
                 }
             }
@@ -661,96 +725,260 @@ export class Analyzer {
     }
 
     /**
+     * Get the genericVars (template parameter names) for a class by name.
+     * e.g. for "map" returns ["TKey", "TValue"]
+     */
+    private getClassGenericVars(className: string): string[] | undefined {
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl' && node.name === className) {
+                    return (node as ClassDeclNode).genericVars;
+                }
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Build a template substitution map from a class's genericVars and concrete genericArgs.
+     * 
+     * Maps the class's formal template parameter names to the concrete types provided
+     * by a typedef or direct generic instantiation.
+     * 
+     * Example:
+     *   class map<Class TKey, Class TValue> { ... }
+     *   typedef map<string, int> TMyMap;
+     *   → buildTemplateMap("map", [{identifier:"string"}, {identifier:"int"}])
+     *   → Map { "TKey" → "string", "TValue" → "int" }
+     * 
+     * The className is first resolved through typedefs (in case the caller
+     * passes a typedef alias instead of the actual class name).
+     * 
+     * @param className   The class name (will be resolved through typedefs)
+     * @param genericArgs Concrete type arguments from the typedef/instantiation
+     * @returns Map of template param name → concrete type name (empty if not generic)
+     */
+    private buildTemplateMap(className: string, genericArgs?: TypeNode[]): Map<string, string> {
+        const templateMap = new Map<string, string>();
+        if (!genericArgs || genericArgs.length === 0) return templateMap;
+        
+        // Resolve through typedefs first
+        const resolvedClass = this.resolveTypedef(className);
+        const genericVars = this.getClassGenericVars(resolvedClass);
+        if (!genericVars) return templateMap;
+        
+        for (let i = 0; i < Math.min(genericVars.length, genericArgs.length); i++) {
+            templateMap.set(genericVars[i], genericArgs[i].identifier);
+        }
+        return templateMap;
+    }
+
+    /**
+     * Resolve a type name through typedefs to the underlying class name.
+     * e.g., "testMapType" → "map" if typedef map<string,string> testMapType;
+     * Returns the original typeName if it's not a typedef.
+     */
+    private resolveTypedef(typeName: string): string {
+        const node = this.resolveTypedefNode(typeName);
+        return node ? node.oldType.identifier : typeName;
+    }
+
+    /**
+     * Find the TypedefNode for a given type name.
+     * Returns null if the type is not a typedef.
+     */
+    private resolveTypedefNode(typeName: string): TypedefNode | null {
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.kind === 'Typedef' && node.name === typeName) {
+                    return node as TypedefNode;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Resolve the final return type of a method chain like "U().Msg().SetMeta(...)"
      * Parses the chain and follows each call to determine the final return type.
      * @param chainText The full chain text starting from the first function
      * @returns The return type of the final call in the chain, or null if unresolved
      */
-    private resolveChainReturnType(chainText: string): string | null {
-        // Parse the chain: extract each function/method call in sequence
-        // Examples:
-        //   "U().Msg().SetMeta(foo, bar)" -> ["U", "Msg", "SetMeta"]
-        //   "GetGame().GetTime()" -> ["GetGame", "GetTime"]
-        
+    /**
+     * Parse chained member accesses from text like ".Method(args).Prop.Other()"
+     * into a list of member names: ["Method", "Prop", "Other"].
+     * Handles both method calls (with parenthesized arguments) and property accesses.
+     */
+    private parseChainMembers(text: string): string[] {
         const calls: string[] = [];
-        let remaining = chainText.trim();
+        let remaining = text.trim();
         
-        // First call: funcName(...)
-        const firstMatch = remaining.match(/^(\w+)\s*\(/);
-        if (!firstMatch) {
-            return null;
-        }
-        calls.push(firstMatch[1]);
-        
-        // Skip past the first call's arguments
-        remaining = remaining.substring(firstMatch[0].length);
-        let parenDepth = 1;
-        let i = 0;
-        
-        while (i < remaining.length && parenDepth > 0) {
-            if (remaining[i] === '(') parenDepth++;
-            else if (remaining[i] === ')') parenDepth--;
-            i++;
-        }
-        
-        remaining = remaining.substring(i).trim();
-        
-        // Continue parsing chained calls: .methodName(...)
         while (remaining.startsWith('.')) {
             remaining = remaining.substring(1).trim();
             
             const methodMatch = remaining.match(/^(\w+)\s*\(/);
             if (!methodMatch) {
-                // Might be a property access, not a method call
+                // Property access (no parens), e.g., .Icons
                 const propMatch = remaining.match(/^(\w+)/);
                 if (propMatch) {
                     calls.push(propMatch[1]);
+                    remaining = remaining.substring(propMatch[0].length).trim();
+                    continue;
                 }
                 break;
             }
             
             calls.push(methodMatch[1]);
             
-            // Skip past this call's arguments
+            // Skip past this call's arguments (balanced parens)
             remaining = remaining.substring(methodMatch[0].length);
-            parenDepth = 1;
-            i = 0;
-            
+            let parenDepth = 1, i = 0;
             while (i < remaining.length && parenDepth > 0) {
                 if (remaining[i] === '(') parenDepth++;
                 else if (remaining[i] === ')') parenDepth--;
                 i++;
             }
-            
             remaining = remaining.substring(i).trim();
         }
         
-        if (calls.length === 0) {
-            return null;
-        }
-        
-        
-        // Resolve the chain step by step
-        // First call is a function (global or static)
-        let currentType = this.resolveFunctionReturnType(calls[0]);
-        if (!currentType) {
-            return null;
-        }
-        
-        
-        // Each subsequent call is a method on the current type
-        for (let j = 1; j < calls.length; j++) {
-            const methodName = calls[j];
-            const nextType = this.resolveMethodReturnType(currentType, methodName);
+        return calls;
+    }
+
+    /**
+     * Resolve a sequence of member accesses on a type, tracking template parameter
+     * substitution at each step.
+     * 
+     * At each step:
+     *   1. Look up the member's return TypeNode in the class hierarchy
+     *   2. Apply template substitution (e.g., TKey → string)
+     *   3. If the result is a typedef, expand it and rebuild the template map
+     *   4. If the result has its own generic args, propagate them
+     * 
+     * @param calls       Ordered member names to resolve (e.g., ["Get", "Length"])
+     * @param currentType The starting type (already typedef-resolved)
+     * @param templateMap The starting template substitution map
+     * @returns The final resolved type, or null if any step fails
+     */
+    private resolveChainSteps(
+        calls: string[],
+        currentType: string,
+        templateMap: Map<string, string>
+    ): string | null {
+        for (const memberName of calls) {
+            const nextTypeNode = this.resolveMethodReturnTypeNode(currentType, memberName);
+            if (!nextTypeNode?.identifier) return null;
             
-            if (!nextType) {
-                return null;
+            let resolvedType = nextTypeNode.identifier;
+            
+            // Apply template substitution (e.g., GetKey() returns TKey → "string")
+            if (templateMap.has(resolvedType)) {
+                resolvedType = templateMap.get(resolvedType)!;
             }
             
-            currentType = nextType;
+            // Resolve through typedefs and rebuild template map for the next step
+            const stepTypedef = this.resolveTypedefNode(resolvedType);
+            if (stepTypedef) {
+                resolvedType = stepTypedef.oldType.identifier;
+                if (stepTypedef.oldType.genericArgs && stepTypedef.oldType.genericArgs.length > 0) {
+                    templateMap = this.buildTemplateMap(resolvedType, stepTypedef.oldType.genericArgs);
+                } else {
+                    templateMap = new Map();
+                }
+            } else if (nextTypeNode.genericArgs && nextTypeNode.genericArgs.length > 0) {
+                // Substitute any generic args that reference template params
+                const substitutedArgs = nextTypeNode.genericArgs.map(arg => {
+                    const subId = templateMap.get(arg.identifier);
+                    if (subId) return { ...arg, identifier: subId } as TypeNode;
+                    return arg;
+                });
+                templateMap = this.buildTemplateMap(resolvedType, substitutedArgs);
+            } else {
+                templateMap = new Map();
+            }
+            
+            currentType = resolvedType;
         }
         
         return currentType;
+    }
+
+    /**
+     * Resolve the final return type of a function chain like "U().Msg().SetMeta(...)".
+     * Parses the chain, resolves the first function call, then delegates to
+     * resolveChainSteps for subsequent member accesses.
+     */
+    private resolveChainReturnType(chainText: string): string | null {
+        // Parse the first call: funcName(args)
+        const remaining = chainText.trim();
+        const firstMatch = remaining.match(/^(\w+)\s*\(/);
+        if (!firstMatch) return null;
+        
+        const firstFunc = firstMatch[1];
+        
+        // Skip past the first call's arguments (balanced parens)
+        let afterFirst = remaining.substring(firstMatch[0].length);
+        let parenDepth = 1, i = 0;
+        while (i < afterFirst.length && parenDepth > 0) {
+            if (afterFirst[i] === '(') parenDepth++;
+            else if (afterFirst[i] === ')') parenDepth--;
+            i++;
+        }
+        afterFirst = afterFirst.substring(i).trim();
+        
+        // Parse remaining chain members: .Method().Prop.Other()
+        const calls = this.parseChainMembers(afterFirst);
+        
+        // Resolve the first function's return type
+        const firstTypeNode = this.resolveFunctionReturnTypeNode(firstFunc);
+        if (!firstTypeNode?.identifier) return null;
+        
+        let currentType = firstTypeNode.identifier;
+        
+        // Resolve typedef and build initial template map
+        let templateMap: Map<string, string>;
+        const typedefNode = this.resolveTypedefNode(currentType);
+        if (typedefNode) {
+            currentType = typedefNode.oldType.identifier;
+            templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+        } else {
+            templateMap = this.buildTemplateMap(currentType, firstTypeNode.genericArgs);
+        }
+        
+        // If no chained calls, return the first function's resolved type
+        if (calls.length === 0) return currentType;
+        
+        // Delegate remaining chain steps
+        return this.resolveChainSteps(calls, currentType, templateMap);
+    }
+
+    /**
+     * Resolve the return type of a variable method/property chain like "testMap.Get(key)".
+     * Resolves the variable's type (through typedefs), builds the template map,
+     * then delegates to resolveChainSteps for the member accesses.
+     * 
+     * Used by type mismatch checking (Patterns 5 & 6) to detect errors like:
+     *   int x = testMap.Get("key");  // map<string,string>.Get returns string, not int
+     * 
+     * @param varType   The declared type of the variable (may be a typedef alias)
+     * @param chainText The chain text after the variable (e.g., ".Get(key)")
+     * @returns The resolved concrete return type, or null if unresolvable
+     */
+    private resolveVariableChainType(varType: string, chainText: string): string | null {
+        const calls = this.parseChainMembers(chainText);
+        if (calls.length === 0) return null;
+        
+        // Resolve starting type through typedef and build template map
+        let currentType = varType;
+        let templateMap: Map<string, string>;
+        const typedefNode = this.resolveTypedefNode(currentType);
+        if (typedefNode) {
+            currentType = typedefNode.oldType.identifier;
+            templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+        } else {
+            templateMap = new Map();
+        }
+        
+        return this.resolveChainSteps(calls, currentType, templateMap);
     }
 
     /**
@@ -802,17 +1030,33 @@ export class Analyzer {
     }
 
     /**
-     * Get member completions for a class type (methods + fields)
-     * Walks the FULL inheritance chain INCLUDING modded classes
+     * Get member completions for a class type (methods + fields).
+     * Walks the FULL inheritance chain INCLUDING modded classes.
+     * 
+     * @param className   The resolved class name (e.g., "map", not the typedef alias)
+     * @param prefix      Filter prefix for completion items (case-insensitive)
+     * @param templateMap Optional map of generic param names → concrete types.
+     *                    When provided, substitutes generic names in completion details.
+     *                    e.g., { "TKey": "string", "TValue": "int" } would show
+     *                    Get() as returning "int" instead of "TValue".
      */
-    private getClassMemberCompletions(className: string, prefix: string): CompletionResult[] {
+    private getClassMemberCompletions(className: string, prefix: string, templateMap?: Map<string, string>): CompletionResult[] {
         const results: CompletionResult[] = [];
         const seen = new Set<string>(); // Deduplicate by name
         
+        // Helper to substitute generic type names with concrete types from templateMap.
+        // e.g., subst("TValue") → "string" when templateMap has { TValue: "string" }
+        // Returns the original name unchanged if not in the map or map is empty.
+        const subst = (typeName: string | undefined): string | undefined => {
+            if (!typeName || !templateMap || templateMap.size === 0) return typeName;
+            return templateMap.get(typeName) || typeName;
+        };
         
         // Get the complete class hierarchy including modded classes
         const classHierarchy = this.getClassHierarchyOrdered(className, new Set());
         
+        // Collect all class names in the hierarchy to filter out constructors/destructors
+        const classNames = new Set(classHierarchy.map(c => c.name));
         
         for (const classNode of classHierarchy) {
             for (const member of classNode.members || []) {
@@ -823,13 +1067,18 @@ export class Analyzer {
                 // Skip static members for instance completions
                 if (member.modifiers?.includes('static')) continue;
                 
+                // Skip constructors and destructors — not valid for instance dot-access
+                if (classNames.has(member.name) || member.name.startsWith('~')) continue;
+                
                 seen.add(member.name);
                 
                 if (member.kind === 'FunctionDecl') {
                     const func = member as FunctionDeclNode;
                     const params = func.parameters?.map(p => 
-                        `${p.type?.identifier || 'auto'} ${p.name}`
+                        `${subst(p.type?.identifier) || 'auto'} ${p.name}`
                     ).join(', ') || '';
+                    
+                    const resolvedReturnType = subst(func.returnType?.identifier) || 'void';
                     
                     // Show visibility modifier if present
                     const visibility = func.modifiers?.find(m => ['private', 'protected'].includes(m)) || '';
@@ -838,19 +1087,20 @@ export class Analyzer {
                     results.push({
                         name: func.name,
                         kind: 'function',
-                        detail: `${visPrefix}${func.returnType?.identifier || 'void'} - ${classNode.name}`,
+                        detail: `${visPrefix}${resolvedReturnType}(${params}) - ${classNode.name}`,
                         insertText: `${func.name}()`,
-                        returnType: func.returnType?.identifier
+                        returnType: resolvedReturnType
                     });
                 } else if (member.kind === 'VarDecl') {
                     const field = member as VarDeclNode;
+                    const resolvedFieldType = subst(field.type?.identifier) || 'auto';
                     const visibility = field.modifiers?.find(m => ['private', 'protected'].includes(m)) || '';
                     const visPrefix = visibility ? `${visibility} ` : '';
                     
                     results.push({
                         name: field.name,
                         kind: 'variable',
-                        detail: `${visPrefix}${field.type?.identifier || 'auto'} - ${classNode.name}`
+                        detail: `${visPrefix}${resolvedFieldType} - ${classNode.name}`
                     });
                 }
             }
@@ -1022,9 +1272,12 @@ export class Analyzer {
         if (memberMatch) {
             // MEMBER ACCESS: Resolve the variable type and search only that class hierarchy
             const varName = memberMatch[1];
-            const varType = this.resolveVariableType(doc, _pos, varName);
+            let varType = this.resolveVariableType(doc, _pos, varName);
             
             if (varType) {
+                // Resolve through typedefs so go-to-definition works on typedef'd variables
+                // e.g., testMap.Get → varType="testMapType" → resolve to "map" → find Get in map hierarchy
+                varType = this.resolveTypedef(varType);
                 const classMatches = this.findMemberInClassHierarchy(varType, name);
                 if (classMatches.length > 0) {
                     return classMatches;
@@ -1566,8 +1819,10 @@ export class Analyzer {
                 const typeName = match[1];
                 const varName = match[2];
                 
-                // Skip if it looks like a function call or keyword
-                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event'].includes(typeName)) {
+                // Skip keywords that are not actual type names.
+                // 'typedef' is included because lines like "typedef set<float> TFloatSet;"
+                // match the varDeclPattern as type=typedef, name=set — which is a false positive.
+                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef'].includes(typeName)) {
                     continue;
                 }
                 
@@ -1691,6 +1946,17 @@ export class Analyzer {
             return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
+        // Skip if either type is an unresolvable template parameter (TKey, TValue, T, etc.)
+        // These can't be checked without full template substitution, so assume compatible.
+        // Check: if the type doesn't exist as a known class, enum, or typedef in the index,
+        // it's likely a template parameter or something we can't verify.
+        const hardcodedPrimitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
+        const declIsKnown = hardcodedPrimitives.has(declLower) || this.findAllClassesByName(declNorm).length > 0;
+        const assignIsKnown = hardcodedPrimitives.has(assignLower) || this.findAllClassesByName(assignNorm).length > 0;
+        if (!declIsKnown || !assignIsKnown) {
+            return { compatible: true, isDowncast: false, isUpcast: false }; // Unresolvable type
+        }
+        
         // array types - need to check element type compatibility
         if (declNorm.startsWith('array<') || assignNorm.startsWith('array<')) {
             const bothArrays = declNorm.startsWith('array') && assignNorm.startsWith('array');
@@ -1731,8 +1997,6 @@ export class Analyzer {
             return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
-        // Hardcoded primitives - used as fallback when not indexed
-        const hardcodedPrimitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
         const declIsPrimitive = hardcodedPrimitives.has(declLower);
         const assignIsPrimitive = hardcodedPrimitives.has(assignLower);
         
@@ -1767,14 +2031,6 @@ export class Analyzer {
                 isUpcast: false,
                 message: `Cannot assign '${assignNorm}' to '${declNorm}'`
             };
-        }
-        
-        // If we can't determine the types (not in cache), assume compatible
-        const declExists = this.findAllClassesByName(declNorm).length > 0;
-        const assignExists = this.findAllClassesByName(assignNorm).length > 0;
-        
-        if (!declExists || !assignExists) {
-            return { compatible: true, isDowncast: false, isUpcast: false }; // Unknown types
         }
         
         // No compatibility found - types are unrelated
@@ -2126,7 +2382,7 @@ export class Analyzer {
             const funcName = match[3];
             
             // Skip if declared type is a keyword that's not a type
-            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum'].includes(declaredType)) {
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'typedef'].includes(declaredType)) {
                 continue;
             }
             
@@ -2154,25 +2410,56 @@ export class Analyzer {
             let highlightLength = match[0].length;  // Default to just the match
             
             if (chainDetected) {
-                // Find the end of the full statement (semicolon or closing paren+semicolon)
-                // Much simpler: just find where the statement ends
+                // Find end of the chain by tracking parens and dot-access patterns.
+                // Stop at operators (+, -, *, etc.) or semicolons outside the chain.
                 const stmtEnd = afterMatch.indexOf(';');
                 let chainEnd = stmtEnd >= 0 ? stmtEnd : afterMatch.length;
                 
-                // For highlighting, we want to include up to but not including the semicolon
-                // But we need to find where the actual chain ends (last closing paren before semicolon)
-                let lastParen = chainEnd;
-                for (let i = chainEnd - 1; i >= 0; i--) {
-                    if (afterMatch[i] === ')') {
-                        lastParen = i + 1;
-                        break;
-                    }
-                }
-                chainEnd = lastParen;
-                
+                // For type resolution, pass everything up to ';' - resolveChainReturnType
+                // handles trailing non-chain text gracefully
                 const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
                 returnType = this.resolveChainReturnType(fullChainText);
-                highlightLength = match[0].length + chainEnd;
+                
+                // For highlight, find where the chain actually ends (last ')' or property name)
+                // by scanning: balanced parens, then optional .identifier or .identifier(...)
+                let hlEnd = 0;
+                let depth = 1;
+                // First: find closing paren of first call
+                for (let ci = 0; ci < afterMatch.length && depth > 0; ci++) {
+                    if (afterMatch[ci] === '(') depth++;
+                    else if (afterMatch[ci] === ')') depth--;
+                    if (depth === 0) { hlEnd = ci + 1; break; }
+                }
+                // Then: continue following .identifier and .identifier(...)
+                let pos = hlEnd;
+                while (pos < afterMatch.length) {
+                    // Skip whitespace
+                    let ws = pos;
+                    while (ws < afterMatch.length && (afterMatch[ws] === ' ' || afterMatch[ws] === '\t')) ws++;
+                    if (ws >= afterMatch.length || afterMatch[ws] !== '.') break;
+                    ws++; // skip dot
+                    while (ws < afterMatch.length && (afterMatch[ws] === ' ' || afterMatch[ws] === '\t')) ws++;
+                    // Match identifier
+                    const idStart = ws;
+                    while (ws < afterMatch.length && /\w/.test(afterMatch[ws])) ws++;
+                    if (ws === idStart) break; // no identifier after dot
+                    pos = ws;
+                    hlEnd = pos;
+                    // Check for (...)
+                    let ps = pos;
+                    while (ps < afterMatch.length && (afterMatch[ps] === ' ' || afterMatch[ps] === '\t')) ps++;
+                    if (ps < afterMatch.length && afterMatch[ps] === '(') {
+                        depth = 1; ps++;
+                        while (ps < afterMatch.length && depth > 0) {
+                            if (afterMatch[ps] === '(') depth++;
+                            else if (afterMatch[ps] === ')') depth--;
+                            ps++;
+                        }
+                        pos = ps;
+                        hlEnd = pos;
+                    }
+                }
+                highlightLength = match[0].length + hlEnd;
             } else {
                 // Get the return type of the single function
                 // Need to find where single function call ends
@@ -2219,7 +2506,7 @@ export class Analyzer {
             
             
             // Skip if declared type is a keyword
-            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else'].includes(declaredType)) {
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'typedef'].includes(declaredType)) {
                 continue;
             }
             
@@ -2344,16 +2631,41 @@ export class Analyzer {
                 const stmtEnd = afterMatch.indexOf(';');
                 chainEnd = stmtEnd >= 0 ? stmtEnd : afterMatch.length;
                 
-                // Find where the actual chain ends (last closing paren before semicolon)
-                for (let i = chainEnd - 1; i >= 0; i--) {
-                    if (afterMatch[i] === ')') {
-                        chainEnd = i + 1;
-                        break;
-                    }
-                }
-                
                 const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
                 returnType = this.resolveChainReturnType(fullChainText);
+                
+                // For highlight, find where the chain actually ends (last ')' or property name)
+                let hlEnd = 0;
+                let depth2 = 1;
+                for (let ci = 0; ci < afterMatch.length && depth2 > 0; ci++) {
+                    if (afterMatch[ci] === '(') depth2++;
+                    else if (afterMatch[ci] === ')') depth2--;
+                    if (depth2 === 0) { hlEnd = ci + 1; break; }
+                }
+                let pos = hlEnd;
+                while (pos < afterMatch.length) {
+                    let ws = pos;
+                    while (ws < afterMatch.length && (afterMatch[ws] === ' ' || afterMatch[ws] === '\t')) ws++;
+                    if (ws >= afterMatch.length || afterMatch[ws] !== '.') break;
+                    ws++;
+                    while (ws < afterMatch.length && (afterMatch[ws] === ' ' || afterMatch[ws] === '\t')) ws++;
+                    const idStart = ws;
+                    while (ws < afterMatch.length && /\w/.test(afterMatch[ws])) ws++;
+                    if (ws === idStart) break;
+                    pos = ws; hlEnd = pos;
+                    let ps = pos;
+                    while (ps < afterMatch.length && (afterMatch[ps] === ' ' || afterMatch[ps] === '\t')) ps++;
+                    if (ps < afterMatch.length && afterMatch[ps] === '(') {
+                        depth2 = 1; ps++;
+                        while (ps < afterMatch.length && depth2 > 0) {
+                            if (afterMatch[ps] === '(') depth2++;
+                            else if (afterMatch[ps] === ')') depth2--;
+                            ps++;
+                        }
+                        pos = ps; hlEnd = pos;
+                    }
+                }
+                chainEnd = hlEnd;
             } else {
                 // Find where single function call ends
                 let depth = 1;
@@ -2382,6 +2694,99 @@ export class Analyzer {
                 const actualLength = match[0].length - 1 - leadingWhitespace.length + chainEnd;
                 this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, returnType);
             }
+        }
+        
+        // ================================================================
+        // Pattern 5: Type varName = someVar.Method();
+        // ================================================================
+        // Detects type mismatches in declarations where the RHS is a variable
+        // method chain. Example:
+        //   typedef map<string, string> TMap;
+        //   TMap m;
+        //   int x = m.Get("key");  // ERROR: Get returns string, not int
+        //
+        // Uses resolveVariableChainType to resolve the chain through typedefs
+        // and template substitution.
+        // ================================================================
+        const varChainDeclPattern = /\b(\w+)[ \t]+(\w+)\s*=\s*(\w+)\s*\./g;
+        
+        while ((match = varChainDeclPattern.exec(text)) !== null) {
+            if (isInsideCommentOrString(match.index)) continue;
+            if (match[0].includes('\n')) continue;
+            
+            const declaredType = match[1];
+            const varName = match[2];
+            const sourceVar = match[3];
+            
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'typedef'].includes(declaredType)) continue;
+            
+            // Get the type of the source variable
+            const lineNum = getLineFromPos(match.index);
+            const sourceVarType = getVarTypeAtLine(sourceVar, lineNum);
+            if (!sourceVarType) continue;
+            
+            // Get the chain text from the dot onwards
+            const afterDot = text.substring(match.index + match[0].length);
+            const stmtEnd = afterDot.indexOf(';');
+            const chainText = '.' + afterDot.substring(0, stmtEnd >= 0 ? stmtEnd : afterDot.length);
+            
+            // Resolve the chain
+            const returnType = this.resolveVariableChainType(sourceVarType, chainText);
+            if (!returnType) continue;
+            
+            // Calculate highlight: from match start to end of chain (before semicolon)
+            const highlightLength = match[0].length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
+            
+            this.addTypeMismatchDiagnostic(doc, diags, match.index, highlightLength, declaredType, returnType);
+        }
+        
+        // ================================================================
+        // Pattern 6: varName = someVar.Method(); (reassignment)
+        // ================================================================
+        // Same as Pattern 5 but for reassignments where the variable was
+        // already declared. Looks up the target variable's type from the scope.
+        // Example:
+        //   string s;
+        //   s = testMap.Get("key");  // OK: string = string
+        //   int n;
+        //   n = testMap.Get("key");  // ERROR: int ≠ string
+        //
+        // The regex starts with a statement boundary (;, {, }, ), newline)
+        // to avoid matching inside expressions.
+        // ================================================================
+        const varChainReassignPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*\./g;
+        
+        while ((match = varChainReassignPattern.exec(text)) !== null) {
+            if (isInsideCommentOrString(match.index)) continue;
+            
+            const leadingWs = match[1];
+            const targetVar = match[2];
+            const sourceVar = match[3];
+            
+            const coreP6 = match[0].substring(1 + leadingWs.length);
+            if (coreP6.includes('\n')) continue;
+            
+            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) continue;
+            
+            const lineNum = getLineFromPos(match.index);
+            const targetType = getVarTypeAtLine(targetVar, lineNum);
+            const sourceVarType = getVarTypeAtLine(sourceVar, lineNum);
+            if (!targetType || !sourceVarType) continue;
+            
+            // Get chain text
+            const afterDot = text.substring(match.index + match[0].length);
+            const stmtEnd = afterDot.indexOf(';');
+            const chainText = '.' + afterDot.substring(0, stmtEnd >= 0 ? stmtEnd : afterDot.length);
+            
+            const returnType = this.resolveVariableChainType(sourceVarType, chainText);
+            if (!returnType) continue;
+            
+            if (/^[A-Z]$/.test(targetType) || /^[A-Z]$/.test(returnType)) continue;
+            if (targetType === returnType) continue;
+            
+            const actualStart = match.index + 1 + leadingWs.length;
+            const actualLength = match[0].length - 1 - leadingWs.length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
+            this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, returnType);
         }
     }
 

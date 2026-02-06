@@ -373,6 +373,7 @@ export function parse(
                 name: nameTok.value,
                 nameStart: doc.positionAt(nameTok.start),
                 nameEnd: doc.positionAt(nameTok.end),
+                genericVars: genericVars,
                 base: base,
                 annotations: annotations,
                 modifiers: mods,

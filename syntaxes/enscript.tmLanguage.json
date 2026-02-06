@@ -89,6 +89,9 @@
 					"include": "#enum-declaration"
 				},
 				{
+					"include": "#typedef-declaration"
+				},
+				{
 					"include": "#interface-declaration"
 				},
 				{
@@ -712,6 +715,24 @@
 					"include": "#generic-constraints"
 				}
 			]
+		},
+		"typedef-declaration": {
+			"match": "(?<!\\.)\\b(typedef)\\b\\s+(.*?)\\s+(@?[_[:alpha:]][_[:alnum:]]*)\\s*;",
+			"captures": {
+				"1": {
+					"name": "storage.type.typedef.cs"
+				},
+				"2": {
+					"patterns": [
+						{
+							"include": "#type"
+						}
+					]
+				},
+				"3": {
+					"name": "entity.name.type.alias.cs"
+				}
+			}
 		},
 		"enum-declaration": {
 			"begin": "(?=\\benum\\b)",
