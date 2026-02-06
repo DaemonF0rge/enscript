@@ -795,27 +795,44 @@ export class Analyzer {
 
     /**
      * Get static member completions for a class (ClassName.StaticMethod())
+     * Walks the full hierarchy: parent classes + modded classes
      */
     private getStaticMemberCompletions(classNode: ClassDeclNode, prefix: string): CompletionResult[] {
         const results: CompletionResult[] = [];
+        const seen = new Set<string>();
         
-        for (const member of classNode.members || []) {
-            if (!member.name) continue;
-            if (!member.modifiers?.includes('static')) continue;
-            if (prefix && !member.name.toLowerCase().startsWith(prefix.toLowerCase())) continue;
-            
-            if (member.kind === 'FunctionDecl') {
-                const func = member as FunctionDeclNode;
-                const params = func.parameters?.map(p => 
-                    `${p.type?.identifier || 'auto'} ${p.name}`
-                ).join(', ') || '';
+        // Walk full hierarchy: parents + modded versions
+        const classHierarchy = this.getClassHierarchyOrdered(classNode.name, new Set());
+        
+        for (const cls of classHierarchy) {
+            for (const member of cls.members || []) {
+                if (!member.name) continue;
+                if (!member.modifiers?.includes('static')) continue;
+                if (seen.has(member.name)) continue;
+                if (prefix && !member.name.toLowerCase().startsWith(prefix.toLowerCase())) continue;
                 
-                results.push({
-                    name: `${func.name}(${params})`,
-                    kind: 'function',
-                    detail: `${func.returnType?.identifier || 'void'} (static)`,
-                    insertText: `${func.name}()`
-                });
+                seen.add(member.name);
+                
+                if (member.kind === 'FunctionDecl') {
+                    const func = member as FunctionDeclNode;
+                    const params = func.parameters?.map(p => 
+                        `${p.type?.identifier || 'auto'} ${p.name}`
+                    ).join(', ') || '';
+                    
+                    results.push({
+                        name: `${func.name}(${params})`,
+                        kind: 'function',
+                        detail: `${func.returnType?.identifier || 'void'} (static)`,
+                        insertText: `${func.name}()`
+                    });
+                } else if (member.kind === 'VarDecl') {
+                    const field = member as VarDeclNode;
+                    results.push({
+                        name: field.name,
+                        kind: 'variable',
+                        detail: `${field.type?.identifier || 'auto'} (static)`
+                    });
+                }
             }
         }
         
@@ -1427,7 +1444,7 @@ export class Analyzer {
             lineNoComment = lineNoComment.replace(/"(?:[^"\\]|\\.)*"/g, '""');  // Replace "..." with ""
             lineNoComment = lineNoComment.replace(/'(?:[^'\\]|\\.)*'/g, "''");  // Replace '...' with ''
             
-            lineNoComment = lineNoComment.trim();
+            const lineNoCommentTrimmed = lineNoComment.trim();
             
             // Check if this line starts a class
             if (classDeclPattern.test(lineNoComment)) {
@@ -1606,7 +1623,6 @@ export class Analyzer {
         const assignedHierarchy = this.getClassHierarchyOrdered(assignNorm, new Set());
         for (const classNode of assignedHierarchy) {
             if (classNode.name === declNorm) {
-                // declaredType is a parent of assignedType - this is an upcast (safe)
                 return { compatible: true, isDowncast: false, isUpcast: true };
             }
         }
@@ -1662,7 +1678,6 @@ export class Analyzer {
         }
         
         // If both are primitives but different (and not numeric), they're not compatible
-        // Note: numeric types (int/float/bool) were already handled above
         if (declIsPrimitive && assignIsPrimitive && declNorm !== assignNorm) {
             return { 
                 compatible: false, 
@@ -2214,6 +2229,7 @@ export class Analyzer {
             if (coreP4.includes('\n')) {
                 continue;
             }
+            
             // Skip keywords
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) {
                 continue;

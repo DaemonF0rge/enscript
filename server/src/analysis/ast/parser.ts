@@ -611,12 +611,18 @@ export function parse(
                     }
                     
                     if (curTok.value === '(' || curTok.value === '[' || curTok.value === '{' || curTok.value === '<') {
-                        // skip initializer expression
+                        // skip initializer expression (balanced brackets)
+                        // Must handle '>>' as two consecutive '>' closes for nested generics
+                        // e.g.: new array<ref array<PIXEL>>();
                         let depth = 1;
                         while (!eof() && depth > 0) {
                             const val = peek().value;
                             if (val === '(' || val === '[' || val === '{' || val === '<') depth++;
-                            if (val === ')' || val === ']' || val === '}' || val === '>') depth--;
+                            else if (val === ')' || val === ']' || val === '}' || val === '>') depth--;
+                            else if (val === '>>') depth -= 2;
+                            else if (val === '<<') depth += 2;
+                            // Safety: don't eat past statement boundary
+                            if (val === ';' && depth > 0) break;
                             next();
                         }
                     }
