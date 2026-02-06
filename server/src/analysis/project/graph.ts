@@ -329,6 +329,50 @@ export class Analyzer {
         // Check if we're after a dot (member completion)
         const textBeforeCursor = text.substring(0, offset);
         
+        // ================================================================
+        // MULTI-LEVEL CHAIN COMPLETION
+        // ================================================================
+        // Handles chains like: param.param4.G  or  param.Get("x").To
+        // Detects 2+ dot-separated segments, resolves through the chain
+        // (with typedef/template substitution), and offers completions
+        // for the final resolved type.
+        // ================================================================
+        const multiDotMatch = textBeforeCursor.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*(\w*)$/);
+        if (multiDotMatch) {
+            const rootName = multiDotMatch[1];
+            const middleChain = multiDotMatch[2]; // e.g., ".param4" or ".Get(key).field"
+            const prefix = multiDotMatch[3] || '';
+            
+            // Resolve the root variable's type
+            const rootType = this.resolveVariableType(doc, pos, rootName);
+            if (rootType) {
+                // Resolve root through typedef and build initial template map
+                let currentType = rootType;
+                let templateMap: Map<string, string>;
+                const typedefNode = this.resolveTypedefNode(currentType);
+                if (typedefNode) {
+                    currentType = typedefNode.oldType.identifier;
+                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+                } else {
+                    const varTypeNode = this.resolveVariableTypeNode(doc, pos, rootName);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
+                    } else {
+                        templateMap = new Map();
+                    }
+                }
+                
+                // Resolve through the middle chain steps
+                const chainMembers = this.parseChainMembers(middleChain);
+                if (chainMembers.length > 0) {
+                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
+                    if (result) {
+                        return this.getClassMemberCompletions(result.type, prefix, result.templateMap.size > 0 ? result.templateMap : undefined);
+                    }
+                }
+            }
+        }
+        
         // Match both variable.method and function().method patterns
         // Pattern 1: variable. or variable.prefix
         // Pattern 2: function(). or function().prefix  
@@ -857,13 +901,13 @@ export class Analyzer {
      * @param calls       Ordered member names to resolve (e.g., ["Get", "Length"])
      * @param currentType The starting type (already typedef-resolved)
      * @param templateMap The starting template substitution map
-     * @returns The final resolved type, or null if any step fails
+     * @returns The final resolved type and template map, or null if any step fails
      */
     private resolveChainSteps(
         calls: string[],
         currentType: string,
         templateMap: Map<string, string>
-    ): string | null {
+    ): { type: string; templateMap: Map<string, string> } | null {
         for (const memberName of calls) {
             const nextTypeNode = this.resolveMethodReturnTypeNode(currentType, memberName);
             if (!nextTypeNode?.identifier) return null;
@@ -899,7 +943,7 @@ export class Analyzer {
             currentType = resolvedType;
         }
         
-        return currentType;
+        return { type: currentType, templateMap };
     }
 
     /**
@@ -948,7 +992,7 @@ export class Analyzer {
         if (calls.length === 0) return currentType;
         
         // Delegate remaining chain steps
-        return this.resolveChainSteps(calls, currentType, templateMap);
+        return this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
     }
 
     /**
@@ -978,7 +1022,7 @@ export class Analyzer {
             templateMap = new Map();
         }
         
-        return this.resolveChainSteps(calls, currentType, templateMap);
+        return this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
     }
 
     /**
@@ -1262,6 +1306,46 @@ export class Analyzer {
         // Check if this is a member access (e.g., player.GetInputType or GetGame().GetTime())
         // Look backwards from the token start to find a dot
         const textBeforeToken = text.substring(0, token.start);
+        
+        // Multi-level chain: e.g., param.param4.GetSomething or param.Get("x").field
+        // Captures root variable + middle chain segments before the final dot
+        const multiLevelMatch = textBeforeToken.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*$/);
+        if (multiLevelMatch) {
+            const rootName = multiLevelMatch[1];
+            const middleChain = multiLevelMatch[2]; // e.g., ".param4" or ".Get(key).field"
+            
+            let rootType = this.resolveVariableType(doc, _pos, rootName);
+            if (rootType) {
+                // Resolve root through typedef and build initial template map
+                let currentType = rootType;
+                let templateMap: Map<string, string>;
+                const typedefNode = this.resolveTypedefNode(currentType);
+                if (typedefNode) {
+                    currentType = typedefNode.oldType.identifier;
+                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+                } else {
+                    currentType = this.resolveTypedef(currentType);
+                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, rootName);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
+                    } else {
+                        templateMap = new Map();
+                    }
+                }
+                
+                // Resolve through the middle chain to get the final type
+                const chainMembers = this.parseChainMembers(middleChain);
+                if (chainMembers.length > 0) {
+                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
+                    if (result) {
+                        const classMatches = this.findMemberInClassHierarchy(result.type, name);
+                        if (classMatches.length > 0) {
+                            return classMatches;
+                        }
+                    }
+                }
+            }
+        }
         
         // Pattern 1: variable.method (e.g., player.GetInputType)
         const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
