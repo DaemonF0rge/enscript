@@ -72,7 +72,21 @@ connection.onInitialized(async () => {
         Analyzer.instance().runDiagnostics(doc);  // will parse & cache
     }
 
-    console.log('Indexing complete.');
+    const stats = Analyzer.instance().getIndexStats();
+    const moduleNames: Record<number, string> = { 1: '1_Core', 2: '2_GameLib', 3: '3_Game', 4: '4_World', 5: '5_Mission' };
+    console.log(
+        `Indexing complete: ${stats.files} files, ` +
+        `${stats.classes} classes, ${stats.functions} functions, ` +
+        `${stats.enums} enums, ${stats.typedefs} typedefs, ${stats.globals} globals` +
+        (stats.parseErrors > 0 ? ` (${stats.parseErrors} parse errors)` : '')
+    );
+    // Log per-module file counts
+    const modParts = Object.entries(stats.moduleCounts)
+        .sort(([a], [b]) => Number(a) - Number(b))
+        .map(([m, count]) => `${moduleNames[Number(m)] || m}: ${count}`);
+    if (modParts.length > 0) {
+        console.log(`  Modules: ${modParts.join(', ')}`);
+    }
     
     // Notify client that indexing is complete - trigger refresh of open files
     connection.sendNotification('enscript/indexingComplete', { 
@@ -102,6 +116,30 @@ connection.onRequest('enscript/checkWorkspace', async () => {
     }
     
     console.log(`Checked ${files.length} files, found issues in ${allDiagnostics.length} files`);
+
+    // Verbose breakdown by diagnostic category
+    if (allDiagnostics.length > 0) {
+        let unknownTypes = 0, typeMismatches = 0, duplicateVars = 0, multiLine = 0, crossModule = 0, parserDiags = 0;
+        for (const { diagnostics } of allDiagnostics) {
+            for (const d of diagnostics) {
+                const msg = d.message;
+                if (msg.startsWith('Unknown type') || msg.startsWith('Unknown base class')) unknownTypes++;
+                else if (msg.includes('cannot be used from') || msg.includes('cannot be extended from')) crossModule++;
+                else if (msg.startsWith('Type mismatch') || msg.startsWith('Unsafe downcast')) typeMismatches++;
+                else if (msg.includes('already declared')) duplicateVars++;
+                else if (msg.includes('Multi-line')) multiLine++;
+                else parserDiags++;
+            }
+        }
+        const parts: string[] = [];
+        if (unknownTypes)   parts.push(`${unknownTypes} unknown types`);
+        if (crossModule)     parts.push(`${crossModule} cross-module`);
+        if (typeMismatches)  parts.push(`${typeMismatches} type mismatches`);
+        if (duplicateVars)   parts.push(`${duplicateVars} duplicate vars`);
+        if (multiLine)       parts.push(`${multiLine} multi-line`);
+        if (parserDiags)     parts.push(`${parserDiags} parser warnings`);
+        console.log(`  Breakdown: ${parts.join(', ')}`);
+    }
     return { 
         filesChecked: files.length, 
         filesWithIssues: allDiagnostics.length,

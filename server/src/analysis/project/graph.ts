@@ -141,6 +141,48 @@ function formatDeclaration(node: SymbolNodeBase): string {
     return `(Unknown ${node.kind}) ${node.name}`;
 }
 
+// ====================================================================
+// Script Module Detection
+// ====================================================================
+// DayZ scripts are organised into numbered modules:
+//   1_Core → 2_GameLib → 3_Game → 4_World → 5_Mission
+// A lower module CANNOT reference types from a higher module.
+// Modders sometimes use shorter names like "game", "world", "mission".
+
+const MODULE_NAMES: Record<number, string> = {
+    1: '1_Core',
+    2: '2_GameLib',
+    3: '3_Game',
+    4: '4_World',
+    5: '5_Mission',
+};
+
+/** Numbered format: /1_core/, /4_World/ etc. */
+const MODULE_NUMBERED = /[/\\]([1-5])_[a-z]+[/\\]/i;
+
+/** Short-name lookup for un-numbered folders like /world/, /game/, /mission/ */
+const MODULE_SHORT_NAMES: Record<string, number> = {
+    core: 1,
+    gamelib: 2,
+    game: 3,
+    world: 4,
+    mission: 5,
+};
+const MODULE_SHORT = /[/\\](core|gamelib|game|world|mission)[/\\]/i;
+
+/** Extract the script module level (1–5) from a file URI or path.  Returns 0 if unknown. */
+function getModuleLevel(uriOrPath: string): number {
+    // Try the canonical numbered format first (e.g. 4_World)
+    const num = MODULE_NUMBERED.exec(uriOrPath);
+    if (num) return parseInt(num[1], 10);
+
+    // Fall back to short names (e.g. just "world" or "game")
+    const short = MODULE_SHORT.exec(uriOrPath);
+    if (short) return MODULE_SHORT_NAMES[short[1].toLowerCase()] ?? 0;
+
+    return 0;
+}
+
 /** Singleton façade that lazily analyses files and answers LSP queries. */
 export class Analyzer {
     private static _instance: Analyzer;
@@ -150,6 +192,28 @@ export class Analyzer {
     }
 
     private docCache = new Map<string, File>();
+    private parseErrorCount = 0;
+
+    /** Return summary stats about everything indexed so far. */
+    getIndexStats() {
+        let classes = 0, functions = 0, enums = 0, typedefs = 0, globals = 0;
+        const moduleCounts: Record<number, number> = {};
+        for (const file of this.docCache.values()) {
+            if (file.module && file.module > 0) {
+                moduleCounts[file.module] = (moduleCounts[file.module] || 0) + 1;
+            }
+            for (const node of file.body) {
+                switch (node.kind) {
+                    case 'ClassDecl':    classes++;   break;
+                    case 'FunctionDecl': functions++; break;
+                    case 'EnumDecl':     enums++;     break;
+                    case 'Typedef':      typedefs++;  break;
+                    case 'VarDecl':      globals++;   break;
+                }
+            }
+        }
+        return { files: this.docCache.size, classes, functions, enums, typedefs, globals, parseErrors: this.parseErrorCount, moduleCounts };
+    }
 
     private ensure(doc: TextDocument): File {
         // 1 · cache hit
@@ -163,11 +227,13 @@ export class Analyzer {
         try {
             // 2 · happy path ─ parse & cache
             const ast = parse(doc);           // pass full TextDocument
+            ast.module = getModuleLevel(doc.uri);
             this.docCache.set(normalizeUri(doc.uri), ast);
             return ast;
         } catch (err) {
             // 3 · graceful error handling
             if (err instanceof ParseError) {
+                this.parseErrorCount++;
                 // VS Code recognises “path:line:col” as a jump-to link
                 const fsPath = url.fileURLToPath(err.uri);          // file:/// → p:\foo\bar.c
                 console.error(`${fsPath}:${err.line}:${err.column}  ${err.message}`);
@@ -868,6 +934,21 @@ export class Analyzer {
     }
 
     /**
+     * Find the module level (1–5) where a symbol is defined.
+     * Returns 0 if the symbol is not found or has no module info.
+     */
+    private getModuleForSymbol(symbolName: string): number {
+        for (const [uri, ast] of this.docCache) {
+            for (const node of ast.body) {
+                if (node.name === symbolName) {
+                    return ast.module || 0;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
      * Get completions for enum members (e.g., MuzzleState. → shows U, L, etc.)
      */
     private getEnumMemberCompletions(enumNode: EnumDeclNode, prefix: string): CompletionResult[] {
@@ -1457,8 +1538,13 @@ export class Analyzer {
                 inFunction = false;
             }
             
+            // Check if this line has a for/foreach/while loop
+            // In Enforce Script, loop variables are scoped to the PARENT scope, not the loop block
+            const isLoopLine = loopPattern.test(lineNoComment);
+            
             // Check if this line starts a new function
-            const isFuncDecl = funcDeclPattern.test(lineNoComment);
+            // Must NOT be a loop line — for(int i ...) looks like a func decl to the regex
+            const isFuncDecl = !isLoopLine && funcDeclPattern.test(lineNoComment);
             if (isFuncDecl) {
                 // New function - reset to: global scope + class fields (copy) + new function scope
                 // We must copy classFieldScope to avoid it being modified by function-local variables
@@ -1466,10 +1552,6 @@ export class Analyzer {
                 inFunction = true;
                 functionBraceDepth = braceDepth;
             }
-            
-            // Check if this line has a for/foreach/while loop
-            // In Enforce Script, loop variables are scoped to the PARENT scope, not the loop block
-            const isLoopLine = loopPattern.test(line);
             
             // FIRST: Find variable declarations on this line BEFORE processing braces
             // This ensures for loop variables (int j in "for (int j = 0...") 
@@ -2458,6 +2540,9 @@ export class Analyzer {
             return; // Not enough files indexed to be confident
         }
         
+        // Determine the module level of the current file (0 = unknown)
+        const currentModule = ast.module || 0;
+        
         // Check if a type exists
         const typeExists = (typeName: string): boolean => {
             if (!typeName) return true;
@@ -2491,7 +2576,7 @@ export class Analyzer {
             return false;
         };
         
-        // Check a type node for unknown types
+        // Check a type node for unknown types and cross-module access
         const checkType = (type: TypeNode | undefined): void => {
             if (!type) return;
             
@@ -2501,6 +2586,16 @@ export class Analyzer {
                     range: { start: type.start, end: type.end },
                     severity: DiagnosticSeverity.Warning
                 });
+            } else if (currentModule > 0) {
+                // Type exists — check cross-module accessibility
+                const typeModule = this.getModuleForSymbol(type.identifier);
+                if (typeModule > 0 && typeModule > currentModule) {
+                    diags.push({
+                        message: `Type '${type.identifier}' is defined in ${MODULE_NAMES[typeModule] || 'module ' + typeModule} and cannot be used from ${MODULE_NAMES[currentModule] || 'module ' + currentModule}. Higher-numbered modules are not visible to lower-numbered modules.`,
+                        range: { start: type.start, end: type.end },
+                        severity: DiagnosticSeverity.Warning
+                    });
+                }
             }
             
             // Check generic arguments too
@@ -2515,13 +2610,22 @@ export class Analyzer {
             if (node.kind === 'ClassDecl') {
                 const classNode = node as ClassDeclNode;
                 
-                // Check base class exists
+                // Check base class exists and is accessible from this module
                 if (classNode.base && !typeExists(classNode.base.identifier)) {
                     diags.push({
                         message: `Unknown base class '${classNode.base.identifier}'`,
                         range: { start: classNode.base.start, end: classNode.base.end },
                         severity: DiagnosticSeverity.Warning
                     });
+                } else if (classNode.base && currentModule > 0) {
+                    const baseModule = this.getModuleForSymbol(classNode.base.identifier);
+                    if (baseModule > 0 && baseModule > currentModule) {
+                        diags.push({
+                            message: `Base class '${classNode.base.identifier}' is defined in ${MODULE_NAMES[baseModule] || 'module ' + baseModule} and cannot be extended from ${MODULE_NAMES[currentModule] || 'module ' + currentModule}. Higher-numbered modules are not visible to lower-numbered modules.`,
+                            range: { start: classNode.base.start, end: classNode.base.end },
+                            severity: DiagnosticSeverity.Warning
+                        });
+                    }
                 }
                 
                 // Check class members
@@ -2533,6 +2637,9 @@ export class Analyzer {
                         checkType(func.returnType);
                         for (const param of func.parameters || []) {
                             checkType(param.type);
+                        }
+                        for (const local of func.locals || []) {
+                            checkType(local.type);
                         }
                     }
                 }
@@ -2549,6 +2656,9 @@ export class Analyzer {
                 checkType(func.returnType);
                 for (const param of func.parameters || []) {
                     checkType(param.type);
+                }
+                for (const local of func.locals || []) {
+                    checkType(local.type);
                 }
             }
         }

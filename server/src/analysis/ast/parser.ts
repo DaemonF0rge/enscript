@@ -163,6 +163,7 @@ export interface File {
     body: SymbolNodeBase[]
     version: number
     diagnostics: Diagnostic[]  // Parser-generated diagnostics (e.g., ternary operator warnings)
+    module?: number            // Script module level (1=Core, 2=GameLib, 3=Game, 4=World, 5=Mission)
 }
 
 // parse entry point
@@ -501,9 +502,14 @@ export function parse(
             //   int x;
             //   if (condition) x = 1; else x = 0;
             // ====================================================================
+            const locals: VarDeclNode[] = [];
             if (peek().value === '{') {
                 next();
                 let depth = 1;
+                // Track previous tokens to detect local variable declarations
+                // Pattern: [modifiers...] TypeName VarName (= | ; | ,)
+                let prevPrev: Token | null = null;
+                let prev: Token | null = null;
                 while (depth > 0 && !eof()) {
                     const t = next();
                     if (t.value === '{') depth++;
@@ -532,6 +538,40 @@ export function parse(
                             addDiagnostic(t, 'Ternary operator (? :) is not supported in Enforce Script. Use if/else statement instead.', DiagnosticSeverity.Error);
                         }
                     }
+
+                    // Detect local variable declarations:
+                    //   TypeName varName ;  or  TypeName varName =  or  TypeName varName ,
+                    // prevPrev = type token, prev = name token, t = ; or = or ,
+                    if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',')) {
+                        const isTypeTok = prevPrev.kind === TokenKind.Identifier
+                            || (prevPrev.kind === TokenKind.Keyword && isPrimitiveType(prevPrev.value));
+                        const isNameTok = prev.kind === TokenKind.Identifier;
+                        if (isTypeTok && isNameTok) {
+                            locals.push({
+                                kind: 'VarDecl',
+                                uri: doc.uri,
+                                name: prev.value,
+                                nameStart: doc.positionAt(prev.start),
+                                nameEnd: doc.positionAt(prev.end),
+                                type: {
+                                    kind: 'Type',
+                                    uri: doc.uri,
+                                    identifier: prevPrev.value,
+                                    start: doc.positionAt(prevPrev.start),
+                                    end: doc.positionAt(prevPrev.end),
+                                    arrayDims: [],
+                                    modifiers: [],
+                                },
+                                annotations: [],
+                                modifiers: [],
+                                start: doc.positionAt(prevPrev.start),
+                                end: doc.positionAt(prev.end),
+                            });
+                        }
+                    }
+
+                    prevPrev = prev;
+                    prev = t;
                 }
             }
 
@@ -543,7 +583,7 @@ export function parse(
                 nameEnd: doc.positionAt(nameTok.end),
                 returnType: baseTypeNode,
                 parameters: params,
-                locals: [], //locals,
+                locals: locals,
                 annotations: annotations,
                 modifiers: mods,
                 start: baseTypeNode.start,
