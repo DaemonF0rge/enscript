@@ -835,6 +835,73 @@ export class Analyzer {
     }
 
     /**
+     * Resolve the return type of a method call within a class, applying template substitution.
+     * 
+     * Walks the class hierarchy. At each base class, if that base was reached through
+     * a typedef with generic args (e.g., typedef array<autoptr UCurrencyValue> UCurrencyBase),
+     * builds a template map so that methods returning template params (like array.Get() → T)
+     * are substituted with the concrete type (UCurrencyValue).
+     * 
+     * This is the same logic as resolveVariableChainType / resolveChainSteps, but for
+     * unqualified method calls inside a class (i.e., calling inherited methods).
+     */
+    private resolveMethodCallWithTemplates(className: string, methodName: string): string | null {
+        // Walk the class hierarchy, building up the template map at each typedef step
+        const visited = new Set<string>();
+        let templateMap = new Map<string, string>();
+        
+        const walk = (name: string): string | null => {
+            if (visited.has(name)) return null;
+            visited.add(name);
+            
+            // Resolve through typedef: e.g., UCurrencyBase → array<autoptr UCurrencyValue>
+            const typedefNode = this.resolveTypedefNode(name);
+            let resolvedName = name;
+            if (typedefNode) {
+                resolvedName = typedefNode.oldType.identifier;
+                if (typedefNode.oldType.genericArgs && typedefNode.oldType.genericArgs.length > 0) {
+                    // Build template map: e.g., T → UCurrencyValue for array<UCurrencyValue>
+                    const newMap = this.buildTemplateMap(resolvedName, typedefNode.oldType.genericArgs);
+                    // Merge with existing map (inner maps take precedence)
+                    for (const [k, v] of newMap) {
+                        templateMap.set(k, v);
+                    }
+                }
+            }
+            
+            // Find all classes with this name
+            const classNodes = this.findAllClassesByName(resolvedName);
+            for (const classNode of classNodes) {
+                // Check if this class directly defines the method
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'FunctionDecl' && member.name === methodName) {
+                        const func = member as FunctionDeclNode;
+                        if (func.returnType?.identifier) {
+                            let retType = func.returnType.identifier;
+                            // Apply template substitution
+                            if (templateMap.has(retType)) {
+                                retType = templateMap.get(retType)!;
+                            }
+                            return retType;
+                        }
+                    }
+                }
+            }
+            
+            // Check base class
+            const originalClass = classNodes.find(c => !c.modifiers?.includes('modded'));
+            const baseClassName = (originalClass || classNodes[0])?.base?.identifier;
+            if (baseClassName) {
+                return walk(baseClassName);
+            }
+            
+            return null;
+        };
+        
+        return walk(className);
+    }
+
+    /**
      * Resolve the return type of a method/field within a class hierarchy, returning full type info.
      * Includes genericArgs for template types like map<string, int>.
      */
@@ -948,7 +1015,10 @@ export class Analyzer {
     /**
      * Parse chained member accesses from text like ".Method(args).Prop.Other()"
      * into a list of member names: ["Method", "Prop", "Other"].
-     * Handles both method calls (with parenthesized arguments) and property accesses.
+     * Handles both method calls (with parenthesized arguments), property accesses,
+     * and array indexing (e.g., ".Items[0].Name" → ["Items", "Name"]).
+     * Array indexing is skipped as it doesn't change the chain resolution
+     * (the element type is handled separately).
      */
     private parseChainMembers(text: string): string[] {
         const calls: string[] = [];
@@ -964,6 +1034,16 @@ export class Analyzer {
                 if (propMatch) {
                     calls.push(propMatch[1]);
                     remaining = remaining.substring(propMatch[0].length).trim();
+                    // Skip any array indexing like [0], [i], [expr] after the property
+                    while (remaining.startsWith('[')) {
+                        let depth = 1, k = 1;
+                        while (k < remaining.length && depth > 0) {
+                            if (remaining[k] === '[') depth++;
+                            else if (remaining[k] === ']') depth--;
+                            k++;
+                        }
+                        remaining = remaining.substring(k).trim();
+                    }
                     continue;
                 }
                 break;
@@ -980,6 +1060,16 @@ export class Analyzer {
                 i++;
             }
             remaining = remaining.substring(i).trim();
+            // Skip any array indexing after the method call, e.g., .GetItems()[0].Name
+            while (remaining.startsWith('[')) {
+                let depth = 1, k = 1;
+                while (k < remaining.length && depth > 0) {
+                    if (remaining[k] === '[') depth++;
+                    else if (remaining[k] === ']') depth--;
+                    k++;
+                }
+                remaining = remaining.substring(k).trim();
+            }
         }
         
         return calls;
@@ -2789,7 +2879,19 @@ export class Analyzer {
                         break;
                     }
                 }
-                returnType = this.resolveFunctionReturnType(funcName);
+                // Try to resolve as a method of the containing class first (for unqualified calls like Find())
+                // This handles cases where the method is inherited or defined in the current class
+                const lineNum = getLineFromPos(match.index);
+                const containingClass = this.findContainingClass(ast, { line: lineNum, character: 0 });
+                if (containingClass) {
+                    returnType = this.resolveMethodReturnType(containingClass.name, funcName);
+                } else {
+                    returnType = null;
+                }
+                // Fall back to global function lookup if not found in class hierarchy
+                if (!returnType) {
+                    returnType = this.resolveFunctionReturnType(funcName);
+                }
                 highlightLength = match[0].length + singleEnd;
             }
             
@@ -2993,7 +3095,17 @@ export class Analyzer {
                         break;
                     }
                 }
-                returnType = this.resolveFunctionReturnType(funcName);
+                // Try to resolve as a method of the containing class first (for unqualified calls like Find())
+                const containingClass = this.findContainingClass(ast, { line: lineNum, character: 0 });
+                if (containingClass) {
+                    returnType = this.resolveMethodReturnType(containingClass.name, funcName);
+                } else {
+                    returnType = null;
+                }
+                // Fall back to global function lookup if not found in class hierarchy
+                if (!returnType) {
+                    returnType = this.resolveFunctionReturnType(funcName);
+                }
             }
             
             if (targetType && returnType) {
@@ -3235,7 +3347,8 @@ export class Analyzer {
      */
     private inferArgType(
         argText: string,
-        getVarType: (name: string) => string | undefined
+        getVarType: (name: string) => string | undefined,
+        containingClassName?: string
     ): string | null {
         const arg = argText.trim();
         if (!arg) return null;
@@ -3295,10 +3408,28 @@ export class Analyzer {
             return null;
         }
         
+        // Variable with array indexing: varName[expr]
+        // We can't easily determine the element type, so return null to avoid false positives.
+        const arrayAccessMatch = arg.match(/^(\w+)\s*\[/);
+        if (arrayAccessMatch && !arg.match(/^(\w+)\s*\(/)) {
+            return null;
+        }
+        
         // Function call: FuncName(...) or FuncName(...).Chain(...)
         const funcCallMatch = arg.match(/^(\w+)\s*\(/);
         if (funcCallMatch) {
-            const rootType = this.resolveFunctionReturnType(funcCallMatch[1]);
+            const calledFunc = funcCallMatch[1];
+            
+            // Try resolving as a method of the containing class first (with template substitution).
+            // This handles cases like Get(i) inside a class that extends array<T> via typedef.
+            let rootType: string | null = null;
+            if (containingClassName) {
+                rootType = this.resolveMethodCallWithTemplates(containingClassName, calledFunc);
+            }
+            // Fall back to global function resolution
+            if (!rootType) {
+                rootType = this.resolveFunctionReturnType(calledFunc);
+            }
             if (rootType) {
                 // Check if there's a chain after the closing paren: FuncName(...).Something
                 const openIdx = arg.indexOf('(');
@@ -3342,7 +3473,15 @@ export class Analyzer {
                 const members = this.parseChainMembers(chainText);
                 if (members.length > 0) {
                     const resolved = this.resolveChainSteps(members, this.resolveTypedef(varType), new Map());
-                    return resolved?.type ?? null;
+                    if (resolved?.type) {
+                        // If the arg ends with array indexing [expr], the result is the element type.
+                        // Since we can't always determine the element type, return null to avoid
+                        // false type mismatch errors for container types.
+                        if (/\[.*\]\s*$/.test(arg)) {
+                            return null;
+                        }
+                        return resolved.type;
+                    }
                 }
             }
         }
@@ -3511,6 +3650,91 @@ export class Analyzer {
             }
         }
         
+        // The parser doesn't parse function bodies (locals is always []),
+        // so we need to scan for local variable declarations using regex.
+        // This includes regular variable declarations and foreach loop variables.
+        {
+            const lines = text.split('\n');
+            let inBlockComment = false;
+            
+            const scanFunctionBody = (funcStart: number, funcEnd: number) => {
+                for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
+                    let line = lines[lineIdx];
+                    
+                    // Handle block comments
+                    if (inBlockComment) {
+                        if (line.includes('*/')) inBlockComment = false;
+                        continue;
+                    }
+                    if (line.trimStart().startsWith('/*')) {
+                        if (!line.includes('*/')) inBlockComment = true;
+                        continue;
+                    }
+                    
+                    // Strip comments and strings
+                    const commentIdx = line.indexOf('//');
+                    if (commentIdx >= 0) line = line.substring(0, commentIdx);
+                    line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+                    line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
+                    line = line.trim();
+                    
+                    if (!line) continue;
+                    
+                    // Match: Type varName; or Type varName = ...;
+                    const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
+                    let m;
+                    while ((m = localDeclPattern.exec(line)) !== null) {
+                        const typeName = m[1];
+                        const varName = m[2];
+                        
+                        // Skip if type is a keyword/modifier
+                        if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
+                             'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
+                             'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
+                            continue;
+                        }
+                        // Skip if varName is a keyword
+                        if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
+                            continue;
+                        }
+                        
+                        addVar(varName, typeName, lineIdx, funcEnd);
+                    }
+                    
+                    // Match foreach variable declarations: foreach (Type varName : collection)
+                    const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
+                    let fm;
+                    while ((fm = foreachPattern.exec(line)) !== null) {
+                        addVar(fm[2], fm[1], lineIdx, funcEnd);
+                    }
+                }
+            };
+            
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl') {
+                    const classNode = node as ClassDeclNode;
+                    for (const member of classNode.members || []) {
+                        if (member.kind === 'FunctionDecl') {
+                            const func = member as FunctionDeclNode;
+                            const funcStart = func.start?.line ?? 0;
+                            const funcEnd = func.end?.line ?? 0;
+                            if (funcEnd > funcStart) {
+                                scanFunctionBody(funcStart, funcEnd);
+                            }
+                        }
+                    }
+                }
+                if (node.kind === 'FunctionDecl') {
+                    const func = node as FunctionDeclNode;
+                    const funcStart = func.start?.line ?? 0;
+                    const funcEnd = func.end?.line ?? 0;
+                    if (funcEnd > funcStart) {
+                        scanFunctionBody(funcStart, funcEnd);
+                    }
+                }
+            }
+        }
+        
         const getVarTypeAtLine = (name: string, line: number): string | undefined => {
             const entries = varTypes.get(name);
             if (entries) {
@@ -3659,6 +3883,13 @@ export class Analyzer {
             
             let overloads: FunctionDeclNode[] = [];
             let chainAttempted = false;
+            let containingClassName: string | undefined;
+            
+            // Try to find the containing class for this call site (needed for template resolution)
+            {
+                const cc = this.findContainingClass(ast, doc.positionAt(match.index));
+                if (cc) containingClassName = cc.name;
+            }
             
             // Check for method call: something.FuncName(
             const dotMatch = textBeforeFunc.match(/(\w+)\s*\.\s*$/);
@@ -3669,43 +3900,84 @@ export class Analyzer {
                     objType = this.resolveTypedef(objType);
                     overloads = this.findFunctionOverloads(funcName, objType);
                 } else {
-                    // Check if there's a multi-dot chain before: e.g., g_Game.GameScript.Method(
-                    // or GetGame().GameScript.Method( (function call root)
-                    // Try to resolve the full chain to get the correct type
-                    const preDot = textBeforeFunc.substring(0, dotMatch.index!).replace(/[\s.]+$/, '');
-                    // Try matching chain with possible function call at the root: FuncName(...).X.Y
-                    const chainWithCallParts = preDot.match(/(\w+)\s*\([^)]*\)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)*)\s*$/);
-                    const chainParts = preDot.match(/(\w+(?:\s*\.\s*\w+)*)\s*$/);
-                    if (chainWithCallParts) {
-                        // Root is a function call: GetGame().GameScript.Method(
-                        const rootFuncName = chainWithCallParts[1];
-                        let rootType = this.resolveFunctionReturnType(rootFuncName) ?? undefined;
-                        if (rootType) {
-                            rootType = this.resolveTypedef(rootType);
-                            const afterCall = chainWithCallParts[2] || '';
-                            // Build chain from after the function call through objName
-                            const middleParts = afterCall.split(/\s*\.\s*/).filter(Boolean)
-                                .map(p => p.replace(/\s*\([^)]*\)$/, '')); // strip parens from method calls
-                            middleParts.push(objName);
-                            const chainText = '.' + middleParts.join('.');
-                            const resolved = this.resolveVariableChainType(rootType, chainText);
-                            if (resolved) {
-                                overloads = this.findFunctionOverloads(funcName, resolved);
+                    // objName is not a simple variable. Use the backward-walking chain parser
+                    // to extract the full expression (e.g., Currencies.Get(i).MoneyValues)
+                    // and resolve its type, then find the function on that type.
+                    const fullTextBefore = textBeforeFunc.replace(/\s+$/, '');
+                    // fullTextBefore ends with "objName." — walk backwards from the end to extract
+                    // the entire chain expression including objName.
+                    if (fullTextBefore.endsWith('.')) {
+                        let p = fullTextBefore.length - 2; // start before trailing dot
+                        while (p >= 0) {
+                            while (p >= 0 && /\s/.test(fullTextBefore[p])) p--;
+                            if (p < 0) break;
+                            if (fullTextBefore[p] === ')') {
+                                let depth = 1; p--;
+                                while (p >= 0 && depth > 0) {
+                                    if (fullTextBefore[p] === '(') depth--;
+                                    else if (fullTextBefore[p] === ')') depth++;
+                                    p--;
+                                }
+                                while (p >= 0 && /\s/.test(fullTextBefore[p])) p--;
                             }
+                            if (p < 0 || !/\w/.test(fullTextBefore[p])) break;
+                            while (p >= 0 && /\w/.test(fullTextBefore[p])) p--;
+                            const idStart = p + 1;
+                            let pp = p;
+                            while (pp >= 0 && /\s/.test(fullTextBefore[pp])) pp--;
+                            if (pp >= 0 && fullTextBefore[pp] === '.') {
+                                p = pp - 1;
+                                continue;
+                            }
+                            p = idStart - 1;
+                            break;
                         }
-                    } else if (chainParts) {
-                        const rootAndChain = chainParts[1].split(/\s*\.\s*/);
-                        const rootName = rootAndChain[0];
-                        let rootType = getVarTypeAtLine(rootName, lineNum);
-                        if (rootType) {
-                            rootType = this.resolveTypedef(rootType);
-                            // Resolve the chain members (everything between root and objName)
-                            const middleParts = rootAndChain.slice(1);
-                            middleParts.push(objName);
-                            const chainText = '.' + middleParts.join('.');
-                            const resolved = this.resolveVariableChainType(rootType, chainText);
-                            if (resolved) {
-                                overloads = this.findFunctionOverloads(funcName, resolved);
+                        const exprStart = p + 1;
+                        const chainExpr = fullTextBefore.substring(exprStart, fullTextBefore.length - 1); // exclude trailing dot
+                        if (chainExpr) {
+                            const rootM = chainExpr.match(/^(\w+)/);
+                            if (rootM) {
+                                const rootName = rootM[1];
+                                const afterRoot = chainExpr.substring(rootName.length);
+                                let rootType: string | undefined;
+                                let chainRemainder: string;
+                                if (afterRoot.trimStart().startsWith('(')) {
+                                    // Root is a function call: FuncName(...).chain...
+                                    rootType = this.resolveFunctionReturnType(rootName) ?? undefined;
+                                    if (!rootType && containingClassName) {
+                                        rootType = this.resolveMethodCallWithTemplates(containingClassName, rootName) ?? undefined;
+                                    }
+                                    const parenStart = afterRoot.indexOf('(');
+                                    let d = 1, ii = parenStart + 1;
+                                    while (ii < afterRoot.length && d > 0) {
+                                        if (afterRoot[ii] === '(') d++;
+                                        else if (afterRoot[ii] === ')') d--;
+                                        ii++;
+                                    }
+                                    chainRemainder = afterRoot.substring(ii);
+                                } else {
+                                    // Root is a variable or class name (for static access)
+                                    rootType = getVarTypeAtLine(rootName, lineNum);
+                                    if (rootType) {
+                                        rootType = this.resolveTypedef(rootType);
+                                    } else {
+                                        // Check if root is a class name (for static field/method access)
+                                        const classNodes = this.findAllClassesByName(rootName);
+                                        if (classNodes.length > 0) {
+                                            rootType = rootName;
+                                        }
+                                    }
+                                    chainRemainder = afterRoot;
+                                }
+                                // Resolve through the remaining chain if present
+                                if (rootType && chainRemainder.trim().startsWith('.')) {
+                                    const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
+                                    if (resolved) {
+                                        overloads = this.findFunctionOverloads(funcName, resolved);
+                                    }
+                                } else if (rootType) {
+                                    overloads = this.findFunctionOverloads(funcName, rootType);
+                                }
                             }
                         }
                     }
@@ -3773,9 +4045,18 @@ export class Analyzer {
                                 }
                                 chainRemainder = afterRoot.substring(i);
                             } else {
-                                // Root is a variable
+                                // Root is a variable or class name (for static access)
                                 rootType = getVarTypeAtLine(rootName, lineNum);
-                                if (rootType) rootType = this.resolveTypedef(rootType);
+                                if (rootType) {
+                                    rootType = this.resolveTypedef(rootType);
+                                } else {
+                                    // Check if root is a class name (for static field/method access like ClassName.StaticField)
+                                    const classNodes = this.findAllClassesByName(rootName);
+                                    if (classNodes.length > 0) {
+                                        // Root is a class name - treat the class itself as the "type" for static access
+                                        rootType = rootName;
+                                    }
+                                }
                                 chainRemainder = afterRoot;
                             }
                             // Resolve through the remaining chain if present
@@ -3794,9 +4075,8 @@ export class Analyzer {
                 // Fall back to global or unqualified call only if no chain was detected.
                 // If a chain was attempted but couldn't resolve, skip — don't match the wrong function.
                 if (!chainAttempted && overloads.length === 0) {
-                    const containingClass = this.findContainingClass(ast, doc.positionAt(match.index));
-                    if (containingClass) {
-                        overloads = this.findFunctionOverloads(funcName, containingClass.name);
+                    if (containingClassName) {
+                        overloads = this.findFunctionOverloads(funcName, containingClassName);
                     }
                     if (overloads.length === 0) {
                         overloads = this.findFunctionOverloads(funcName);
@@ -3827,7 +4107,7 @@ export class Analyzer {
             
             // Infer argument types
             const argTypes: (string | null)[] = argStrings.map(arg =>
-                this.inferArgType(arg, (name) => getVarTypeAtLine(name, lineNum))
+                this.inferArgType(arg, (name) => getVarTypeAtLine(name, lineNum), containingClassName)
             );
             
             // Validate against overloads

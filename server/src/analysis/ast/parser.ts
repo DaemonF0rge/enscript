@@ -967,16 +967,22 @@ export function parse(
 
         if (peek().value === '(') {
             expect('(');
-            while (peek().value !== ')') {
-                if (peek().kind === TokenKind.String || peek().kind === TokenKind.Number) {
-                    args.push(next().value);
-                } else {
-                    next(); // skip unexpected stuff
+            let depth = 1;
+            while (depth > 0 && pos < toks.length) {
+                const tok = peek();
+                if (tok.value === '(') { depth++; next(); }
+                else if (tok.value === ')') {
+                    depth--;
+                    if (depth > 0) next(); // consume inner ')'
                 }
-
-                if (peek().value === ',') next();
+                else if (tok.kind === TokenKind.String || tok.kind === TokenKind.Number) {
+                    args.push(next().value);
+                }
+                else {
+                    next(); // skip identifiers, dots, commas, etc.
+                }
             }
-            expect(')');
+            expect(')'); // consume the final ')'
         }
 
         const endTok = expect(']');
