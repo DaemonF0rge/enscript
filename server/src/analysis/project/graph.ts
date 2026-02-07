@@ -599,10 +599,11 @@ export class Analyzer {
         // Regex fallbacks for cases the AST-based lookup misses
         // (e.g., variables in unparsed regions)
         const text = doc.getText();
+        const regexKeywords = new Set(['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'case', 'break', 'continue', 'this', 'super', 'null', 'true', 'false', 'out', 'inout', 'volatile']);
         
         // Pattern: Type varName; or Type varName =
         const varDeclMatch = text.match(new RegExp(`(\\w+)\\s+${varName}\\s*[;=]`));
-        if (varDeclMatch) {
+        if (varDeclMatch && !regexKeywords.has(varDeclMatch[1])) {
             return varDeclMatch[1];
         }
         
@@ -616,6 +617,12 @@ export class Analyzer {
         const outParamMatch = text.match(new RegExp(`(?:out|inout)\\s+(\\w+)\\s+${varName}\\s*[,)]`));
         if (outParamMatch) {
             return outParamMatch[1];
+        }
+        
+        // Pattern: foreach (Type varName : collection)
+        const foreachMatch = text.match(new RegExp(`foreach\\s*\\(\\s*(\\w+)\\s+${varName}\\s*:`));
+        if (foreachMatch && !regexKeywords.has(foreachMatch[1])) {
+            return foreachMatch[1];
         }
         
         return null;
@@ -1022,7 +1029,19 @@ export class Analyzer {
             templateMap = new Map();
         }
         
-        return this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        const result = this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        
+        // If the chain text ends with array indexing like [expr],
+        // the result is the element type, not the container type.
+        // Since we don't always know the element type, return null to avoid
+        // false type mismatch errors.
+        if (result && /\[.*\]\s*$/.test(chainText)) {
+            if (['array', 'set', 'map'].includes(result)) {
+                return null;
+            }
+        }
+        
+        return result;
     }
 
     /**
@@ -1477,7 +1496,15 @@ export class Analyzer {
         
         // Find all classes with this name (original + modded versions)
         const classNodes = this.findAllClassesByName(className);
-        if (classNodes.length === 0) return [];
+        if (classNodes.length === 0) {
+            // className might be a typedef (e.g., typedef ItemBase InventoryItemSuper)
+            // Resolve through typedef and retry with the underlying type
+            const resolved = this.resolveTypedef(className);
+            if (resolved !== className) {
+                return this.getClassHierarchyOrdered(resolved, visited);
+            }
+            return [];
+        }
         
         // Separate original class from modded classes
         const originalClass = classNodes.find(c => !c.modifiers?.includes('modded'));
@@ -1487,9 +1514,20 @@ export class Analyzer {
         const baseClassName = (originalClass || classNodes[0])?.base?.identifier;
         
         // Recursively get parent hierarchy FIRST (so base classes come first)
-        const parentHierarchy: ClassDeclNode[] = baseClassName 
-            ? this.getClassHierarchyOrdered(baseClassName, visited)
-            : [];
+        // If no explicit base class, implicitly inherit from 'Class' (the root of all
+        // Enforce Script classes), so built-in methods like Cast, CastTo, etc. are found.
+        // Also: if explicit base can't be found (e.g. engine-internal class), still
+        // fall through to 'Class' so built-in methods are always available.
+        let parentHierarchy: ClassDeclNode[] = [];
+        if (baseClassName) {
+            parentHierarchy = this.getClassHierarchyOrdered(baseClassName, visited);
+            if (parentHierarchy.length === 0 && className !== 'Class') {
+                // Explicit base not found — still inherit from Class
+                parentHierarchy = this.getClassHierarchyOrdered('Class', visited);
+            }
+        } else if (className !== 'Class') {
+            parentHierarchy = this.getClassHierarchyOrdered('Class', visited);
+        }
         
         // Build result: parents first, then this class (original + modded)
         const result: ClassDeclNode[] = [...parentHierarchy];
@@ -1752,6 +1790,9 @@ export class Analyzer {
             
             // Check for type mismatches in assignments
             this.checkTypeMismatches(doc, diags);
+            
+            // Check function call arguments (param count and types)
+            this.checkFunctionCallArgs(doc, diags);
         }
         
         // Check for multi-line statements (not supported in Enforce Script)
@@ -1789,13 +1830,18 @@ export class Analyzer {
         // Pattern to detect function declarations
         // Must have: optional modifiers, return type (including generics), function name, parentheses for params
         // Excludes: array access like m_Foo[0] and assignments
-        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+|[\w<>,\s]+)\s+(\w+)\s*\([^)]*\)\s*\{?\s*$/;
+        // Matches lines ending with { (normal), {} (empty body), ; (proto/native), or ) (brace on next line)
+        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{\}?|;)?\s*$/;
+
+        // Pattern to detect proto/native function declarations (no body, just ;)
+        // Params in these don't create real variables — skip them for duplicate checking
+        const protoFuncPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:proto|native)\s+/;
         
         // Pattern to detect for/foreach/while loops (their vars go to parent scope in Enforce)
         const loopPattern = /\b(for|foreach|while)\s*\(/;
         
-        // Pattern to detect class declarations
-        const classDeclPattern = /\b(?:modded\s+)?class\s+(\w+)/;
+        // Pattern to detect class declarations (handles template params like <Class T>)
+        const classDeclPattern = /\b(?:modded\s+)?class\s+(\w+)(?:<[^>]*>)?(?:\s*(?::\s*|\s+extends\s+)(\w+))?/;
         
         // Track when we enter/exit functions
         let inFunction = false;
@@ -1806,6 +1852,10 @@ export class Analyzer {
         let classFieldScope: Map<string, VarInfo> = new Map();
         let inClass = false;
         let classBraceDepth = 0;
+        let currentClassName = '';
+        // Track parent method names + param counts for missing override warnings
+        // Maps method name -> array of param counts from parent classes
+        let parentMethodSignatures: Map<string, number[]> = new Map();
         
         // Track block comments
         let inBlockComment = false;
@@ -1865,13 +1915,41 @@ export class Analyzer {
             const lineNoCommentTrimmed = lineNoComment.trim();
             
             // Check if this line starts a class
-            if (classDeclPattern.test(lineNoComment)) {
+            const classMatch = lineNoComment.match(classDeclPattern);
+            if (classMatch) {
                 // Starting a new class - reset all class-related state
                 inClass = true;
                 classBraceDepth = braceDepth;
                 classFieldScope = new Map(); // Fresh class field scope
-                // Reset scope stack to just global scope
-                scopeStack = [new Map()];
+                currentClassName = classMatch[1];
+                const baseClassName = classMatch[2];
+                parentMethodSignatures = new Map();
+                
+                // Pre-populate classFieldScope with inherited fields from parent classes
+                if (baseClassName) {
+                    const hierarchy = this.getClassHierarchyOrdered(baseClassName, new Set());
+                    for (const parentClass of hierarchy) {
+                        for (const member of parentClass.members || []) {
+                            if (member.kind === 'VarDecl' && member.name) {
+                                classFieldScope.set(member.name, {
+                                    line: member.start?.line ?? -1,
+                                    character: member.start?.character ?? 0
+                                });
+                            }
+                            if (member.kind === 'FunctionDecl' && member.name) {
+                                const paramCount = (member as any).parameters?.length ?? 0;
+                                if (!parentMethodSignatures.has(member.name)) {
+                                    parentMethodSignatures.set(member.name, []);
+                                }
+                                parentMethodSignatures.get(member.name)!.push(paramCount);
+                            }
+                        }
+                    }
+                }
+                
+                // Reset scope stack to global scope + class fields (with inherited fields)
+                // This ensures class-level field declarations are checked against parent fields
+                scopeStack = [new Map(), classFieldScope];
                 inFunction = false;
             }
             
@@ -1881,15 +1959,56 @@ export class Analyzer {
             
             // Check if this line starts a new function
             // Must NOT be a loop line — for(int i ...) looks like a func decl to the regex
-            const isFuncDecl = !isLoopLine && funcDeclPattern.test(lineNoComment);
+            // Also exclude control flow statements (if, else, switch, do) which can false-match
+            const isControlFlow = /\b(if|else|switch|do|return|new|delete|throw)\b/.test(lineNoComment);
+            const isFuncDecl = !isLoopLine && !isControlFlow && funcDeclPattern.test(lineNoComment);
+            
             if (isFuncDecl) {
                 // New function - reset to: global scope + class fields (copy) + new function scope
                 // We must copy classFieldScope to avoid it being modified by function-local variables
+                const wasInFunction = inFunction;
                 scopeStack = [scopeStack[0], new Map(classFieldScope), new Map()];
                 inFunction = true;
                 functionBraceDepth = braceDepth;
+                
+                // Check for missing override keyword — only at class level, not inside a nested function
+                if (inClass && !wasInFunction && parentMethodSignatures.size > 0) {
+                    const funcNameMatch = lineNoComment.match(funcDeclPattern);
+                    if (funcNameMatch) {
+                        const declaredFuncName = funcNameMatch[1];
+                        const hasOverride = /\boverride\b/.test(lineNoComment);
+                        if (!hasOverride && parentMethodSignatures.has(declaredFuncName)) {
+                            // Don't warn for constructors (function name === class name)
+                            if (declaredFuncName !== currentClassName) {
+                                // Extract param count from this declaration to compare with parent
+                                // Only warn if a parent has a method with the SAME param count (true override)
+                                // Different param counts = overload, not override
+                                const paramStr = lineNoComment.match(/\(([^)]*)\)/);
+                                const childParamCount = paramStr && paramStr[1].trim() !== '' 
+                                    ? paramStr[1].split(',').length 
+                                    : 0;
+                                const parentParamCounts = parentMethodSignatures.get(declaredFuncName)!;
+                                if (parentParamCounts.includes(childParamCount)) {
+                                    const fnStart = lineNoComment.indexOf(declaredFuncName);
+                                    diags.push({
+                                        message: `Method '${declaredFuncName}' overrides a method from a parent class but is missing the 'override' keyword.`,
+                                        range: {
+                                            start: { line: lineNum, character: fnStart },
+                                            end: { line: lineNum, character: fnStart + declaredFuncName.length }
+                                        },
+                                        severity: DiagnosticSeverity.Warning
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
             
+            // Skip variable extraction for proto/native function declarations —
+            // their parameters don't create real variables in any scope
+            const isProtoOrNative = protoFuncPattern.test(lineNoComment);
+
             // FIRST: Find variable declarations on this line BEFORE processing braces
             // This ensures for loop variables (int j in "for (int j = 0...") 
             // are added to the current scope before we push a new scope for {
@@ -1899,7 +2018,7 @@ export class Analyzer {
             
             // Use lineNoComment but keep original line for position calculation
             const lineForVars = lineNoComment;
-            while ((match = varDeclPattern.exec(lineForVars)) !== null) {
+            while (!isProtoOrNative && (match = varDeclPattern.exec(lineForVars)) !== null) {
                 const typeName = match[1];
                 const varName = match[2];
                 
@@ -2084,8 +2203,12 @@ export class Analyzer {
         const declIsPrimitive = hardcodedPrimitives.has(declLower);
         const assignIsPrimitive = hardcodedPrimitives.has(assignLower);
         
-        // string is only compatible with string
+        // string is compatible with string, and string can be implicitly converted to vector
+        // in Enforce Script (e.g., "0 0 0" is a valid vector literal)
         if (declLower === 'string' || assignLower === 'string') {
+            if (declLower === 'vector' && assignLower === 'string') {
+                return { compatible: true, isDowncast: false, isUpcast: false };
+            }
             if (declLower !== assignLower) {
                 return { 
                     compatible: false, 
@@ -2331,6 +2454,13 @@ export class Analyzer {
                                     
                                     addScopedVar(varName, typeName, lineIdx, funcEnd, false);
                                 }
+                                // Also match foreach variable declarations:
+                                //   foreach (Type varName : collection)
+                                const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
+                                let fm;
+                                while ((fm = foreachPattern.exec(line)) !== null) {
+                                    addScopedVar(fm[2], fm[1], lineIdx, funcEnd, false);
+                                }
                             }
                         }
                     }
@@ -2378,6 +2508,13 @@ export class Analyzer {
                             }
                             
                             addScopedVar(varName, typeName, lineIdx, funcEnd, false);
+                        }
+                        // Also match foreach variable declarations:
+                        //   foreach (Type varName : collection)
+                        const foreachPatternTL = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
+                        let fmTL;
+                        while ((fmTL = foreachPatternTL.exec(line)) !== null) {
+                            addScopedVar(fmTL[2], fmTL[1], lineIdx, funcEnd, false);
                         }
                     }
                 }
@@ -2871,6 +3008,732 @@ export class Analyzer {
             const actualStart = match.index + 1 + leadingWs.length;
             const actualLength = match[0].length - 1 - leadingWs.length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
             this.addTypeMismatchDiagnostic(doc, diags, actualStart, actualLength, targetType, returnType);
+        }
+    }
+
+    // ========================================================================
+    // FUNCTION CALL ARGUMENT VALIDATION
+    // ========================================================================
+    // Validates function/method call arguments:
+    //   1. Argument count — too few (missing required params) or too many
+    //   2. Argument types — each argument's type vs the parameter's declared type
+    //
+    // Handles:
+    //   - Overloaded functions (multiple declarations with same name)
+    //   - Default parameter values (params with defaults are optional)
+    //   - Constructor calls (new ClassName(...))
+    //   - Method calls (obj.Method(...))
+    //   - Global function calls (FuncName(...))
+    //   - out/inout parameter modifiers
+    //
+    // A call is valid if ANY overload accepts it. Errors are only reported
+    // when NO overload matches.
+    // ========================================================================
+
+    /**
+     * Find all overloads of a function/method by name.
+     * For methods, searches the class hierarchy. For globals, searches all files.
+     * Returns all FunctionDeclNode[] with that name.
+     */
+    private findFunctionOverloads(funcName: string, className?: string): FunctionDeclNode[] {
+        const overloads: FunctionDeclNode[] = [];
+        
+        if (className) {
+            // Method: search class hierarchy
+            const resolved = this.resolveTypedef(className);
+            const hierarchy = this.getClassHierarchyOrdered(resolved, new Set());
+            for (const classNode of hierarchy) {
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'FunctionDecl' && member.name === funcName) {
+                        overloads.push(member as FunctionDeclNode);
+                    }
+                }
+            }
+        } else {
+            // Global function: search all files
+            for (const [uri, ast] of this.docCache) {
+                for (const node of ast.body) {
+                    if (node.kind === 'FunctionDecl' && node.name === funcName) {
+                        overloads.push(node as FunctionDeclNode);
+                    }
+                    // Also check class methods (for unqualified calls from within a class)
+                    if (node.kind === 'ClassDecl') {
+                        for (const member of (node as ClassDeclNode).members || []) {
+                            if (member.kind === 'FunctionDecl' && member.name === funcName) {
+                                overloads.push(member as FunctionDeclNode);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return overloads;
+    }
+
+    /**
+     * Parse the argument list text of a function call into individual argument strings.
+     * Handles nested parentheses, brackets, strings, and template args.
+     * e.g., 'a, Func(b, c), "hello, world"' → ["a", "Func(b, c)", '"hello, world"']
+     */
+    private parseCallArguments(argsText: string): string[] {
+        const args: string[] = [];
+        let depth = 0;       // () depth
+        let bracketDepth = 0; // <> and [] depth
+        let braceDepth = 0;  // {} depth (array literals like {1,2,3})
+        let inString = false;
+        let stringChar = '';
+        let current = '';
+        
+        for (let i = 0; i < argsText.length; i++) {
+            const ch = argsText[i];
+            
+            // Handle strings
+            if (!inString && (ch === '"' || ch === "'")) {
+                inString = true;
+                stringChar = ch;
+                current += ch;
+                continue;
+            }
+            if (inString) {
+                current += ch;
+                if (ch === stringChar && (i === 0 || argsText[i - 1] !== '\\')) {
+                    inString = false;
+                }
+                continue;
+            }
+            
+            // Track nesting
+            if (ch === '(' || ch === '[') { depth++; current += ch; continue; }
+            if (ch === ')' || ch === ']') { depth--; current += ch; continue; }
+            if (ch === '<') { bracketDepth++; current += ch; continue; }
+            if (ch === '>') { bracketDepth--; current += ch; continue; }
+            if (ch === '{') { braceDepth++; current += ch; continue; }
+            if (ch === '}') { braceDepth--; current += ch; continue; }
+            
+            // Split on comma only at top level (no nesting of any kind)
+            if (ch === ',' && depth === 0 && bracketDepth === 0 && braceDepth === 0) {
+                args.push(current.trim());
+                current = '';
+                continue;
+            }
+            
+            current += ch;
+        }
+        
+        const last = current.trim();
+        if (last) args.push(last);
+        
+        return args;
+    }
+
+    /**
+     * Infer the type of a call argument expression.
+     * Returns the type name or null if unresolvable.
+     */
+    private inferArgType(
+        argText: string,
+        getVarType: (name: string) => string | undefined
+    ): string | null {
+        const arg = argText.trim();
+        if (!arg) return null;
+        
+        // String literal
+        if (arg.startsWith('"') || arg.startsWith("'")) return 'string';
+        
+        // Numeric literal  
+        if (/^-?\d+$/.test(arg)) return 'int';
+        if (/^-?\d+\.\d*$/.test(arg) || /^-?\.\d+$/.test(arg)) return 'float';
+        
+        // Boolean literal
+        if (arg === 'true' || arg === 'false') return 'bool';
+        
+        // null
+        if (arg === 'null' || arg === 'NULL') return null; // null is compatible with any ref type
+        
+        // new ClassName(...)
+        const newMatch = arg.match(/^new\s+(\w+)/);
+        if (newMatch) return newMatch[1];
+        
+        // Cast: ClassName.Cast(expr) or ClassName.Cast(expr).Chain(...)
+        const castMatch = arg.match(/^(\w+)\.Cast\s*\(/);
+        if (castMatch) {
+            const castType = castMatch[1];
+            // Skip past the balanced parens of Cast(...)
+            const openIdx = arg.indexOf('(', castMatch[0].length - 1);
+            let depth = 1;
+            let i = openIdx + 1;
+            while (i < arg.length && depth > 0) {
+                const ch = arg[i];
+                if (ch === '(') depth++;
+                else if (ch === ')') depth--;
+                else if (ch === '"' || ch === "'") {
+                    const q = ch;
+                    i++;
+                    while (i < arg.length && arg[i] !== q) {
+                        if (arg[i] === '\\') i++;
+                        i++;
+                    }
+                }
+                i++;
+            }
+            // Check if there's a chain after Cast(...): e.g., .GetCurrentSkinIdx()
+            const afterCast = arg.substring(i).trim();
+            if (afterCast.startsWith('.')) {
+                return this.resolveVariableChainType(castType, afterCast);
+            }
+            return castType;
+        }
+        
+        // Simple variable reference
+        if (/^\w+$/.test(arg)) {
+            const varType = getVarType(arg);
+            if (varType) return varType;
+            // Could be an enum value or class name - can't determine type
+            return null;
+        }
+        
+        // Function call: FuncName(...) or FuncName(...).Chain(...)
+        const funcCallMatch = arg.match(/^(\w+)\s*\(/);
+        if (funcCallMatch) {
+            const rootType = this.resolveFunctionReturnType(funcCallMatch[1]);
+            if (rootType) {
+                // Check if there's a chain after the closing paren: FuncName(...).Something
+                const openIdx = arg.indexOf('(');
+                let depth = 1;
+                let i = openIdx + 1;
+                while (i < arg.length && depth > 0) {
+                    const ch = arg[i];
+                    if (ch === '(') depth++;
+                    else if (ch === ')') depth--;
+                    else if (ch === '"' || ch === "'") {
+                        const q = ch;
+                        i++;
+                        while (i < arg.length && arg[i] !== q) {
+                            if (arg[i] === '\\') i++;
+                            i++;
+                        }
+                    }
+                    i++;
+                }
+                // i now points just past the closing paren
+                const afterCall = arg.substring(i).trim();
+                if (afterCall.startsWith('.')) {
+                    // There's a chain after the function call — resolve it
+                    return this.resolveVariableChainType(rootType, afterCall);
+                }
+            }
+            return rootType;
+        }
+        
+        // Method chain: var.Method(...)
+        const chainMatch = arg.match(/^(\w+)\s*\./);
+        if (chainMatch) {
+            const varType = getVarType(chainMatch[1]);
+            if (varType) {
+                const chainText = arg.substring(chainMatch[0].length - 1); // keep the dot
+                // If the chain ends with a method call, use resolveVariableChainType
+                if (chainText.includes('(')) {
+                    return this.resolveVariableChainType(varType, chainText);
+                }
+                // Property access: resolve the field type
+                const members = this.parseChainMembers(chainText);
+                if (members.length > 0) {
+                    const resolved = this.resolveChainSteps(members, this.resolveTypedef(varType), new Map());
+                    return resolved?.type ?? null;
+                }
+            }
+        }
+        
+        // Can't determine type
+        return null;
+    }
+
+    /**
+     * Check a single function call's arguments against all overloads.
+     * Returns null if any overload matches, or an error message if none do.
+     */
+    private validateCallAgainstOverloads(
+        overloads: FunctionDeclNode[],
+        argTypes: (string | null)[],
+        argCount: number,
+        funcName: string
+    ): { message: string; severity: 'error' | 'warning' } | null {
+        if (overloads.length === 0) return null; // No declarations found, skip
+        
+        // Try each overload - if ANY matches, the call is valid
+        let bestError: string | null = null;
+        let closestOverload: FunctionDeclNode | null = null;
+        let smallestParamDiff = Infinity;
+        
+        for (const overload of overloads) {
+            const params = overload.parameters || [];
+            const requiredCount = params.filter(p => !p.hasDefault).length;
+            const totalCount = params.length;
+            
+            // Check argument count
+            if (argCount < requiredCount) {
+                const diff = requiredCount - argCount;
+                if (diff < smallestParamDiff) {
+                    smallestParamDiff = diff;
+                    closestOverload = overload;
+                    const missing = params.slice(argCount).filter(p => !p.hasDefault)
+                        .map(p => `${p.type?.identifier || '?'} ${p.name}`).join(', ');
+                    bestError = `Missing required argument(s): ${missing}`;
+                }
+                continue; // Try other overloads
+            }
+            
+            if (argCount > totalCount) {
+                const diff = argCount - totalCount;
+                if (diff < smallestParamDiff) {
+                    smallestParamDiff = diff;
+                    closestOverload = overload;
+                    bestError = `Too many arguments: expected ${totalCount === requiredCount ? totalCount : `${requiredCount}-${totalCount}`}, got ${argCount}`;
+                }
+                continue; // Try other overloads
+            }
+            
+            // Argument count is valid, check types
+            let typeMismatch = false;
+            let mismatchMsg = '';
+            
+            for (let i = 0; i < argCount; i++) {
+                const argType = argTypes[i];
+                if (!argType) continue; // Couldn't resolve arg type, skip this param
+                
+                // Skip void arg types — typically a function reference (method without parens)
+                // rather than a meaningful value, so type checking would be misleading
+                if (argType === 'void') continue;
+                
+                const param = params[i];
+                if (!param?.type?.identifier) continue;
+                
+                const paramType = param.type.identifier;
+                
+                // Skip auto/typename/Class/void/func params - they accept anything
+                // In Enforce Script, void parameters are generic "any type" placeholders,
+                // and func/function params accept function references which look like identifiers.
+                // Also skip container types (array, set, map) since we don't compare generics yet.
+                if (paramType === 'auto' || paramType === 'typename' || paramType === 'Class' || paramType === 'void' || paramType === 'func' || paramType === 'function' || paramType === 'array' || paramType === 'set' || paramType === 'map') continue;
+                
+                // Skip out/inout params - their types flow differently
+                if (param.modifiers?.includes('out') || param.modifiers?.includes('inout')) continue;
+                
+                const compat = this.checkTypeCompatibility(paramType, argType);
+                if (!compat.compatible) {
+                    typeMismatch = true;
+                    mismatchMsg = `Argument ${i + 1}: cannot pass '${argType}' as '${paramType} ${param.name}'`;
+                    break;
+                }
+            }
+            
+            if (!typeMismatch) {
+                // This overload matches — call is valid
+                return null;
+            }
+            
+            // This overload didn't match on types
+            if (smallestParamDiff > 0 || !bestError) {
+                smallestParamDiff = 0;
+                closestOverload = overload;
+                bestError = mismatchMsg;
+            }
+        }
+        
+        if (!bestError) return null;
+        
+        // Build the signature of the closest matching overload for context
+        if (closestOverload) {
+            const sig = closestOverload.parameters
+                .map(p => `${p.type?.identifier || '?'} ${p.name}${p.hasDefault ? '?' : ''}`)
+                .join(', ');
+            const prefix = overloads.length > 1 
+                ? `No matching overload for '${funcName}': ` 
+                : `'${funcName}(${sig})': `;
+            return { message: prefix + bestError, severity: 'error' };
+        }
+        
+        return { message: bestError, severity: 'error' };
+    }
+
+    /**
+     * Validate function/method call arguments in the document.
+     * Checks argument count and types against all overloads.
+     */
+    private checkFunctionCallArgs(doc: TextDocument, diags: Diagnostic[]): void {
+        const text = doc.getText();
+        const ast = this.ensure(doc);
+        
+        // Build scoped variable type lookup (reuse same approach as checkTypeMismatches)
+        const varTypes = new Map<string, { type: string; startLine: number; endLine: number }[]>();
+        
+        const addVar = (name: string, type: string, start: number, end: number) => {
+            if (!varTypes.has(name)) varTypes.set(name, []);
+            varTypes.get(name)!.push({ type, startLine: start, endLine: end });
+        };
+        
+        // Collect variable types from AST
+        for (const node of ast.body) {
+            if (node.kind === 'VarDecl' && node.name && (node as VarDeclNode).type?.identifier) {
+                addVar(node.name, (node as VarDeclNode).type.identifier, node.start?.line ?? 0, Number.MAX_SAFE_INTEGER);
+            }
+            if (node.kind === 'ClassDecl') {
+                const cls = node as ClassDeclNode;
+                const clsStart = cls.start?.line ?? 0;
+                const clsEnd = cls.end?.line ?? Number.MAX_SAFE_INTEGER;
+                for (const member of cls.members || []) {
+                    if (member.kind === 'VarDecl' && member.name && (member as VarDeclNode).type?.identifier) {
+                        addVar(member.name, (member as VarDeclNode).type.identifier, clsStart, clsEnd);
+                    }
+                    if (member.kind === 'FunctionDecl') {
+                        const func = member as FunctionDeclNode;
+                        const fStart = func.start?.line ?? clsStart;
+                        const fEnd = func.end?.line ?? clsEnd;
+                        for (const p of func.parameters || []) {
+                            if (p.name && p.type?.identifier) addVar(p.name, p.type.identifier, fStart, fEnd);
+                        }
+                        for (const l of func.locals || []) {
+                            if (l.name && l.type?.identifier) addVar(l.name, l.type.identifier, l.start?.line ?? fStart, fEnd);
+                        }
+                    }
+                }
+            }
+            if (node.kind === 'FunctionDecl') {
+                const func = node as FunctionDeclNode;
+                const fStart = func.start?.line ?? 0;
+                const fEnd = func.end?.line ?? Number.MAX_SAFE_INTEGER;
+                for (const p of func.parameters || []) {
+                    if (p.name && p.type?.identifier) addVar(p.name, p.type.identifier, fStart, fEnd);
+                }
+            }
+        }
+        
+        const getVarTypeAtLine = (name: string, line: number): string | undefined => {
+            const entries = varTypes.get(name);
+            if (entries) {
+                let best: { type: string; startLine: number; endLine: number } | undefined;
+                for (const e of entries) {
+                    if (line >= e.startLine && line <= e.endLine) {
+                        if (!best || (e.endLine - e.startLine) < (best.endLine - best.startLine)) {
+                            best = e;
+                        }
+                    }
+                }
+                if (best) return best.type;
+            }
+            // Fall back to full cross-file resolution (globals, class hierarchy, etc.)
+            const pos: Position = { line, character: 0 };
+            return this.resolveVariableType(doc, pos, name) ?? undefined;
+        };
+        
+        // Helper: check if position is in comment or string
+        const isInsideCommentOrString = (position: number): boolean => {
+            let lineStart = text.lastIndexOf('\n', position) + 1;
+            let lineEnd = text.indexOf('\n', position);
+            if (lineEnd === -1) lineEnd = text.length;
+            const line = text.substring(lineStart, lineEnd);
+            const posInLine = position - lineStart;
+            
+            const commentIdx = line.indexOf('//');
+            if (commentIdx >= 0 && commentIdx < posInLine) return true;
+            
+            let i = position - 1;
+            while (i >= 0) {
+                if (i > 0 && text[i-1] === '*' && text[i] === '/') break;
+                if (i > 0 && text[i-1] === '/' && text[i] === '*') return true;
+                i--;
+            }
+            
+            let inStr = false;
+            let sCh = '';
+            for (let j = 0; j < posInLine; j++) {
+                const ch = line[j];
+                if (!inStr && (ch === '"' || ch === "'")) { inStr = true; sCh = ch; }
+                else if (inStr && ch === sCh && (j === 0 || line[j-1] !== '\\')) { inStr = false; }
+            }
+            return inStr;
+        };
+        
+        const getLineFromPos = (pos: number): number => {
+            let line = 0;
+            for (let i = 0; i < pos && i < text.length; i++) {
+                if (text[i] === '\n') line++;
+            }
+            return line;
+        };
+        
+        // Keywords and built-ins that look like function calls but aren't
+        const skipNames = new Set([
+            'if', 'while', 'for', 'foreach', 'switch', 'return', 'new', 'delete',
+            'super', 'this', 'class', 'enum', 'typedef', 'Print', 'PrintFormat',
+            'cast', 'sizeof', 'typeof', 'typename', 'thread', 'ref',
+            'array', 'set', 'map', 'autoptr'
+        ]);
+        
+        // Find function calls: FuncName(args) or obj.Method(args)
+        // We scan for pattern: identifier ( ... )
+        // Use regex to find call sites, then extract balanced args
+        const callPattern = /\b(\w+)\s*\(/g;
+        let match: RegExpExecArray | null;
+        
+        while ((match = callPattern.exec(text)) !== null) {
+            if (isInsideCommentOrString(match.index)) continue;
+            
+            const funcName = match[1];
+            if (skipNames.has(funcName)) continue;
+            
+            // Skip destructor calls: ~ClassName() — destructors take no args
+            if (match.index > 0 && text[match.index - 1] === '~') continue;
+            
+            // Skip annotations inside square brackets: [NonSerialized()], [Attribute()]
+            // Walk backwards from match to find if we're inside [...]
+            let bracketCheck = match.index - 1;
+            while (bracketCheck >= 0 && text[bracketCheck] === ' ') bracketCheck--;
+            if (bracketCheck >= 0 && text[bracketCheck] === '[') continue;
+            // Also handle: [Attr(param)] where there's content before
+            let inBracket = false;
+            for (let bi = match.index - 1; bi >= 0; bi--) {
+                if (text[bi] === '\n' || text[bi] === ';' || text[bi] === '}' || text[bi] === '{') break;
+                if (text[bi] === ']') break; // not inside brackets
+                if (text[bi] === '[') { inBracket = true; break; }
+            }
+            if (inBracket) continue;
+            
+            // Skip constructor calls: new ClassName(...)
+            const beforeNew = text.substring(Math.max(0, match.index - 10), match.index).trimEnd();
+            if (beforeNew.endsWith('new')) continue;
+            
+            // Skip declarations: "void FuncName(" or "int FuncName(" etc.
+            // If preceded by a type + space, it's likely a declaration not a call
+            const beforeCall = text.substring(Math.max(0, match.index - 80), match.index);
+            // Check if this is a function declaration (type immediately before name)
+            const declCheck = beforeCall.match(/(?:void|int|float|bool|string|auto|vector|override\s+\w+|static\s+\w+|\w+)\s+$/);
+            if (declCheck) {
+                // Could be a declaration. Check more carefully — if the next non-whitespace
+                // before the type name is '{', ';', or start-of-line, it's a declaration
+                const typeName = declCheck[0].trim();
+                // Skip if it looks like a declaration context (not preceded by = or , or ( )
+                const preDeclText = text.substring(Math.max(0, match.index - 80), match.index - typeName.length).trimEnd();
+                const lastChar = preDeclText[preDeclText.length - 1];
+                if (!lastChar || lastChar === '{' || lastChar === '}' || lastChar === ';' || lastChar === ')' || lastChar === '\n') {
+                    continue; // It's a declaration, skip
+                }
+            }
+            
+            // Extract the balanced argument text
+            const argsStart = match.index + match[0].length;
+            let depth = 1;
+            let pos = argsStart;
+            while (pos < text.length && depth > 0) {
+                const ch = text[pos];
+                if (ch === '(') depth++;
+                else if (ch === ')') depth--;
+                // Skip strings inside args
+                else if (ch === '"' || ch === "'") {
+                    const quote = ch;
+                    pos++;
+                    while (pos < text.length && text[pos] !== quote) {
+                        if (text[pos] === '\\') pos++; // skip escaped char
+                        pos++;
+                    }
+                }
+                pos++;
+            }
+            if (depth !== 0) continue; // Unbalanced parens
+            
+            const argsText = text.substring(argsStart, pos - 1).trim();
+            const argStrings = argsText ? this.parseCallArguments(argsText) : [];
+            const argCount = argStrings.length;
+            
+            // Determine if this is a method call or global call
+            const textBeforeFunc = text.substring(Math.max(0, match.index - 200), match.index);
+            const lineNum = getLineFromPos(match.index);
+            
+            let overloads: FunctionDeclNode[] = [];
+            let chainAttempted = false;
+            
+            // Check for method call: something.FuncName(
+            const dotMatch = textBeforeFunc.match(/(\w+)\s*\.\s*$/);
+            if (dotMatch) {
+                const objName = dotMatch[1];
+                let objType = getVarTypeAtLine(objName, lineNum);
+                if (objType) {
+                    objType = this.resolveTypedef(objType);
+                    overloads = this.findFunctionOverloads(funcName, objType);
+                } else {
+                    // Check if there's a multi-dot chain before: e.g., g_Game.GameScript.Method(
+                    // or GetGame().GameScript.Method( (function call root)
+                    // Try to resolve the full chain to get the correct type
+                    const preDot = textBeforeFunc.substring(0, dotMatch.index!).replace(/[\s.]+$/, '');
+                    // Try matching chain with possible function call at the root: FuncName(...).X.Y
+                    const chainWithCallParts = preDot.match(/(\w+)\s*\([^)]*\)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)*)\s*$/);
+                    const chainParts = preDot.match(/(\w+(?:\s*\.\s*\w+)*)\s*$/);
+                    if (chainWithCallParts) {
+                        // Root is a function call: GetGame().GameScript.Method(
+                        const rootFuncName = chainWithCallParts[1];
+                        let rootType = this.resolveFunctionReturnType(rootFuncName) ?? undefined;
+                        if (rootType) {
+                            rootType = this.resolveTypedef(rootType);
+                            const afterCall = chainWithCallParts[2] || '';
+                            // Build chain from after the function call through objName
+                            const middleParts = afterCall.split(/\s*\.\s*/).filter(Boolean)
+                                .map(p => p.replace(/\s*\([^)]*\)$/, '')); // strip parens from method calls
+                            middleParts.push(objName);
+                            const chainText = '.' + middleParts.join('.');
+                            const resolved = this.resolveVariableChainType(rootType, chainText);
+                            if (resolved) {
+                                overloads = this.findFunctionOverloads(funcName, resolved);
+                            }
+                        }
+                    } else if (chainParts) {
+                        const rootAndChain = chainParts[1].split(/\s*\.\s*/);
+                        const rootName = rootAndChain[0];
+                        let rootType = getVarTypeAtLine(rootName, lineNum);
+                        if (rootType) {
+                            rootType = this.resolveTypedef(rootType);
+                            // Resolve the chain members (everything between root and objName)
+                            const middleParts = rootAndChain.slice(1);
+                            middleParts.push(objName);
+                            const chainText = '.' + middleParts.join('.');
+                            const resolved = this.resolveVariableChainType(rootType, chainText);
+                            if (resolved) {
+                                overloads = this.findFunctionOverloads(funcName, resolved);
+                            }
+                        }
+                    }
+                    // Fall back to static class call if chain didn't resolve
+                    if (overloads.length === 0 && objName[0] === objName[0].toUpperCase()) {
+                        overloads = this.findFunctionOverloads(funcName, objName);
+                    }
+                }
+            } else {
+                // Check for chain call: e.g., U().globals().FuncName( or var.method().FuncName(
+                // The simple dotMatch fails when a ')' precedes the dot (chain with call results)
+                const trimBefore = textBeforeFunc.replace(/\s+$/, '');
+                if (trimBefore.endsWith('.')) {
+                    chainAttempted = true;
+                    // Walk backwards to extract the full chain expression before the trailing dot
+                    let p = trimBefore.length - 2; // start before the dot
+                    while (p >= 0) {
+                        // Skip whitespace
+                        while (p >= 0 && /\s/.test(trimBefore[p])) p--;
+                        if (p < 0) break;
+                        // Optional balanced parens (method call arguments)
+                        if (trimBefore[p] === ')') {
+                            let depth = 1; p--;
+                            while (p >= 0 && depth > 0) {
+                                if (trimBefore[p] === '(') depth--;
+                                else if (trimBefore[p] === ')') depth++;
+                                p--;
+                            }
+                            // p is now before the '('
+                            while (p >= 0 && /\s/.test(trimBefore[p])) p--;
+                        }
+                        // Required: identifier
+                        if (p < 0 || !/\w/.test(trimBefore[p])) break;
+                        while (p >= 0 && /\w/.test(trimBefore[p])) p--;
+                        const idStart = p + 1;
+                        // Check for preceding dot (more chain)
+                        let pp = p;
+                        while (pp >= 0 && /\s/.test(trimBefore[pp])) pp--;
+                        if (pp >= 0 && trimBefore[pp] === '.') {
+                            p = pp - 1;
+                            continue;
+                        }
+                        // No more dots — idStart is the beginning of the expression
+                        p = idStart - 1;
+                        break;
+                    }
+                    const exprStart = p + 1;
+                    const chainExpr = trimBefore.substring(exprStart, trimBefore.length - 1); // exclude trailing dot
+                    if (chainExpr) {
+                        const rootM = chainExpr.match(/^(\w+)/);
+                        if (rootM) {
+                            const rootName = rootM[1];
+                            const afterRoot = chainExpr.substring(rootName.length);
+                            let rootType: string | undefined;
+                            let chainRemainder: string;
+                            if (afterRoot.trimStart().startsWith('(')) {
+                                // Root is a function call: FuncName(...).chain...
+                                rootType = this.resolveFunctionReturnType(rootName) ?? undefined;
+                                const parenStart = afterRoot.indexOf('(');
+                                let d = 1, i = parenStart + 1;
+                                while (i < afterRoot.length && d > 0) {
+                                    if (afterRoot[i] === '(') d++;
+                                    else if (afterRoot[i] === ')') d--;
+                                    i++;
+                                }
+                                chainRemainder = afterRoot.substring(i);
+                            } else {
+                                // Root is a variable
+                                rootType = getVarTypeAtLine(rootName, lineNum);
+                                if (rootType) rootType = this.resolveTypedef(rootType);
+                                chainRemainder = afterRoot;
+                            }
+                            // Resolve through the remaining chain if present
+                            if (rootType && chainRemainder.trim().startsWith('.')) {
+                                const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
+                                if (resolved) {
+                                    overloads = this.findFunctionOverloads(funcName, resolved);
+                                }
+                            } else if (rootType) {
+                                overloads = this.findFunctionOverloads(funcName, rootType);
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to global or unqualified call only if no chain was detected.
+                // If a chain was attempted but couldn't resolve, skip — don't match the wrong function.
+                if (!chainAttempted && overloads.length === 0) {
+                    const containingClass = this.findContainingClass(ast, doc.positionAt(match.index));
+                    if (containingClass) {
+                        overloads = this.findFunctionOverloads(funcName, containingClass.name);
+                    }
+                    if (overloads.length === 0) {
+                        overloads = this.findFunctionOverloads(funcName);
+                    }
+                }
+            }
+            
+            if (overloads.length === 0) {
+                // Warn about unknown functions only when the index is large enough to be confident
+                if (this.docCache.size >= 500) {
+                    // Skip warning for chain calls where we couldn't resolve the target type —
+                    // we don't know what class the method belongs to
+                    const isUnresolvedChain = chainAttempted || (dotMatch && !getVarTypeAtLine(dotMatch[1], lineNum) && dotMatch[1][0] !== dotMatch[1][0].toUpperCase());
+                    if (!isUnresolvedChain) {
+                        const startPos = doc.positionAt(match.index);
+                        const endPos = doc.positionAt(match.index + funcName.length);
+                        diags.push({
+                            message: dotMatch
+                                ? `Unknown method '${funcName}' on type '${getVarTypeAtLine(dotMatch[1], lineNum) || dotMatch[1]}'`
+                                : `Unknown function '${funcName}'`,
+                            range: { start: startPos, end: endPos },
+                            severity: DiagnosticSeverity.Warning
+                        });
+                    }
+                }
+                continue;
+            }
+            
+            // Infer argument types
+            const argTypes: (string | null)[] = argStrings.map(arg =>
+                this.inferArgType(arg, (name) => getVarTypeAtLine(name, lineNum))
+            );
+            
+            // Validate against overloads
+            const result = this.validateCallAgainstOverloads(overloads, argTypes, argCount, funcName);
+            if (result) {
+                const startPos = doc.positionAt(match.index);
+                const endPos = doc.positionAt(pos - 1); // end of closing paren
+                diags.push({
+                    message: result.message,
+                    range: { start: startPos, end: endPos },
+                    severity: result.severity === 'error' ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning
+                });
+            }
         }
     }
 

@@ -150,6 +150,7 @@ export interface TypedefNode extends SymbolNodeBase {
 export interface VarDeclNode extends SymbolNodeBase {
     kind: 'VarDecl';
     type: TypeNode;
+    hasDefault?: boolean; // true if parameter has a default value (e.g., int x = 5)
 }
 
 export interface FunctionDeclNode extends SymbolNodeBase {
@@ -261,7 +262,7 @@ export function parse(
         expect('(');
         while (!eof() && peek().value !== ')') {
             const varDecl = expectVarDecl(doc, true);
-            // ignore default values
+            // Skip any remaining tokens until ')' or ',' (default values are already consumed by parseDecl)
             while (!eof() && peek().value !== ')' && peek().value !== ',')
                 next();
 
@@ -510,9 +511,12 @@ export function parse(
                 // Track previous tokens to detect local variable declarations
                 // Pattern: [modifiers...] TypeName VarName (= | ; | ,)
                 let prevPrev: Token | null = null;
+                let prevPrevIdx = -1;
                 let prev: Token | null = null;
+                let prevIdx = -1;
                 while (depth > 0 && !eof()) {
                     const t = next();
+                    const tIdx = pos - 1; // index of the token that next() just returned
                     if (t.value === '{') depth++;
                     else if (t.value === '}') depth--;
                     // Detect ternary operator (condition ? true : false)
@@ -543,9 +547,34 @@ export function parse(
                     // Detect local variable declarations:
                     //   TypeName varName ;  or  TypeName varName =  or  TypeName varName ,
                     // prevPrev = type token, prev = name token, t = ; or = or ,
+                    // For generic types like array<autoptr X>, prevPrev is '>' — we need to
+                    // walk backwards past balanced angle brackets to find the actual type name.
                     if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',')) {
-                        const isTypeTok = prevPrev.kind === TokenKind.Identifier
-                            || (prevPrev.kind === TokenKind.Keyword && isPrimitiveType(prevPrev.value));
+                        let typeTok = prevPrev;
+                        if (prevPrev.value === '>') {
+                            // Walk backwards through tokens to find matching '<' and the type before it
+                            let angleDepth = 1;
+                            let searchPos = prevPrevIdx - 1; // start before the '>'
+                            while (searchPos >= 0 && angleDepth > 0) {
+                                const st = toks[searchPos];
+                                if (st.value === '>') angleDepth++;
+                                else if (st.value === '<') angleDepth--;
+                                searchPos--;
+                            }
+                            // After the loop, searchPos has been decremented past '<',
+                            // so it now points to the type name token (e.g., 'array')
+                            if (searchPos >= 0 && angleDepth === 0) {
+                                // Skip past any trivia tokens (comments, preprocessor)
+                                while (searchPos >= 0 && (toks[searchPos].kind === TokenKind.Comment || toks[searchPos].kind === TokenKind.Preproc)) {
+                                    searchPos--;
+                                }
+                                if (searchPos >= 0) {
+                                    typeTok = toks[searchPos];
+                                }
+                            }
+                        }
+                        const isTypeTok = typeTok.kind === TokenKind.Identifier
+                            || (typeTok.kind === TokenKind.Keyword && isPrimitiveType(typeTok.value));
                         const isNameTok = prev.kind === TokenKind.Identifier;
                         if (isTypeTok && isNameTok) {
                             locals.push({
@@ -557,22 +586,24 @@ export function parse(
                                 type: {
                                     kind: 'Type',
                                     uri: doc.uri,
-                                    identifier: prevPrev.value,
-                                    start: doc.positionAt(prevPrev.start),
-                                    end: doc.positionAt(prevPrev.end),
+                                    identifier: typeTok.value,
+                                    start: doc.positionAt(typeTok.start),
+                                    end: doc.positionAt(typeTok.end),
                                     arrayDims: [],
                                     modifiers: [],
                                 },
                                 annotations: [],
                                 modifiers: [],
-                                start: doc.positionAt(prevPrev.start),
+                                start: doc.positionAt(typeTok.start),
                                 end: doc.positionAt(prev.end),
                             });
                         }
                     }
 
                     prevPrev = prev;
+                    prevPrevIdx = prevIdx;
                     prev = t;
+                    prevIdx = tIdx;
                 }
             }
 
@@ -595,6 +626,7 @@ export function parse(
         // variable
 
         const vars: VarDeclNode[] = [];
+        let sawDefault = false;
         while (!eof()) {
             const typeNode = structuredClone(baseTypeNode);
 
@@ -611,6 +643,7 @@ export function parse(
 
             // value initialization (skip for now)
             if (peek().value === '=') {
+                sawDefault = true;
                 next();
                 
                 // Handle EOF after = (incomplete code)
@@ -684,6 +717,7 @@ export function parse(
                 nameStart: doc.positionAt(nameTok.start),
                 nameEnd: doc.positionAt(nameTok.end),
                 type: baseTypeNode,
+                hasDefault: sawDefault || undefined,
                 annotations: annotations,
                 modifiers: mods,
                 start: baseTypeNode.start,
