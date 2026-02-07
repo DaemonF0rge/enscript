@@ -170,9 +170,10 @@ export interface File {
 // parse entry point
 export function parse(
     doc: TextDocument,
-    conn?: Connection            // optional – pass from index.ts to auto-log
+    conn?: Connection,            // optional – pass from index.ts to auto-log
+    defines?: Set<string>         // optional – preprocessor defines to treat as active
 ): File {
-    const toks = lex(doc.getText());
+    const toks = lex(doc.getText(), defines);
     const text = doc.getText();
     let pos = 0;
     

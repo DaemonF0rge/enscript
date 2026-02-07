@@ -193,6 +193,96 @@ export class Analyzer {
 
     private docCache = new Map<string, File>();
     private parseErrorCount = 0;
+    private preprocessorDefines: Set<string> = new Set();
+
+    /** Set preprocessor defines that should be treated as active in #ifdef directives */
+    setPreprocessorDefines(defines: string[]): void {
+        this.preprocessorDefines = new Set(defines);
+    }
+
+    /**
+     * Strip out skipped #ifdef/#ifndef regions from text, preserving line structure.
+     * Replaces skipped content with spaces so line/column positions remain valid.
+     * Uses the same logic as the lexer: skip first branch by default, process #else;
+     * if a define is in preprocessorDefines, process the first branch and skip #else.
+     */
+    private stripSkippedIfdefRegions(text: string): string {
+        const result = text.split('');
+        const lines = text.split('\n');
+        
+        // Blank out a range of characters (preserve newlines for line numbers)
+        const blankOut = (start: number, end: number) => {
+            for (let i = start; i < end && i < result.length; i++) {
+                if (result[i] !== '\n' && result[i] !== '\r') {
+                    result[i] = ' ';
+                }
+            }
+        };
+        
+        // Find offset of line start
+        let i = 0;
+        
+        // Stack of ifdef states for nesting
+        // Each entry: { skippingFirstBranch, inElseBranch, depth relative to this ifdef }
+        interface IfdefState {
+            processFirstBranch: boolean;
+            inElseBranch: boolean;
+            directiveStart: number;
+        }
+        const stack: IfdefState[] = [];
+        
+        // Are we currently in a region that should be blanked?
+        const isSkipping = (): boolean => {
+            for (const s of stack) {
+                if (!s.processFirstBranch && !s.inElseBranch) return true;  // in first branch, should skip
+                if (s.processFirstBranch && s.inElseBranch) return true;    // in else branch, should skip
+            }
+            return false;
+        };
+        
+        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+            const line = lines[lineNum];
+            const trimmed = line.trim();
+            
+            const ifdefMatch = trimmed.match(/^#\s*(ifdef|ifndef)\s+(\w+)/);
+            if (ifdefMatch) {
+                const isIfdef = ifdefMatch[1] === 'ifdef';
+                const symbol = ifdefMatch[2];
+                const isDefined = this.preprocessorDefines.has(symbol);
+                const processFirst = isIfdef ? isDefined : !isDefined;
+                
+                stack.push({ processFirstBranch: processFirst, inElseBranch: false, directiveStart: i });
+                
+                // Blank the directive line itself
+                blankOut(i, i + line.length);
+                i += line.length + 1; // +1 for \n
+                continue;
+            }
+            
+            if (trimmed.match(/^#\s*else\b/) && stack.length > 0) {
+                stack[stack.length - 1].inElseBranch = true;
+                blankOut(i, i + line.length);
+                i += line.length + 1;
+                continue;
+            }
+            
+            if (trimmed.match(/^#\s*endif\b/) && stack.length > 0) {
+                stack.pop();
+                blankOut(i, i + line.length);
+                i += line.length + 1;
+                continue;
+            }
+            
+            // If we're in a skipped region, blank this line
+            if (isSkipping()) {
+                blankOut(i, i + line.length);
+            }
+            
+            i += line.length + 1; // +1 for \n
+        }
+        
+        return result.join('');
+    }
 
     /** Return summary stats about everything indexed so far. */
     getIndexStats() {
@@ -226,7 +316,7 @@ export class Analyzer {
 
         try {
             // 2 · happy path ─ parse & cache
-            const ast = parse(doc);           // pass full TextDocument
+            const ast = parse(doc, undefined, this.preprocessorDefines);           // pass full TextDocument + defines
             ast.module = getModuleLevel(doc.uri);
             this.docCache.set(normalizeUri(doc.uri), ast);
             return ast;
@@ -1816,7 +1906,7 @@ export class Analyzer {
      *   for (int j = 0; j < 10; j++) { }  // ERROR: 'j' already declared
      */
     private checkDuplicateVariables(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = doc.getText();
+        const text = this.stripSkippedIfdefRegions(doc.getText());
         
         // Track variables by scope - use a stack of scopes
         // Each scope has a map of variable names to their declaration info
@@ -1831,7 +1921,7 @@ export class Analyzer {
         // Must have: optional modifiers, return type (including generics), function name, parentheses for params
         // Excludes: array access like m_Foo[0] and assignments
         // Matches lines ending with { (normal), {} (empty body), ; (proto/native), or ) (brace on next line)
-        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{\}?|;)?\s*$/;
+        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{[^}]*\}?|;)?\s*$/;
 
         // Pattern to detect proto/native function declarations (no body, just ;)
         // Params in these don't create real variables — skip them for duplicate checking
@@ -2025,7 +2115,7 @@ export class Analyzer {
                 // Skip keywords that are not actual type names.
                 // 'typedef' is included because lines like "typedef set<float> TFloatSet;"
                 // match the varDeclPattern as type=typedef, name=set — which is a false positive.
-                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef'].includes(typeName)) {
+                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'out', 'inout', 'notnull', 'owned', 'local', 'volatile', 'external', 'abstract', 'final', 'reference'].includes(typeName)) {
                     continue;
                 }
                 
@@ -2256,7 +2346,7 @@ export class Analyzer {
      * - Re-assignment: varName = otherVar;
      */
     private checkTypeMismatches(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = doc.getText();
+        const text = this.stripSkippedIfdefRegions(doc.getText());
         const ast = this.ensure(doc);
         
         // Scoped variable tracking - each variable knows its valid line range
@@ -2558,8 +2648,13 @@ export class Analyzer {
                 if (!inString && (ch === '"' || ch === "'")) {
                     inString = true;
                     stringChar = ch;
-                } else if (inString && ch === stringChar && (j === 0 || line[j-1] !== '\\')) {
-                    inString = false;
+                } else if (inString && ch === stringChar) {
+                    let backslashCount = 0;
+                    let bi = j - 1;
+                    while (bi >= 0 && line[bi] === '\\') { backslashCount++; bi--; }
+                    if (backslashCount % 2 === 0) {
+                        inString = false;
+                    }
                 }
             }
             return inString;
@@ -3097,8 +3192,15 @@ export class Analyzer {
             }
             if (inString) {
                 current += ch;
-                if (ch === stringChar && (i === 0 || argsText[i - 1] !== '\\')) {
-                    inString = false;
+                if (ch === stringChar) {
+                    // Count consecutive backslashes before this quote
+                    let backslashCount = 0;
+                    let bi = i - 1;
+                    while (bi >= 0 && argsText[bi] === '\\') { backslashCount++; bi--; }
+                    // Even number of backslashes (including 0) means quote is NOT escaped
+                    if (backslashCount % 2 === 0) {
+                        inString = false;
+                    }
                 }
                 continue;
             }
@@ -3362,7 +3464,7 @@ export class Analyzer {
      * Checks argument count and types against all overloads.
      */
     private checkFunctionCallArgs(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = doc.getText();
+        const text = this.stripSkippedIfdefRegions(doc.getText());
         const ast = this.ensure(doc);
         
         // Build scoped variable type lookup (reuse same approach as checkTypeMismatches)
@@ -3450,7 +3552,12 @@ export class Analyzer {
             for (let j = 0; j < posInLine; j++) {
                 const ch = line[j];
                 if (!inStr && (ch === '"' || ch === "'")) { inStr = true; sCh = ch; }
-                else if (inStr && ch === sCh && (j === 0 || line[j-1] !== '\\')) { inStr = false; }
+                else if (inStr && ch === sCh) {
+                    let backslashCount = 0;
+                    let bi = j - 1;
+                    while (bi >= 0 && line[bi] === '\\') { backslashCount++; bi--; }
+                    if (backslashCount % 2 === 0) { inStr = false; }
+                }
             }
             return inStr;
         };
@@ -3780,7 +3887,7 @@ export class Analyzer {
      *       "more text");  // ERROR!
      */
     private checkMultiLineStatements(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = doc.getText();
+        const text = this.stripSkippedIfdefRegions(doc.getText());
         const lines = text.split('\n');
         
         // Track if we're inside a block comment

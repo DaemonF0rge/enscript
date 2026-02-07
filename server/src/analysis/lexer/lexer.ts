@@ -46,7 +46,7 @@
 import { Token, TokenKind } from './token';
 import { keywords, punct, multiCharOps } from './rules';
 
-export function lex(text: string): Token[] {
+export function lex(text: string, defines?: Set<string>): Token[] {
     const toks: Token[] = [];
     let i = 0;
 
@@ -88,9 +88,10 @@ export function lex(text: string): Token[] {
 
         // pre-processor (#define, #ifdef, #else, #endif, etc.)
         // Strategy for #ifdef/#else/#endif:
-        //   - Skip the #ifdef branch entirely (until #else or #endif)
-        //   - Process the #else branch (if present)
-        //   - This ensures we consistently get the "fallback" code path
+        //   - By default: skip the #ifdef/#ifndef branch, process the #else branch
+        //   - If the symbol is in the `defines` set: process the #ifdef branch, skip #else
+        //   - For #ifndef: inverted logic (process if NOT defined)
+        //   - User can configure which defines are active via settings
         //   - Handles nested #ifdef by tracking depth
         if (ch === '#') {
             const lineStart = i;
@@ -98,15 +99,73 @@ export function lex(text: string): Token[] {
             const directive = text.slice(lineStart, i).trim();
             
             // Check if this is #ifdef or #ifndef
-            if (directive.match(/^#\s*(ifdef|ifndef)\b/)) {
-                // Skip the #ifdef branch until we find #else or #endif at same nesting level
+            const ifdefMatch = directive.match(/^#\s*(ifdef|ifndef)\s+(\w+)/);
+            if (ifdefMatch) {
+                const isIfdef = ifdefMatch[1] === 'ifdef';
+                const symbol = ifdefMatch[2];
+                const isDefined = defines?.has(symbol) ?? false;
+                // Process first branch if: (#ifdef and defined) or (#ifndef and NOT defined)
+                const processFirstBranch = isIfdef ? isDefined : !isDefined;
+                
+                if (processFirstBranch) {
+                    // Process the #ifdef/#ifndef branch — just emit directive, continue lexing
+                    push(TokenKind.Preproc, directive, lineStart);
+                    // We'll handle #else (skip) and #endif (emit) when we encounter them
+                    continue;
+                } else {
+                    // Skip the #ifdef/#ifndef branch until #else or #endif
+                    let depth = 1;
+                    
+                    while (depth > 0 && i < text.length) {
+                        while (i < text.length && text[i] !== '#') {
+                            if (text[i] === '"') {
+                                i++;
+                                while (i < text.length && text[i] !== '"') {
+                                    if (text[i] === '\\' && i + 1 < text.length) i++;
+                                    i++;
+                                }
+                                if (i < text.length) i++;
+                            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '/') {
+                                while (i < text.length && text[i] !== '\n') i++;
+                            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '*') {
+                                i += 2;
+                                while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                                i += 2;
+                            } else {
+                                i++;
+                            }
+                        }
+                        
+                        if (i >= text.length) break;
+                        
+                        const dStart = i;
+                        while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
+                        const d = text.slice(dStart, i).trim();
+                        
+                        if (d.match(/^#\s*(ifdef|ifndef)\b/)) {
+                            depth++;
+                        } else if (d.match(/^#\s*endif\b/)) {
+                            depth--;
+                        } else if (d.match(/^#\s*else\b/) && depth === 1) {
+                            // Found #else at our level - stop skipping, process #else branch
+                            depth = 0;
+                        }
+                    }
+                    
+                    push(TokenKind.Preproc, text.slice(lineStart, i), lineStart);
+                    continue;
+                }
+            }
+            
+            // #else — we only reach here if we're PROCESSING the first branch
+            // (otherwise the skip loop above would have consumed #else)
+            // Now skip from #else until #endif
+            if (directive.match(/^#\s*else\b/)) {
+                const elseStart = lineStart;
                 let depth = 1;
-                const ifdefStart = lineStart;
                 
                 while (depth > 0 && i < text.length) {
-                    // Find next preprocessor directive
                     while (i < text.length && text[i] !== '#') {
-                        // Skip strings to avoid matching # inside strings
                         if (text[i] === '"') {
                             i++;
                             while (i < text.length && text[i] !== '"') {
@@ -115,10 +174,8 @@ export function lex(text: string): Token[] {
                             }
                             if (i < text.length) i++;
                         } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '/') {
-                            // Skip single line comment
                             while (i < text.length && text[i] !== '\n') i++;
                         } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '*') {
-                            // Skip multi-line comment
                             i += 2;
                             while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
                             i += 2;
@@ -129,7 +186,6 @@ export function lex(text: string): Token[] {
                     
                     if (i >= text.length) break;
                     
-                    // Read the directive
                     const dStart = i;
                     while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
                     const d = text.slice(dStart, i).trim();
@@ -138,14 +194,16 @@ export function lex(text: string): Token[] {
                         depth++;
                     } else if (d.match(/^#\s*endif\b/)) {
                         depth--;
-                    } else if (d.match(/^#\s*else\b/) && depth === 1) {
-                        // Found #else at our level - stop skipping, process #else branch
-                        depth = 0;
                     }
                 }
                 
-                // Emit the whole skipped block as a single preproc token
-                push(TokenKind.Preproc, text.slice(lineStart, i), lineStart);
+                push(TokenKind.Preproc, text.slice(elseStart, i), elseStart);
+                continue;
+            }
+            
+            // #endif — just emit as preproc token
+            if (directive.match(/^#\s*endif\b/)) {
+                push(TokenKind.Preproc, directive, lineStart);
                 continue;
             }
             

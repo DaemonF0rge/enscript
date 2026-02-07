@@ -48,6 +48,13 @@ connection.onInitialize((_params: InitializeParams): InitializeResult => {
 connection.onInitialized(async () => {
     const config = await getConfiguration(connection);
     const includePaths = config.includePaths as string[] || [];
+    const preprocessorDefines = config.preprocessorDefines as string[] || [];
+    
+    // Configure preprocessor defines
+    if (preprocessorDefines.length > 0) {
+        Analyzer.instance().setPreprocessorDefines(preprocessorDefines);
+        console.log(`Preprocessor defines: ${preprocessorDefines.join(', ')}`);
+    }
 
     const pathsToIndex = [workspaceRoot, ...includePaths];
     const allFiles: string[] = [];

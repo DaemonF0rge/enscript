@@ -62,6 +62,14 @@
                     "items": {
                         "type": "string"
                     }
+                },
+                "enscript.preprocessorDefines": {
+                    "type": "array",
+                    "default": [],
+                    "description": "List of preprocessor symbols to treat as defined. When set, #ifdef blocks for these symbols will be processed instead of skipped (e.g. [\"ENF_DONE\"] to include proto declarations guarded by #ifdef ENF_DONE).",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         }
