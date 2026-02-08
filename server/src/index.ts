@@ -14,6 +14,7 @@ import * as fs from 'fs/promises';
 import { findAllFiles, readFileUtf8 } from './util/fs';
 import { Analyzer } from './analysis/project/graph';
 import { getConfiguration } from './util/config';
+import { ASTCache } from './analysis/project/cache';
 
 
 // Create LSP connection (stdio or Node IPC autodetect).
@@ -71,22 +72,67 @@ connection.onInitialized(async () => {
 
     console.log(`Indexing ${allFiles.length} EnScript files...`);
 
-    for (const filePath of allFiles) {
-        const uri = url.pathToFileURL(filePath).toString();
-        const text = await readFileUtf8(filePath);
-        const doc = TextDocument.create(uri, 'enscript', 1, text);
+    // Notify client that indexing is starting
+    connection.sendNotification('enscript/indexingStart', { 
+        fileCount: allFiles.length
+    });
 
-        Analyzer.instance().runDiagnostics(doc);  // will parse & cache
+    // Initialize persistent AST cache for faster subsequent launches
+    const astCache = new ASTCache(workspaceRoot);
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    const startTime = Date.now();
+    let lastProgressUpdate = 0;
+
+    for (let i = 0; i < allFiles.length; i++) {
+        const filePath = allFiles[i];
+        const uri = url.pathToFileURL(filePath).toString();
+        
+        // Try to load from persistent cache first
+        const cachedAst = astCache.get(filePath);
+        if (cachedAst) {
+            // Cache hit - inject directly into Analyzer's memory cache
+            Analyzer.instance().injectCachedAST(uri, cachedAst);
+            cacheHits++;
+        } else {
+            // Cache miss - need to read and parse
+            const text = await readFileUtf8(filePath);
+            const doc = TextDocument.create(uri, 'enscript', 1, text);
+            const ast = Analyzer.instance().parseAndCache(doc);
+            
+            // Store in persistent cache for next launch
+            if (ast && ast.body.length > 0) {
+                astCache.set(filePath, ast);
+            }
+            cacheMisses++;
+        }
+
+        // Send progress updates every 500ms or every 100 files
+        const now = Date.now();
+        if (now - lastProgressUpdate > 500 || (i + 1) % 100 === 0) {
+            connection.sendNotification('enscript/indexingProgress', { 
+                current: i + 1,
+                total: allFiles.length,
+                percent: Math.round((i + 1) / allFiles.length * 100)
+            });
+            lastProgressUpdate = now;
+        }
     }
+
+    // Save the cache to disk
+    astCache.save();
+    
+    const elapsed = Date.now() - startTime;
 
     const stats = Analyzer.instance().getIndexStats();
     const moduleNames: Record<number, string> = { 1: '1_Core', 2: '2_GameLib', 3: '3_Game', 4: '4_World', 5: '5_Mission' };
     console.log(
-        `Indexing complete: ${stats.files} files, ` +
+        `Indexing complete in ${elapsed}ms: ${stats.files} files, ` +
         `${stats.classes} classes, ${stats.functions} functions, ` +
         `${stats.enums} enums, ${stats.typedefs} typedefs, ${stats.globals} globals` +
         (stats.parseErrors > 0 ? ` (${stats.parseErrors} parse errors)` : '')
     );
+    console.log(`  Cache: ${cacheHits} hits, ${cacheMisses} misses (${cacheHits > 0 ? Math.round(cacheHits / (cacheHits + cacheMisses) * 100) : 0}% hit rate)`);
     // Log per-module file counts
     const modParts = Object.entries(stats.moduleCounts)
         .sort(([a], [b]) => Number(a) - Number(b))

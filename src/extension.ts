@@ -8,6 +8,7 @@ import {
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
+let statusBarItem: vscode.StatusBarItem | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     const serverModule = path.join(__dirname, '..', 'server', 'out', 'index.js');
@@ -39,9 +40,38 @@ export async function activate(context: vscode.ExtensionContext) {
     client.start();
     context.subscriptions.push(client);
     
+    // Create status bar item for indexing progress
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    context.subscriptions.push(statusBarItem);
+    
+    // Listen for indexing start notification
+    client.onNotification('enscript/indexingStart', (params: { fileCount: number }) => {
+        if (statusBarItem) {
+            statusBarItem.text = `$(sync~spin) Enscript: Indexing ${params.fileCount} files...`;
+            statusBarItem.tooltip = 'EnScript is indexing your workspace. Autocomplete will be available shortly.';
+            statusBarItem.show();
+        }
+    });
+    
+    // Listen for indexing progress notification
+    client.onNotification('enscript/indexingProgress', (params: { current: number; total: number; percent: number }) => {
+        if (statusBarItem) {
+            statusBarItem.text = `$(sync~spin) Enscript: Indexing ${params.current}/${params.total} (${params.percent}%)`;
+        }
+    });
+    
     // Listen for indexing complete notification - refresh diagnostics on open files
     client.onNotification('enscript/indexingComplete', (params: { fileCount: number }) => {
-        vscode.window.showInformationMessage(`Enscript: Indexed ${params.fileCount} files. Refreshing diagnostics...`);
+        if (statusBarItem) {
+            statusBarItem.text = `$(check) Enscript: Ready`;
+            statusBarItem.tooltip = `Indexed ${params.fileCount} files`;
+            // Hide after 5 seconds
+            setTimeout(() => {
+                if (statusBarItem) {
+                    statusBarItem.hide();
+                }
+            }, 5000);
+        }
         
         // Trigger a re-validation of all open enscript documents
         for (const doc of vscode.workspace.textDocuments) {

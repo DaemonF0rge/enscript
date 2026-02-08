@@ -4,7 +4,7 @@ import { Analyzer } from '../../analysis/project/graph';
 
 export function registerHover(conn: Connection, docs: TextDocuments<TextDocument>): void {
   conn.onHover((params: HoverParams): Hover | null => {
-    conn.console.info(`onHover ${params.textDocument.uri}`);
+    //conn.console.info(`onHover ${params.textDocument.uri}`);
     const doc = docs.get(params.textDocument.uri);
     if (!doc) return null;
 

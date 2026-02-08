@@ -68,6 +68,19 @@ interface CompletionResult {
 }
 
 /**
+ * Global symbol entry for the pre-built symbol index
+ */
+interface GlobalSymbolEntry {
+    name: string;
+    nameLower: string;  // Pre-computed lowercase for fast prefix matching
+    kind: string;
+    detail?: string;
+    insertText?: string;
+    returnType?: string;
+    uri: string;  // Source file URI for deduplication on updates
+}
+
+/**
  * Returns the token at a specific offset (e.g. mouse hover or cursor position).
  * Lexes only a small window around the position for performance.
  */
@@ -194,6 +207,223 @@ export class Analyzer {
     private docCache = new Map<string, File>();
     private parseErrorCount = 0;
     private preprocessorDefines: Set<string> = new Set();
+    
+    // ================================================================
+    // GLOBAL SYMBOL INDEX for fast completions
+    // ================================================================
+    // Pre-built index partitioned by first letter for O(1) bucket lookup.
+    // Each bucket is a sorted array for deterministic ordering.
+    // Updated incrementally when files change.
+    // ================================================================
+    
+    /** Main symbol map: name -> entry */
+    private globalSymbolIndex: Map<string, GlobalSymbolEntry> = new Map();
+    
+    /** Prefix buckets: first lowercase letter -> sorted array of names */
+    private symbolsByPrefix: Map<string, string[]> = new Map();
+    
+    /** All symbol names sorted (for no-prefix completions) */
+    private sortedSymbolNames: string[] = [];
+    
+    /** Flag to mark when sorted arrays need rebuild */
+    private symbolIndexDirty = false;
+    
+    // ================================================================
+    // CLASS INDEX for fast class lookups
+    // ================================================================
+    // Maps class names to their ClassDeclNode references.
+    // Supports multiple entries per name (modded classes).
+    // Avoids iterating docCache on every findAllClassesByName call.
+    // ================================================================
+    
+    /** Class index: className -> array of ClassDeclNode (supports modded classes) */
+    private classIndex: Map<string, ClassDeclNode[]> = new Map();
+    
+    /** Enum index: enumName -> EnumDeclNode */
+    private enumIndex: Map<string, EnumDeclNode> = new Map();
+    
+    /** Function index: funcName -> FunctionDeclNode[] */
+    private functionIndex: Map<string, FunctionDeclNode[]> = new Map();
+    
+    /** Typedef index: name -> TypedefNode */
+    private typedefIndex: Map<string, TypedefNode> = new Map();
+    
+    /** Update all indexes from a file's AST */
+    private updateAllIndexes(uri: string, ast: File): void {
+        // Remove old entries from this URI
+        this.removeIndexEntriesForUri(uri);
+        
+        // Add new entries
+        for (const node of ast.body) {
+            if (!node.name) continue;
+            
+            if (node.kind === 'ClassDecl') {
+                const classNode = node as ClassDeclNode;
+                (classNode as any)._sourceUri = uri;  // Tag with source URI for removal
+                let existing = this.classIndex.get(node.name);
+                if (!existing) {
+                    existing = [];
+                    this.classIndex.set(node.name, existing);
+                }
+                existing.push(classNode);
+            } else if (node.kind === 'EnumDecl') {
+                (node as any)._sourceUri = uri;
+                this.enumIndex.set(node.name, node as EnumDeclNode);
+            } else if (node.kind === 'FunctionDecl') {
+                const funcNode = node as FunctionDeclNode;
+                (funcNode as any)._sourceUri = uri;
+                let existing = this.functionIndex.get(node.name);
+                if (!existing) {
+                    existing = [];
+                    this.functionIndex.set(node.name, existing);
+                }
+                existing.push(funcNode);
+            } else if (node.kind === 'Typedef') {
+                (node as any)._sourceUri = uri;
+                this.typedefIndex.set(node.name, node as TypedefNode);
+            }
+        }
+    }
+    
+    /** Remove all index entries from a specific URI */
+    private removeIndexEntriesForUri(uri: string): void {
+        // Remove from class index
+        for (const [name, classes] of this.classIndex) {
+            const filtered = classes.filter((c: any) => c._sourceUri !== uri);
+            if (filtered.length === 0) {
+                this.classIndex.delete(name);
+            } else if (filtered.length !== classes.length) {
+                this.classIndex.set(name, filtered);
+            }
+        }
+        
+        // Remove from enum index
+        for (const [name, node] of this.enumIndex) {
+            if ((node as any)._sourceUri === uri) {
+                this.enumIndex.delete(name);
+            }
+        }
+        
+        // Remove from function index
+        for (const [name, funcs] of this.functionIndex) {
+            const filtered = funcs.filter((f: any) => f._sourceUri !== uri);
+            if (filtered.length === 0) {
+                this.functionIndex.delete(name);
+            } else if (filtered.length !== funcs.length) {
+                this.functionIndex.set(name, filtered);
+            }
+        }
+        
+        // Remove from typedef index
+        for (const [name, node] of this.typedefIndex) {
+            if ((node as any)._sourceUri === uri) {
+                this.typedefIndex.delete(name);
+            }
+        }
+    }
+
+    /** Rebuild sorted arrays from the symbol index */
+    private rebuildSortedSymbolArrays(): void {
+        if (!this.symbolIndexDirty) return;
+        
+        // Clear prefix buckets
+        this.symbolsByPrefix.clear();
+        
+        // Build buckets by first letter
+        for (const name of this.globalSymbolIndex.keys()) {
+            const firstChar = name[0]?.toLowerCase() || '_';
+            let bucket = this.symbolsByPrefix.get(firstChar);
+            if (!bucket) {
+                bucket = [];
+                this.symbolsByPrefix.set(firstChar, bucket);
+            }
+            bucket.push(name);
+        }
+        
+        // Sort each bucket for deterministic ordering
+        for (const bucket of this.symbolsByPrefix.values()) {
+            bucket.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        }
+        
+        // Build sorted master list
+        this.sortedSymbolNames = Array.from(this.globalSymbolIndex.keys())
+            .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        
+        this.symbolIndexDirty = false;
+    }
+    
+    /** Rebuild the global symbol index from a file's AST */
+    private updateGlobalSymbolIndex(uri: string, ast: File): void {
+        // First remove any existing symbols from this URI
+        for (const [name, entry] of this.globalSymbolIndex) {
+            if (entry.uri === uri) {
+                this.globalSymbolIndex.delete(name);
+            }
+        }
+        
+        // Add new symbols from the AST
+        for (const node of ast.body) {
+            if (!node.name) continue;
+            
+            let entry: GlobalSymbolEntry | undefined;
+            
+            if (node.kind === 'ClassDecl') {
+                const classNode = node as ClassDeclNode;
+                entry = {
+                    name: node.name,
+                    nameLower: node.name.toLowerCase(),  // Pre-compute for fast matching
+                    kind: 'class',
+                    detail: classNode.base?.identifier 
+                        ? `extends ${classNode.base.identifier}` 
+                        : 'class',
+                    uri
+                };
+            } else if (node.kind === 'FunctionDecl') {
+                const func = node as FunctionDeclNode;
+                entry = {
+                    name: func.name,
+                    nameLower: func.name.toLowerCase(),
+                    kind: 'function',
+                    detail: func.returnType?.identifier || 'void',
+                    insertText: `${func.name}()`,
+                    returnType: func.returnType?.identifier,
+                    uri
+                };
+            } else if (node.kind === 'VarDecl') {
+                const v = node as VarDeclNode;
+                entry = {
+                    name: v.name,
+                    nameLower: v.name.toLowerCase(),
+                    kind: 'variable',
+                    detail: v.type?.identifier || 'auto',
+                    uri
+                };
+            } else if (node.kind === 'EnumDecl') {
+                entry = {
+                    name: node.name,
+                    nameLower: node.name.toLowerCase(),
+                    kind: 'enum',
+                    detail: 'enum',
+                    uri
+                };
+            } else if (node.kind === 'Typedef') {
+                entry = {
+                    name: node.name,
+                    nameLower: node.name.toLowerCase(),
+                    kind: 'typedef',
+                    detail: `typedef ${(node as TypedefNode).oldType?.identifier}`,
+                    uri
+                };
+            }
+            
+            if (entry) {
+                this.globalSymbolIndex.set(node.name, entry);
+            }
+        }
+        
+        // Mark sorted arrays as needing rebuild
+        this.symbolIndexDirty = true;
+    }
 
     /** Set preprocessor defines that should be treated as active in #ifdef directives */
     setPreprocessorDefines(defines: string[]): void {
@@ -305,6 +535,29 @@ export class Analyzer {
         return { files: this.docCache.size, classes, functions, enums, typedefs, globals, parseErrors: this.parseErrorCount, moduleCounts };
     }
 
+    /**
+     * Inject a pre-parsed AST directly into the cache (used by persistent cache on startup)
+     * @param uri The document URI
+     * @param ast The pre-parsed AST from disk cache
+     */
+    injectCachedAST(uri: string, ast: File): void {
+        const normalizedUri = normalizeUri(uri);
+        ast.module = getModuleLevel(uri);
+        this.docCache.set(normalizedUri, ast);
+        // Update indexes for fast lookups
+        this.updateGlobalSymbolIndex(normalizedUri, ast);
+        this.updateAllIndexes(normalizedUri, ast);
+    }
+
+    /**
+     * Parse a document and return the AST (used during indexing to populate persistent cache)
+     * @param doc The TextDocument to parse
+     * @returns The parsed AST (or a stub on error)
+     */
+    parseAndCache(doc: TextDocument): File {
+        return this.ensure(doc);
+    }
+
     private ensure(doc: TextDocument): File {
         // 1 · cache hit
         const currVersion = doc.version;
@@ -317,8 +570,12 @@ export class Analyzer {
         try {
             // 2 · happy path ─ parse & cache
             const ast = parse(doc, undefined, this.preprocessorDefines);           // pass full TextDocument + defines
+            const normalizedUri = normalizeUri(doc.uri);
             ast.module = getModuleLevel(doc.uri);
-            this.docCache.set(normalizeUri(doc.uri), ast);
+            this.docCache.set(normalizedUri, ast);
+            // Update indexes for fast lookups
+            this.updateGlobalSymbolIndex(normalizedUri, ast);
+            this.updateAllIndexes(normalizedUri, ast);
             return ast;
         } catch (err) {
             // 3 · graceful error handling
@@ -607,78 +864,56 @@ export class Analyzer {
             }
         }
         
-        // Add all top-level symbols from ALL indexed documents
-        for (const [uri, fileAst] of this.docCache) {
-            for (const node of fileAst.body) {
-                if (!node.name) continue;
-                if (seen.has(node.name)) continue;
-                if (prefix && !node.name.toLowerCase().startsWith(prefix)) continue;
-                
-                seen.add(node.name);
-                
-                if (node.kind === 'ClassDecl') {
-                    results.push({
-                        name: node.name,
-                        kind: 'class',
-                        detail: (node as ClassDeclNode).base?.identifier 
-                            ? `extends ${(node as ClassDeclNode).base?.identifier}` 
-                            : 'class'
-                    });
-                } else if (node.kind === 'FunctionDecl') {
-                    const func = node as FunctionDeclNode;
-                    results.push({
-                        name: func.name,
-                        kind: 'function',
-                        detail: func.returnType?.identifier || 'void',
-                        insertText: `${func.name}()`,
-                        returnType: func.returnType?.identifier
-                    });
-                } else if (node.kind === 'VarDecl') {
-                    const v = node as VarDeclNode;
-                    results.push({
-                        name: v.name,
-                        kind: 'variable',
-                        detail: v.type?.identifier || 'auto'
-                    });
-                } else if (node.kind === 'EnumDecl') {
-                    results.push({
-                        name: node.name,
-                        kind: 'enum',
-                        detail: 'enum'
-                    });
-                } else if (node.kind === 'Typedef') {
-                    results.push({
-                        name: node.name,
-                        kind: 'typedef',
-                        detail: `typedef ${(node as TypedefNode).oldType?.identifier}`
-                    });
-                }
-            }
+        // ================================================================
+        // FAST GLOBAL SYMBOL LOOKUP using pre-built sorted index
+        // ================================================================
+        // Uses prefix-partitioned buckets for O(bucket_size) lookup instead
+        // of O(total_symbols). Sorted arrays ensure deterministic ordering.
+        // Pre-computed lowercase names avoid repeated .toLowerCase() calls.
+        // ================================================================
+        
+        // Ensure sorted arrays are up to date
+        this.rebuildSortedSymbolArrays();
+        
+        // Choose which symbol names to iterate based on prefix
+        let symbolNames: string[];
+        if (prefix.length > 0) {
+            // Use prefix bucket for faster lookup
+            const bucket = this.symbolsByPrefix.get(prefix[0]) || [];
+            symbolNames = bucket;
+        } else {
+            // No prefix - use full sorted list
+            symbolNames = this.sortedSymbolNames;
+        }
+        
+        for (const name of symbolNames) {
+            if (seen.has(name)) continue;
+            
+            const entry = this.globalSymbolIndex.get(name);
+            if (!entry) continue;
+            
+            // Use pre-computed lowercase for fast prefix matching
+            if (prefix && !entry.nameLower.startsWith(prefix)) continue;
+            
+            seen.add(name);
+            results.push({
+                name: entry.name,
+                kind: entry.kind,
+                detail: entry.detail,
+                insertText: entry.insertText,
+                returnType: entry.returnType
+            });
         }
         
         return results;
     }
 
     /**
-     * Known DayZ global variables that have a more specific type than declared.
-     * Example: g_Game is declared as "Game" but is actually "CGame"
-     */
-    private static readonly KNOWN_VARIABLE_TYPES: Record<string, string> = {
-        'g_Game': 'CGame',
-    };
-
-    /**
      * Resolve the type of a variable at a given position.
-     * Checks known overrides, then delegates AST lookup to resolveVariableTypeNode,
-     * and falls back to regex patterns for variables the AST misses.
+     * Checks AST lookup first, then falls back to regex patterns
+     * for variables the AST misses.
      */
     private resolveVariableType(doc: TextDocument, pos: Position, varName: string): string | null {
-        
-        // Check for known variable type overrides first
-        const knownType = Analyzer.KNOWN_VARIABLE_TYPES[varName];
-        if (knownType) {
-            return knownType;
-        }
         
         // Delegate the AST-based lookup to resolveVariableTypeNode
         const typeNode = this.resolveVariableTypeNode(doc, pos, varName);
@@ -766,17 +1001,6 @@ export class Analyzer {
     }
 
     /**
-     * Known DayZ singleton functions that return a more specific type than declared.
-     * These functions are declared to return base class but actually return derived class.
-     * Example: GetGame() is declared as returning "Game" but actually returns "CGame"
-     */
-    private static readonly KNOWN_RETURN_TYPES: Record<string, string> = {
-        'GetGame': 'CGame',
-        'GetDayZGame': 'DayZGame',
-        'g_Game': 'CGame',
-    };
-
-    /**
      * Resolve the return type of a function by name
      * Searches top-level functions and class methods across all indexed files
      */
@@ -786,35 +1010,29 @@ export class Analyzer {
 
     /**
      * Resolve the return type of a global/static function, returning full TypeNode info.
+     * Uses pre-built indexes for fast lookup.
      */
     private resolveFunctionReturnTypeNode(funcName: string): TypeNode | null {
         
-        // Check for known overrides first (e.g., GetGame() returns CGame, not Game)
-        const knownType = Analyzer.KNOWN_RETURN_TYPES[funcName];
-        if (knownType) {
-            // Return a synthetic TypeNode for known types
-            return { kind: 'Type', identifier: knownType, arrayDims: [], modifiers: [], uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
+        // Check top-level functions via function index (O(1))
+        const funcs = this.functionIndex.get(funcName);
+        if (funcs && funcs.length > 0) {
+            for (const func of funcs) {
+                if (func.returnType?.identifier) {
+                    return func.returnType;
+                }
+            }
         }
         
-        // Search all indexed documents for a function with this name
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                // Top-level function
-                if (node.kind === 'FunctionDecl' && node.name === funcName) {
-                    const func = node as FunctionDeclNode;
-                    if (func.returnType?.identifier) {
-                        return func.returnType;
-                    }
-                }
-                
-                // Class method (for static calls or when we don't know the class)
-                if (node.kind === 'ClassDecl') {
-                    for (const member of (node as ClassDeclNode).members || []) {
-                        if (member.kind === 'FunctionDecl' && member.name === funcName) {
-                            const func = member as FunctionDeclNode;
-                            if (func.returnType?.identifier) {
-                                return func.returnType;
-                            }
+        // Check class methods across all classes (still need to iterate but on indexed classes)
+        // This is for static calls or when we don't know the class
+        for (const [className, classes] of this.classIndex) {
+            for (const classNode of classes) {
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'FunctionDecl' && member.name === funcName) {
+                        const func = member as FunctionDeclNode;
+                        if (func.returnType?.identifier) {
+                            return func.returnType;
                         }
                     }
                 }
@@ -935,14 +1153,14 @@ export class Analyzer {
     /**
      * Get the genericVars (template parameter names) for a class by name.
      * e.g. for "map" returns ["TKey", "TValue"]
+     * Uses the pre-built class index for O(1) lookup.
      */
     private getClassGenericVars(className: string): string[] | undefined {
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl' && node.name === className) {
-                    return (node as ClassDeclNode).genericVars;
-                }
-            }
+        const classes = this.classIndex.get(className);
+        if (classes && classes.length > 0) {
+            // Prefer non-modded class for the template definition
+            const origClass = classes.find(c => !c.modifiers?.includes('modded')) || classes[0];
+            return origClass.genericVars;
         }
         return undefined;
     }
@@ -994,16 +1212,10 @@ export class Analyzer {
     /**
      * Find the TypedefNode for a given type name.
      * Returns null if the type is not a typedef.
+     * Uses the pre-built typedef index for O(1) lookup.
      */
     private resolveTypedefNode(typeName: string): TypedefNode | null {
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.kind === 'Typedef' && node.name === typeName) {
-                    return node as TypedefNode;
-                }
-            }
-        }
-        return null;
+        return this.typedefIndex.get(typeName) || null;
     }
 
     /**
@@ -1400,44 +1612,71 @@ export class Analyzer {
 
     /**
      * Find a class by name across all cached documents
+     * Uses the pre-built class index for O(1) lookup.
      */
     private findClassByName(className: string): ClassDeclNode | null {
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl' && node.name === className) {
-                    return node as ClassDeclNode;
-                }
-            }
+        const classes = this.classIndex.get(className);
+        // Return the first non-modded class, or the first modded one if no original exists
+        if (classes && classes.length > 0) {
+            return classes.find(c => !c.modifiers?.includes('modded')) || classes[0];
         }
         return null;
     }
 
     /**
      * Find an enum by name across all indexed files
+     * Uses the pre-built enum index for O(1) lookup.
      */
     private findEnumByName(enumName: string): EnumDeclNode | null {
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.kind === 'EnumDecl' && node.name === enumName) {
-                    return node as EnumDeclNode;
-                }
-            }
-        }
-        return null;
+        return this.enumIndex.get(enumName) || null;
     }
 
     /**
      * Find the module level (1–5) where a symbol is defined.
      * Returns 0 if the symbol is not found or has no module info.
+     * Uses pre-built indexes for fast lookup.
      */
     private getModuleForSymbol(symbolName: string): number {
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.name === symbolName) {
-                    return ast.module || 0;
-                }
+        // Check class index
+        const classes = this.classIndex.get(symbolName);
+        if (classes && classes.length > 0) {
+            const sourceUri = (classes[0] as any)._sourceUri;
+            if (sourceUri) {
+                const ast = this.docCache.get(sourceUri);
+                if (ast?.module) return ast.module;
             }
         }
+        
+        // Check enum index
+        const enumNode = this.enumIndex.get(symbolName);
+        if (enumNode) {
+            const sourceUri = (enumNode as any)._sourceUri;
+            if (sourceUri) {
+                const ast = this.docCache.get(sourceUri);
+                if (ast?.module) return ast.module;
+            }
+        }
+        
+        // Check function index
+        const funcs = this.functionIndex.get(symbolName);
+        if (funcs && funcs.length > 0) {
+            const sourceUri = (funcs[0] as any)._sourceUri;
+            if (sourceUri) {
+                const ast = this.docCache.get(sourceUri);
+                if (ast?.module) return ast.module;
+            }
+        }
+        
+        // Check typedef index
+        const typedefNode = this.typedefIndex.get(symbolName);
+        if (typedefNode) {
+            const sourceUri = (typedefNode as any)._sourceUri;
+            if (sourceUri) {
+                const ast = this.docCache.get(sourceUri);
+                if (ast?.module) return ast.module;
+            }
+        }
+        
         return 0;
     }
 
@@ -1601,7 +1840,7 @@ export class Analyzer {
             }
         }
 
-        // FALLBACK: Global search - but with proper scoping rules
+        // FALLBACK: Global search using pre-built indexes
         // - Enum members ONLY if accessed via EnumName.member
         // - Class members ONLY if inside that class (already checked above)
         const matches: SymbolNodeBase[] = [];
@@ -1610,30 +1849,62 @@ export class Analyzer {
         const enumMemberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
         const isEnumAccess = enumMemberMatch && enumMemberMatch[1][0] === enumMemberMatch[1][0].toUpperCase();
 
-        // iterate all loaded documents
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                // top-level match (classes, functions, global variables, enums, typedefs)
-                if (node.name === name) {
-                    matches.push(node as SymbolNodeBase);
-                }
-
-                // Enum member match - ONLY if accessed via EnumName.member
-                if (isEnumAccess && enumMemberMatch && node.kind === 'EnumDecl' && node.name === enumMemberMatch[1]) {
-                    for (const member of (node as EnumDeclNode).members) {
-                        if (member.name === name) {
-                            matches.push(member as SymbolNodeBase);
-                        }
+        // Check class index
+        const classes = this.classIndex.get(name);
+        if (classes) {
+            for (const c of classes) matches.push(c as SymbolNodeBase);
+        }
+        
+        // Check function index
+        const funcs = this.functionIndex.get(name);
+        if (funcs) {
+            for (const f of funcs) matches.push(f as SymbolNodeBase);
+        }
+        
+        // Check enum index
+        const enumNode = this.enumIndex.get(name);
+        if (enumNode) {
+            matches.push(enumNode as SymbolNodeBase);
+        }
+        
+        // Check typedef index
+        const typedefNode = this.typedefIndex.get(name);
+        if (typedefNode) {
+            matches.push(typedefNode as SymbolNodeBase);
+        }
+        
+        // Check global symbol index for variables
+        const globalSymbol = this.globalSymbolIndex.get(name);
+        if (globalSymbol && globalSymbol.kind === 'variable') {
+            // Need to find the actual VarDeclNode - search docCache for this specific variable
+            const ast = this.docCache.get(globalSymbol.uri);
+            if (ast) {
+                for (const node of ast.body) {
+                    if (node.kind === 'VarDecl' && node.name === name) {
+                        matches.push(node as SymbolNodeBase);
+                        break;
                     }
                 }
-                
-                // Class members are NOT included in global search
-                // They should only be found via:
-                // 1. Member access (player.Method) - handled above
-                // 2. Inside the class (this.Method or just Method) - handled above
-                // 3. Inheritance chain - handled above
             }
         }
+
+        // Enum member match - ONLY if accessed via EnumName.member
+        if (isEnumAccess && enumMemberMatch) {
+            const enumDecl = this.enumIndex.get(enumMemberMatch[1]);
+            if (enumDecl) {
+                for (const member of enumDecl.members) {
+                    if (member.name === name) {
+                        matches.push(member as SymbolNodeBase);
+                    }
+                }
+            }
+        }
+        
+        // Class members are NOT included in global search
+        // They should only be found via:
+        // 1. Member access (player.Method) - handled above
+        // 2. Inside the class (this.Method or just Method) - handled above
+        // 3. Inheritance chain - handled above
 
         return matches;
     }
@@ -1753,23 +2024,10 @@ export class Analyzer {
     /**
      * Find all classes with a given name (handles modded classes)
      * In Enforce Script, multiple 'modded class X' can exist for the same class
+     * Uses the pre-built class index for O(1) lookup.
      */
     private findAllClassesByName(className: string): ClassDeclNode[] {
-        const matches: ClassDeclNode[] = [];
-        
-        for (const [uri, ast] of this.docCache) {
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl' && node.name === className) {
-                    const classNode = node as ClassDeclNode;
-                    matches.push(classNode);
-                }
-            }
-        }
-        
-        if (matches.length === 0) {
-        }
-        
-        return matches;
+        return this.classIndex.get(className) || [];
     }
 
     getHover(doc: TextDocument, _pos: Position): string | null {
@@ -3257,18 +3515,19 @@ export class Analyzer {
                 }
             }
         } else {
-            // Global function: search all files
-            for (const [uri, ast] of this.docCache) {
-                for (const node of ast.body) {
-                    if (node.kind === 'FunctionDecl' && node.name === funcName) {
-                        overloads.push(node as FunctionDeclNode);
-                    }
-                    // Also check class methods (for unqualified calls from within a class)
-                    if (node.kind === 'ClassDecl') {
-                        for (const member of (node as ClassDeclNode).members || []) {
-                            if (member.kind === 'FunctionDecl' && member.name === funcName) {
-                                overloads.push(member as FunctionDeclNode);
-                            }
+            // Global function: use function index for fast lookup
+            const funcs = this.functionIndex.get(funcName);
+            if (funcs) {
+                overloads.push(...funcs);
+            }
+            
+            // Also check class methods (for unqualified calls from within a class)
+            // This still needs to iterate class index since we don't index methods separately
+            for (const [className, classes] of this.classIndex) {
+                for (const classNode of classes) {
+                    for (const member of classNode.members || []) {
+                        if (member.kind === 'FunctionDecl' && member.name === funcName) {
+                            overloads.push(member as FunctionDeclNode);
                         }
                     }
                 }
