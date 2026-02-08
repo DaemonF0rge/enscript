@@ -108,18 +108,24 @@ export function getTokenAtPosition(text: string, offset: number): Token | null {
     return null;
 }
 
-function formatDeclaration(node: SymbolNodeBase): string {
+function formatDeclaration(node: SymbolNodeBase, templateMap?: Map<string, string>): string {
+    // Helper: substitute generic type params with concrete types from templateMap
+    const subst = (typeName: string): string => {
+        if (!templateMap || templateMap.size === 0) return typeName;
+        return templateMap.get(typeName) || typeName;
+    };
+
     let fmt: string | null = null;
     switch (node.kind) {
         case 'FunctionDecl': {
             const _node = node as FunctionDeclNode;
-            fmt = `${(_node.modifiers.length ? _node.modifiers.join(' ') + ' ': '')}${_node.returnType.identifier} ${_node.name}(${_node.parameters?.map(p => (p.modifiers.length ? p.modifiers.join(' ') + ' ': '') + p.type.identifier + ' ' + p.name).join(', ') ?? ''})`;
+            fmt = `${(_node.modifiers.length ? _node.modifiers.join(' ') + ' ': '')}${subst(_node.returnType.identifier)} ${_node.name}(${_node.parameters?.map(p => (p.modifiers.length ? p.modifiers.join(' ') + ' ': '') + subst(p.type.identifier) + ' ' + p.name).join(', ') ?? ''})`;
             break;
         }
 
         case 'VarDecl': {
             const _node = node as VarDeclNode;
-            fmt = `${(_node.modifiers.length ? _node.modifiers.join(' ') + ' ': '')}${_node.type.identifier} ${_node.name}`;
+            fmt = `${(_node.modifiers.length ? _node.modifiers.join(' ') + ' ': '')}${subst(_node.type.identifier)} ${_node.name}`;
             break;
         }
 
@@ -927,7 +933,8 @@ export class Analyzer {
         const regexKeywords = new Set(['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'case', 'break', 'continue', 'this', 'super', 'null', 'true', 'false', 'out', 'inout', 'volatile']);
         
         // Pattern: Type varName; or Type varName =
-        const varDeclMatch = text.match(new RegExp(`(\\w+)\\s+${varName}\\s*[;=]`));
+        // Use word boundary to avoid matching inside larger expressions
+        const varDeclMatch = text.match(new RegExp(`(?:^|[{;,\\s])\\s*(\\w+)\\s+${varName}\\s*[;=]`));
         if (varDeclMatch && !regexKeywords.has(varDeclMatch[1])) {
             return varDeclMatch[1];
         }
@@ -1213,9 +1220,24 @@ export class Analyzer {
      * Find the TypedefNode for a given type name.
      * Returns null if the type is not a typedef.
      * Uses the pre-built typedef index for O(1) lookup.
+     * 
+     * IMPORTANT: If a class with the same name also exists, the class takes
+     * precedence over the typedef. This handles DayZ's opaque handle pattern
+     * where e.g. "typedef int[] Material;" coexists with "class Material { ... }".
+     * The typedef is just the internal engine representation; the class is
+     * the actual script-level type with methods.
      */
     private resolveTypedefNode(typeName: string): TypedefNode | null {
-        return this.typedefIndex.get(typeName) || null;
+        const node = this.typedefIndex.get(typeName);
+        if (!node) return null;
+        
+        // If a class with the same name exists, prefer the class over the typedef.
+        // This handles opaque handle types like: typedef int[] Material; class Material { ... }
+        if (this.classIndex.has(typeName)) {
+            return null;
+        }
+        
+        return node;
     }
 
     /**
@@ -2031,12 +2053,115 @@ export class Analyzer {
     }
 
     getHover(doc: TextDocument, _pos: Position): string | null {
+        // Build template context for member accesses so hover shows
+        // concrete types (e.g., "string" instead of "TValue")
+        const templateMap = this.buildHoverTemplateMap(doc, _pos);
+        
         const symbols = this.resolveDefinitions(doc, _pos);
         if (symbols.length === 0) return null;
 
         return symbols
-            .map((s) => formatDeclaration(s))
+            .map((s) => formatDeclaration(s, templateMap))
             .join('\n\n');
+    }
+
+    /**
+     * Build a template substitution map for hover at the given position.
+     * When hovering over a member of a generic/typedef'd variable (e.g., testMap.Get),
+     * this builds a map like { TKey: "string", TValue: "int" } so the hover can
+     * display concrete types instead of generic parameter names.
+     */
+    private buildHoverTemplateMap(doc: TextDocument, _pos: Position): Map<string, string> | undefined {
+        const offset = doc.offsetAt(_pos);
+        const text = doc.getText();
+        const token = getTokenAtPosition(text, offset);
+        if (!token) return undefined;
+        
+        const typeKeywords = new Set(['string', 'int', 'float', 'bool', 'vector', 'typename', 'void']);
+        if (token.kind !== TokenKind.Identifier &&
+            !(token.kind === TokenKind.Keyword && typeKeywords.has(token.value))) {
+            return undefined;
+        }
+        
+        const textBeforeToken = text.substring(0, token.start);
+        
+        // Multi-level chain: e.g., param.field.Get
+        const multiLevelMatch = textBeforeToken.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*$/);
+        if (multiLevelMatch) {
+            const rootName = multiLevelMatch[1];
+            const middleChain = multiLevelMatch[2];
+            
+            const rootType = this.resolveVariableType(doc, _pos, rootName);
+            if (rootType) {
+                let currentType = rootType;
+                let templateMap: Map<string, string>;
+                const typedefNode = this.resolveTypedefNode(currentType);
+                if (typedefNode) {
+                    currentType = typedefNode.oldType.identifier;
+                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+                } else {
+                    currentType = this.resolveTypedef(currentType);
+                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, rootName);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
+                    } else {
+                        templateMap = new Map();
+                    }
+                }
+                
+                const chainMembers = this.parseChainMembers(middleChain);
+                if (chainMembers.length > 0) {
+                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
+                    if (result && result.templateMap.size > 0) {
+                        return result.templateMap;
+                    }
+                }
+            }
+        }
+        
+        // Single-level: variable.member (e.g., testMap.Get)
+        const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
+        if (memberMatch) {
+            const varName = memberMatch[1];
+            const varType = this.resolveVariableType(doc, _pos, varName);
+            if (varType) {
+                const typedefNode = this.resolveTypedefNode(varType);
+                if (typedefNode) {
+                    const resolvedType = typedefNode.oldType.identifier;
+                    const tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
+                    if (tplMap.size > 0) return tplMap;
+                } else {
+                    // Direct generic declaration: map<string, int> myMap;
+                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, varName);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        const resolvedType = this.resolveTypedef(varType);
+                        const tplMap = this.buildTemplateMap(resolvedType, varTypeNode.genericArgs);
+                        if (tplMap.size > 0) return tplMap;
+                    }
+                }
+            }
+        }
+        
+        // Function call chain: GetSomething().member
+        const chainedCallMatch = textBeforeToken.match(/(\w+)\s*\([^)]*\)\s*\.\s*$/);
+        if (chainedCallMatch) {
+            const funcName = chainedCallMatch[1];
+            const returnTypeNode = this.resolveFunctionReturnTypeNode(funcName);
+            if (returnTypeNode?.identifier) {
+                let resolvedType = returnTypeNode.identifier;
+                const typedefNode = this.resolveTypedefNode(resolvedType);
+                if (typedefNode) {
+                    resolvedType = typedefNode.oldType.identifier;
+                    const tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
+                    if (tplMap.size > 0) return tplMap;
+                } else if (returnTypeNode.genericArgs && returnTypeNode.genericArgs.length > 0) {
+                    const tplMap = this.buildTemplateMap(resolvedType, returnTypeNode.genericArgs);
+                    if (tplMap.size > 0) return tplMap;
+                }
+            }
+        }
+        
+        return undefined;
     }
 
     findReferences(doc: TextDocument, _pos: Position, _inc: boolean) {
@@ -2268,8 +2393,8 @@ export class Analyzer {
         // Pattern to detect function declarations
         // Must have: optional modifiers, return type (including generics), function name, parentheses for params
         // Excludes: array access like m_Foo[0] and assignments
-        // Matches lines ending with { (normal), {} (empty body), ; (proto/native), or ) (brace on next line)
-        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{[^}]*\}?|;)?\s*$/;
+        // Matches lines ending with { (normal), {} (empty body), {}; (empty body + semicolon), ; (proto/native), or ) (brace on next line)
+        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{[^}]*\}?;?|;)?\s*$/;
 
         // Pattern to detect proto/native function declarations (no body, just ;)
         // Params in these don't create real variables — skip them for duplicate checking
@@ -2285,6 +2410,11 @@ export class Analyzer {
         let inFunction = false;
         let functionBraceDepth = 0;
         let braceDepth = 0;
+        
+        // Track multi-line function declarations (parameters spanning multiple lines)
+        // When a function declaration has ( but no ) on the same line, we set this flag
+        // and skip variable extraction until we find the closing )
+        let inMultiLineFuncDecl = false;
         
         // Track class fields - these need to be visible inside methods
         let classFieldScope: Map<string, VarInfo> = new Map();
@@ -2316,8 +2446,15 @@ export class Analyzer {
             // Check for block comment start
             if (trimmedLine.startsWith('/*') || trimmedLine.startsWith('/**')) {
                 if (line.includes('*/')) {
-                    // Single-line block comment like /* foo */ - skip entire line
-                    continue;
+                    // Single-line block comment like /* foo */ — but only skip if the
+                    // ENTIRE line is a comment. If there's code AFTER the closing */,
+                    // fall through to normal processing where inline /*...*/ stripping
+                    // handles it. Example: /*sealed*/ bool IsFlipped()
+                    const afterComment = line.substring(line.indexOf('*/') + 2).trim();
+                    if (!afterComment) {
+                        continue;
+                    }
+                    // Code follows the block comment — fall through to process it
                 } else {
                     // Multi-line block comment starts here
                     inBlockComment = true;
@@ -2391,6 +2528,22 @@ export class Analyzer {
                 inFunction = false;
             }
             
+            // Handle multi-line function declarations: if we're inside one,
+            // check if this line has the closing ')'
+            if (inMultiLineFuncDecl) {
+                if (lineNoComment.includes(')')) {
+                    // End of multi-line param list — trigger scope reset now
+                    inMultiLineFuncDecl = false;
+                    const wasInFunction = inFunction;
+                    scopeStack = [scopeStack[0], new Map(classFieldScope), new Map()];
+                    inFunction = true;
+                    functionBraceDepth = braceDepth;
+                }
+                // Skip variable extraction for parameter continuation lines
+                // (they are function params, handled by the scope reset above)
+                // Still process braces below though
+            }
+            
             // Check if this line has a for/foreach/while loop
             // In Enforce Script, loop variables are scoped to the PARENT scope, not the loop block
             const isLoopLine = loopPattern.test(lineNoComment);
@@ -2398,8 +2551,23 @@ export class Analyzer {
             // Check if this line starts a new function
             // Must NOT be a loop line — for(int i ...) looks like a func decl to the regex
             // Also exclude control flow statements (if, else, switch, do) which can false-match
-            const isControlFlow = /\b(if|else|switch|do|return|new|delete|throw)\b/.test(lineNoComment);
-            const isFuncDecl = !isLoopLine && !isControlFlow && funcDeclPattern.test(lineNoComment);
+            // IMPORTANT: Only check for control flow keywords BEFORE the first '{', because
+            // single-line function bodies like "bool Foo() { return true; }" contain keywords
+            // like 'return' in the body that would cause a false isControlFlow=true.
+            const declPart = lineNoComment.includes('{') ? lineNoComment.substring(0, lineNoComment.indexOf('{')) : lineNoComment;
+            const isControlFlow = /\b(if|else|switch|do|return|new|delete|throw)\b/.test(declPart);
+            let isFuncDecl = !isLoopLine && !isControlFlow && funcDeclPattern.test(lineNoComment);
+            
+            // Detect multi-line function declarations: looks like a func decl start
+            // (has modifiers + return type + name + open paren) but no closing ')' on this line
+            if (!isFuncDecl && !isLoopLine && !isControlFlow && !inMultiLineFuncDecl) {
+                // Pattern: optional modifiers, return type, function name, opening '(' but no closing ')'
+                const multiLineFuncStart = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+\w+\s*\(/.test(lineNoComment);
+                if (multiLineFuncStart && !lineNoComment.includes(')')) {
+                    inMultiLineFuncDecl = true;
+                    // Scope reset will happen when we find the closing ')'
+                }
+            }
             
             if (isFuncDecl) {
                 // New function - reset to: global scope + class fields (copy) + new function scope
@@ -2451,12 +2619,13 @@ export class Analyzer {
             // This ensures for loop variables (int j in "for (int j = 0...") 
             // are added to the current scope before we push a new scope for {
             // Use lineNoComment to avoid matching variables in comments
+            // Skip if we're in a multi-line function declaration (params are not local vars)
             let match;
             varDeclPattern.lastIndex = 0;
             
             // Use lineNoComment but keep original line for position calculation
             const lineForVars = lineNoComment;
-            while (!isProtoOrNative && (match = varDeclPattern.exec(lineForVars)) !== null) {
+            while (!isProtoOrNative && !inMultiLineFuncDecl && (match = varDeclPattern.exec(lineForVars)) !== null) {
                 const typeName = match[1];
                 const varName = match[2];
                 
@@ -4098,7 +4267,8 @@ export class Analyzer {
             // If preceded by a type + space, it's likely a declaration not a call
             const beforeCall = text.substring(Math.max(0, match.index - 80), match.index);
             // Check if this is a function declaration (type immediately before name)
-            const declCheck = beforeCall.match(/(?:void|int|float|bool|string|auto|vector|override\s+\w+|static\s+\w+|\w+)\s+$/);
+            // Also handles generic types like array<Man> or map<string, int>
+            const declCheck = beforeCall.match(/(?:void|int|float|bool|string|auto|vector|override\s+\w+|static\s+\w+|\w+(?:<[^>]*>)?)\s+$/);
             if (declCheck) {
                 // Could be a declaration. Check more carefully — if the next non-whitespace
                 // before the type name is '{', ';', or start-of-line, it's a declaration
@@ -4154,14 +4324,30 @@ export class Analyzer {
             const dotMatch = textBeforeFunc.match(/(\w+)\s*\.\s*$/);
             if (dotMatch) {
                 const objName = dotMatch[1];
+                
+                // Check if objName is a class name FIRST (for static access like ClassName.StaticMethod)
+                // This must come before getVarTypeAtLine because regex fallbacks can
+                // produce false positives (e.g., matching "new InventoryLocation;" as type "new")
+                if (objName[0] === objName[0].toUpperCase() && this.classIndex.has(objName)) {
+                    overloads = this.findFunctionOverloads(funcName, objName);
+                }
+                
+                if (overloads.length === 0) {
                 let objType = getVarTypeAtLine(objName, lineNum);
                 if (objType) {
                     objType = this.resolveTypedef(objType);
                     overloads = this.findFunctionOverloads(funcName, objType);
-                } else {
-                    // objName is not a simple variable. Use the backward-walking chain parser
-                    // to extract the full expression (e.g., Currencies.Get(i).MoneyValues)
-                    // and resolve its type, then find the function on that type.
+                }
+                
+                // If simple variable lookup didn't find overloads (or objType was falsy),
+                // try chain resolution. This handles multi-step chains like
+                // data.m_Modifiers.Count() where dotMatch captures "m_Modifiers" but
+                // it's actually a member of "data", not a standalone variable.
+                // Without this fallback, a wrong type from regex fallback (e.g., an
+                // unrelated "int m_Modifiers;" in another class) would short-circuit
+                // the chain resolution and produce false "Unknown method" errors.
+                if (overloads.length === 0) {
+                    chainAttempted = true;
                     const fullTextBefore = textBeforeFunc.replace(/\s+$/, '');
                     // fullTextBefore ends with "objName." — walk backwards from the end to extract
                     // the entire chain expression including objName.
@@ -4217,9 +4403,7 @@ export class Analyzer {
                                 } else {
                                     // Root is a variable or class name (for static access)
                                     rootType = getVarTypeAtLine(rootName, lineNum);
-                                    if (rootType) {
-                                        rootType = this.resolveTypedef(rootType);
-                                    } else {
+                                    if (!rootType) {
                                         // Check if root is a class name (for static field/method access)
                                         const classNodes = this.findAllClassesByName(rootName);
                                         if (classNodes.length > 0) {
@@ -4228,14 +4412,16 @@ export class Analyzer {
                                     }
                                     chainRemainder = afterRoot;
                                 }
-                                // Resolve through the remaining chain if present
+                                // Resolve through the remaining chain if present.
+                                // Pass the raw (non-typedef-resolved) rootType to resolveVariableChainType
+                                // so it can build the proper template map from the typedef's generic args.
                                 if (rootType && chainRemainder.trim().startsWith('.')) {
                                     const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
                                     if (resolved) {
                                         overloads = this.findFunctionOverloads(funcName, resolved);
                                     }
                                 } else if (rootType) {
-                                    overloads = this.findFunctionOverloads(funcName, rootType);
+                                    overloads = this.findFunctionOverloads(funcName, this.resolveTypedef(rootType));
                                 }
                             }
                         }
@@ -4245,6 +4431,7 @@ export class Analyzer {
                         overloads = this.findFunctionOverloads(funcName, objName);
                     }
                 }
+                } // end of overloads.length === 0 check
             } else {
                 // Check for chain call: e.g., U().globals().FuncName( or var.method().FuncName(
                 // The simple dotMatch fails when a ')' precedes the dot (chain with call results)
@@ -4305,27 +4492,24 @@ export class Analyzer {
                                 chainRemainder = afterRoot.substring(i);
                             } else {
                                 // Root is a variable or class name (for static access)
-                                rootType = getVarTypeAtLine(rootName, lineNum);
-                                if (rootType) {
-                                    rootType = this.resolveTypedef(rootType);
+                                // Check class name first to avoid regex false positives
+                                if (rootName[0] === rootName[0].toUpperCase() && this.classIndex.has(rootName)) {
+                                    rootType = rootName;
                                 } else {
-                                    // Check if root is a class name (for static field/method access like ClassName.StaticField)
-                                    const classNodes = this.findAllClassesByName(rootName);
-                                    if (classNodes.length > 0) {
-                                        // Root is a class name - treat the class itself as the "type" for static access
-                                        rootType = rootName;
-                                    }
+                                    rootType = getVarTypeAtLine(rootName, lineNum);
                                 }
                                 chainRemainder = afterRoot;
                             }
-                            // Resolve through the remaining chain if present
+                            // Resolve through the remaining chain if present.
+                            // Pass the raw (non-typedef-resolved) rootType to resolveVariableChainType
+                            // so it can build the proper template map from the typedef's generic args.
                             if (rootType && chainRemainder.trim().startsWith('.')) {
                                 const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
                                 if (resolved) {
                                     overloads = this.findFunctionOverloads(funcName, resolved);
                                 }
                             } else if (rootType) {
-                                overloads = this.findFunctionOverloads(funcName, rootType);
+                                overloads = this.findFunctionOverloads(funcName, this.resolveTypedef(rootType));
                             }
                         }
                     }

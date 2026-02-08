@@ -548,17 +548,21 @@ export function parse(
                     // Detect local variable declarations:
                     //   TypeName varName ;  or  TypeName varName =  or  TypeName varName ,
                     // prevPrev = type token, prev = name token, t = ; or = or ,
-                    // For generic types like array<autoptr X>, prevPrev is '>' — we need to
+                    // For generic types like array<autoptr X>, prevPrev is '>' or '>>' — we need to
                     // walk backwards past balanced angle brackets to find the actual type name.
+                    // The '>>' token represents two closing brackets (nested generics like
+                    // map<int, array<float>>) and must be counted as 2.
                     if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',')) {
                         let typeTok = prevPrev;
-                        if (prevPrev.value === '>') {
+                        if (prevPrev.value === '>' || prevPrev.value === '>>') {
                             // Walk backwards through tokens to find matching '<' and the type before it
-                            let angleDepth = 1;
-                            let searchPos = prevPrevIdx - 1; // start before the '>'
+                            // '>>' counts as 2 closing brackets (nested generics)
+                            let angleDepth = prevPrev.value === '>>' ? 2 : 1;
+                            let searchPos = prevPrevIdx - 1; // start before the '>' or '>>'
                             while (searchPos >= 0 && angleDepth > 0) {
                                 const st = toks[searchPos];
-                                if (st.value === '>') angleDepth++;
+                                if (st.value === '>>') angleDepth += 2;
+                                else if (st.value === '>') angleDepth++;
                                 else if (st.value === '<') angleDepth--;
                                 searchPos--;
                             }
