@@ -2346,8 +2346,10 @@ export class Analyzer {
     //   - lineOffsets: cumulative character offsets per line for O(1) lookup
     //   - ast: parsed AST for this document
     //   - doc: the TextDocument (needed for positionAt)
-    //   - scopedVars: unified scoped variable map (used by type mismatch and
-    //                 call arg checkers with different lookup semantics)
+    //   - scopedVars: unified scoped variable map built entirely from the
+    //                 parser's AST (locals are now detected by the parser,
+    //                 not regex). Used by type mismatch and call arg checkers
+    //                 with different lookup semantics.
     // ========================================================================
 
     /**
@@ -2439,28 +2441,18 @@ export class Analyzer {
         return inString;
     }
 
-    /** Scoped variable entry — tracks type and scope range with class-field distinction */
-    private static readonly SCOPED_VAR_TYPE_KEYWORDS = new Set([
-        'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
-        'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
-        'const', 'proto', 'native', 'Print', 'foreach'
-    ]);
-    private static readonly SCOPED_VAR_NAME_KEYWORDS = new Set([
-        'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'
-    ]);
-
     /**
-     * Build the unified scoped variable map from AST declarations + regex body scan.
+     * Build the unified scoped variable map from AST declarations.
      * Contains ALL variables: globals, class fields, inherited fields, func params,
-     * func locals (from AST), and regex-detected locals in function bodies.
+     * and func locals (detected by the parser — including foreach variables and
+     * auto-typed variables).
      *
-     * This replaces the per-checker duplicate data collection while preserving
-     * every data source exactly.
+     * The parser's token-based local detection (prevPrev/prev/t pattern matching)
+     * handles all cases previously covered by the regex scanners, and its results
+     * are cached per file version, so this work is only done once.
      */
     private buildScopedVarMap(
-        ast: File,
-        text: string,
-        lines: string[]
+        ast: File
     ): Map<string, { type: string; startLine: number; endLine: number; isClassField: boolean }[]> {
         type ScopedVarEntry = { type: string; startLine: number; endLine: number; isClassField: boolean };
         const scopedVars = new Map<string, ScopedVarEntry[]>();
@@ -2548,85 +2540,14 @@ export class Analyzer {
             }
         }
 
-        // ── Phase B: Regex-based local variable scan ───────────────────────
-        // The parser's locals detection covers many cases but can miss some.
-        // This regex scan supplements it for function bodies. This preserves
-        // every regex pattern and keyword filter from both original scanners.
-        {
-            let inBlockComment = false;
-
-            const scanFunctionBody = (funcStart: number, funcEnd: number) => {
-                for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
-                    let line = lines[lineIdx];
-
-                    // Handle block comments
-                    if (inBlockComment) {
-                        if (line.includes('*/')) inBlockComment = false;
-                        continue;
-                    }
-                    if (line.trimStart().startsWith('/*')) {
-                        if (!line.includes('*/')) inBlockComment = true;
-                        continue;
-                    }
-
-                    // Strip comments and strings
-                    const commentIdx = line.indexOf('//');
-                    if (commentIdx >= 0) line = line.substring(0, commentIdx);
-                    line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-                    line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
-                    line = line.trim();
-
-                    // Skip empty lines
-                    if (!line) continue;
-
-                    // Match: Type varName; or Type varName = ...;
-                    const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
-                    let m;
-                    while ((m = localDeclPattern.exec(line)) !== null) {
-                        const typeName = m[1];
-                        const varName = m[2];
-
-                        if (Analyzer.SCOPED_VAR_TYPE_KEYWORDS.has(typeName)) continue;
-                        if (Analyzer.SCOPED_VAR_NAME_KEYWORDS.has(varName)) continue;
-
-                        add(varName, typeName, lineIdx, funcEnd, false);
-                    }
-
-                    // Also match foreach variable declarations:
-                    //   foreach (Type varName : collection)
-                    const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
-                    let fm;
-                    while ((fm = foreachPattern.exec(line)) !== null) {
-                        add(fm[2], fm[1], lineIdx, funcEnd, false);
-                    }
-                }
-            };
-
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl') {
-                    const classNode = node as ClassDeclNode;
-                    for (const member of classNode.members || []) {
-                        if (member.kind === 'FunctionDecl') {
-                            const func = member as FunctionDeclNode;
-                            const funcStart = func.start?.line ?? 0;
-                            const funcEnd = func.end?.line ?? 0;
-                            if (funcEnd > funcStart) {
-                                scanFunctionBody(funcStart, funcEnd);
-                            }
-                        }
-                    }
-                }
-                // Also scan top-level functions
-                if (node.kind === 'FunctionDecl') {
-                    const func = node as FunctionDeclNode;
-                    const funcStart = func.start?.line ?? 0;
-                    const funcEnd = func.end?.line ?? 0;
-                    if (funcEnd > funcStart) {
-                        scanFunctionBody(funcStart, funcEnd);
-                    }
-                }
-            }
-        }
+        // NOTE: The parser now handles ALL local variable detection, including:
+        //   - Standard declarations: Type varName ; / = / ,
+        //   - foreach variables: foreach (Type varName : collection)
+        //   - auto-typed variables: auto varName = expr;
+        //   - Generic-typed variables: array<int> varName;
+        // The regex-based Phase B scanner was removed as the parser's
+        // locals detection (via prevPrev/prev/current token tracking) now
+        // covers every case the regex did, and its results are cached.
 
         return scopedVars;
     }
@@ -2657,7 +2578,7 @@ export class Analyzer {
             // Build scoped variable map once (used by both type mismatch and
             // call arg checkers). Placed here because it requires the index
             // to be populated (getClassHierarchyOrdered for inherited fields).
-            const scopedVars = this.buildScopedVarMap(ast, text, lines);
+            const scopedVars = this.buildScopedVarMap(ast);
             
             // Check for type mismatches in assignments
             this.checkTypeMismatches(doc, diags, text, lines, lineOffsets, ast, scopedVars);

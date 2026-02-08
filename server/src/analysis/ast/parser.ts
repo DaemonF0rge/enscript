@@ -243,7 +243,7 @@ export function parse(
 
     /* helper: check if a keyword is a primitive type */
     const isPrimitiveType = (value: string): boolean => {
-        return ['void', 'int', 'float', 'bool', 'string', 'vector', 'typename'].includes(value);
+        return ['void', 'int', 'float', 'bool', 'string', 'vector', 'typename', 'auto'].includes(value);
     };
 
     /* read & return one identifier or keyword token */
@@ -547,12 +547,15 @@ export function parse(
 
                     // Detect local variable declarations:
                     //   TypeName varName ;  or  TypeName varName =  or  TypeName varName ,
-                    // prevPrev = type token, prev = name token, t = ; or = or ,
+                    //   TypeName varName :  (foreach variable: foreach (Type var : collection))
+                    // prevPrev = type token, prev = name token, t = ; or = or , or :
+                    // The ':' trigger is safe because other uses of ':' inside function bodies
+                    // (case labels, default:, ternary) don't have a valid type+name pair preceding them.
                     // For generic types like array<autoptr X>, prevPrev is '>' or '>>' — we need to
                     // walk backwards past balanced angle brackets to find the actual type name.
                     // The '>>' token represents two closing brackets (nested generics like
                     // map<int, array<float>>) and must be counted as 2.
-                    if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',')) {
+                    if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',' || t.value === ':')) {
                         let typeTok = prevPrev;
                         if (prevPrev.value === '>' || prevPrev.value === '>>') {
                             // Walk backwards through tokens to find matching '<' and the type before it
