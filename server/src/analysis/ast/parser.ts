@@ -151,6 +151,7 @@ export interface VarDeclNode extends SymbolNodeBase {
     kind: 'VarDecl';
     type: TypeNode;
     hasDefault?: boolean; // true if parameter has a default value (e.g., int x = 5)
+    scopeEnd?: Position;  // End of the brace-scope where this local is visible (set for function-body locals)
 }
 
 export interface FunctionDeclNode extends SymbolNodeBase {
@@ -165,6 +166,7 @@ export interface File {
     version: number
     diagnostics: Diagnostic[]  // Parser-generated diagnostics (e.g., ternary operator warnings)
     module?: number            // Script module level (1=Core, 2=GameLib, 3=Game, 4=World, 5=Mission)
+    skippedRegions?: { start: number, end: number }[]  // Character ranges blanked by #ifdef processing
 }
 
 // parse entry point
@@ -509,6 +511,11 @@ export function parse(
             if (peek().value === '{') {
                 next();
                 let depth = 1;
+                // Scope tracking: each entry holds locals declared in that brace scope.
+                // When '}' closes a scope, scopeEnd is set on all locals in it.
+                // This enables AST-based duplicate variable checking with proper
+                // scope overlap detection (sibling scopes don't conflict).
+                const bodyScopes: VarDeclNode[][] = [[]]; // [0] = function body scope
                 // Track previous tokens to detect local variable declarations
                 // Pattern: [modifiers...] TypeName VarName (= | ; | ,)
                 let prevPrev: Token | null = null;
@@ -518,8 +525,20 @@ export function parse(
                 while (depth > 0 && !eof()) {
                     const t = next();
                     const tIdx = pos - 1; // index of the token that next() just returned
-                    if (t.value === '{') depth++;
-                    else if (t.value === '}') depth--;
+                    if (t.value === '{') {
+                        depth++;
+                        bodyScopes.push([]);
+                    } else if (t.value === '}') {
+                        depth--;
+                        // Pop scope and set scopeEnd for all locals declared in it
+                        if (bodyScopes.length > 0) {
+                            const closingLocals = bodyScopes.pop()!;
+                            const endPos = doc.positionAt(t.start);
+                            for (const local of closingLocals) {
+                                local.scopeEnd = endPos;
+                            }
+                        }
+                    }
                     // Detect ternary operator (condition ? true : false)
                     // This is invalid in Enforce Script
                     else if (t.value === '?' && depth > 0) {
@@ -585,7 +604,7 @@ export function parse(
                             || (typeTok.kind === TokenKind.Keyword && isPrimitiveType(typeTok.value));
                         const isNameTok = prev.kind === TokenKind.Identifier;
                         if (isTypeTok && isNameTok) {
-                            locals.push({
+                            const local: VarDeclNode = {
                                 kind: 'VarDecl',
                                 uri: doc.uri,
                                 name: prev.value,
@@ -604,7 +623,12 @@ export function parse(
                                 modifiers: [],
                                 start: doc.positionAt(typeTok.start),
                                 end: doc.positionAt(prev.end),
-                            });
+                            };
+                            locals.push(local);
+                            // Track in scope stack so scopeEnd is set when '}' closes this scope
+                            if (bodyScopes.length > 0) {
+                                bodyScopes[bodyScopes.length - 1].push(local);
+                            }
                         }
                     }
 

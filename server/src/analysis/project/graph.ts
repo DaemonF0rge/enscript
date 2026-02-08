@@ -437,86 +437,93 @@ export class Analyzer {
     }
 
     /**
-     * Strip out skipped #ifdef/#ifndef regions from text, preserving line structure.
-     * Replaces skipped content with spaces so line/column positions remain valid.
+     * Compute character ranges that should be blanked for #ifdef/#ifndef regions.
+     * Returns an array of { start, end } pairs (character offsets) covering:
+     *   - All directive lines (#ifdef, #ifndef, #else, #endif) — always blanked
+     *   - Content in skipped branches — conditionally blanked
+     *
      * Uses the same logic as the lexer: skip first branch by default, process #else;
-     * if a define is in preprocessorDefines, process the first branch and skip #else.
+     * if a define is in the defines set, process the first branch and skip #else.
+     *
+     * The result is stored on the cached AST so it doesn't need to be recomputed
+     * on every diagnostic run.
      */
-    private stripSkippedIfdefRegions(text: string): string {
-        const result = text.split('');
+    static computeSkippedRegions(text: string, defines: Set<string>): { start: number, end: number }[] {
+        const regions: { start: number, end: number }[] = [];
         const lines = text.split('\n');
-        
-        // Blank out a range of characters (preserve newlines for line numbers)
-        const blankOut = (start: number, end: number) => {
-            for (let i = start; i < end && i < result.length; i++) {
-                if (result[i] !== '\n' && result[i] !== '\r') {
-                    result[i] = ' ';
-                }
-            }
-        };
-        
-        // Find offset of line start
-        let i = 0;
-        
-        // Stack of ifdef states for nesting
-        // Each entry: { skippingFirstBranch, inElseBranch, depth relative to this ifdef }
+
         interface IfdefState {
             processFirstBranch: boolean;
             inElseBranch: boolean;
-            directiveStart: number;
         }
         const stack: IfdefState[] = [];
-        
-        // Are we currently in a region that should be blanked?
+
         const isSkipping = (): boolean => {
             for (const s of stack) {
-                if (!s.processFirstBranch && !s.inElseBranch) return true;  // in first branch, should skip
-                if (s.processFirstBranch && s.inElseBranch) return true;    // in else branch, should skip
+                if (!s.processFirstBranch && !s.inElseBranch) return true;
+                if (s.processFirstBranch && s.inElseBranch) return true;
             }
             return false;
         };
-        
+
+        let offset = 0;
         for (let lineNum = 0; lineNum < lines.length; lineNum++) {
             const line = lines[lineNum];
             const trimmed = line.trim();
-            
+            const lineEnd = offset + line.length;
+
             const ifdefMatch = trimmed.match(/^#\s*(ifdef|ifndef)\s+(\w+)/);
             if (ifdefMatch) {
                 const isIfdef = ifdefMatch[1] === 'ifdef';
                 const symbol = ifdefMatch[2];
-                const isDefined = this.preprocessorDefines.has(symbol);
+                const isDefined = defines.has(symbol);
                 const processFirst = isIfdef ? isDefined : !isDefined;
-                
-                stack.push({ processFirstBranch: processFirst, inElseBranch: false, directiveStart: i });
-                
-                // Blank the directive line itself
-                blankOut(i, i + line.length);
-                i += line.length + 1; // +1 for \n
+
+                stack.push({ processFirstBranch: processFirst, inElseBranch: false });
+                regions.push({ start: offset, end: lineEnd });
+                offset = lineEnd + 1;
                 continue;
             }
-            
+
             if (trimmed.match(/^#\s*else\b/) && stack.length > 0) {
                 stack[stack.length - 1].inElseBranch = true;
-                blankOut(i, i + line.length);
-                i += line.length + 1;
+                regions.push({ start: offset, end: lineEnd });
+                offset = lineEnd + 1;
                 continue;
             }
-            
+
             if (trimmed.match(/^#\s*endif\b/) && stack.length > 0) {
                 stack.pop();
-                blankOut(i, i + line.length);
-                i += line.length + 1;
+                regions.push({ start: offset, end: lineEnd });
+                offset = lineEnd + 1;
                 continue;
             }
-            
-            // If we're in a skipped region, blank this line
+
             if (isSkipping()) {
-                blankOut(i, i + line.length);
+                regions.push({ start: offset, end: lineEnd });
             }
-            
-            i += line.length + 1; // +1 for \n
+
+            offset = lineEnd + 1;
         }
-        
+
+        return regions;
+    }
+
+    /**
+     * Apply pre-computed skipped regions to blank out text.
+     * Replaces skipped content with spaces, preserving newlines so
+     * line/column positions remain valid.
+     */
+    static applySkippedRegions(text: string, regions?: { start: number, end: number }[]): string {
+        if (!regions || regions.length === 0) return text;
+        const result = text.split('');
+        for (const region of regions) {
+            for (let i = region.start; i < region.end && i < result.length; i++) {
+                if (result[i] !== '\n' && result[i] !== '\r') {
+                    result[i] = ' ';
+                }
+            }
+        }
         return result.join('');
     }
 
@@ -578,6 +585,9 @@ export class Analyzer {
             const ast = parse(doc, undefined, this.preprocessorDefines);           // pass full TextDocument + defines
             const normalizedUri = normalizeUri(doc.uri);
             ast.module = getModuleLevel(doc.uri);
+            // Pre-compute skipped #ifdef regions so runDiagnostics can
+            // apply them from cache instead of re-scanning directives.
+            ast.skippedRegions = Analyzer.computeSkippedRegions(doc.getText(), this.preprocessorDefines);
             this.docCache.set(normalizedUri, ast);
             // Update indexes for fast lookups
             this.updateGlobalSymbolIndex(normalizedUri, ast);
@@ -2565,7 +2575,9 @@ export class Analyzer {
         // These pre-computed values are passed to each checker so the
         // expensive work (ifdef stripping, line splitting, line offset table,
         // scoped variable map) is done only once per diagnostic run.
-        const text = this.stripSkippedIfdefRegions(doc.getText());
+        // Skipped regions are cached on the AST so only the cheap blanking
+        // step runs here; the directive-parsing logic ran once at parse time.
+        const text = Analyzer.applySkippedRegions(doc.getText(), ast.skippedRegions);
         const lines = text.split('\n');
         const lineOffsets = Analyzer.buildLineOffsets(text);
         
@@ -2592,342 +2604,266 @@ export class Analyzer {
         this.checkMultiLineStatements(doc, diags, text, lines);
         
         // Check for duplicate variable declarations in same scope
-        // Enforce Script doesn't allow duplicate variable names even in sibling for loops
-        this.checkDuplicateVariables(doc, diags, text);
+        // Now AST-based: uses parser's locals with scopeEnd ranges instead
+        // of re-parsing text line-by-line. Also checks missing 'override' keyword.
+        this.checkDuplicateVariables(ast, diags);
         
         return diags;
     }
 
     /**
-     * Check for duplicate variable declarations within the same scope.
-     * In Enforce Script, you cannot have two for loops with the same loop variable
-     * at the same scope level, even though they're "separate" blocks.
-     * 
-     * Example that causes error:
-     *   for (int j = 0; j < 10; j++) { }
-     *   for (int j = 0; j < 10; j++) { }  // ERROR: 'j' already declared
+     * Check for duplicate variable declarations within the same scope (AST-based).
+     *
+     * Walks the parsed AST instead of re-scanning the text line-by-line.
+     * Each local in a function body carries a `scopeEnd` set by the parser,
+     * so we can determine whether two locals' scopes overlap.
+     *
+     * Also checks:
+     *   – class fields vs inherited fields
+     *   – function locals/params vs class fields, inherited fields, globals
+     *   – missing `override` keyword on methods that override a parent method
+     *
+     * In Enforce Script:
+     *   - Variables in outer scopes are visible in inner scopes (no shadowing)
+     *   - Loop control variables live in the PARENT scope, not the loop block
+     *     (the parser naturally captures this because the declaration token
+     *      appears before the opening '{' of the loop body)
+     *   - Two variables with the same name in sibling, non-overlapping scopes
+     *     do NOT conflict (handled via scopeEnd range checking)
      */
-    private checkDuplicateVariables(doc: TextDocument, diags: Diagnostic[], text: string): void {
-        
-        // Track variables by scope - use a stack of scopes
-        // Each scope has a map of variable names to their declaration info
-        type VarInfo = { line: number; character: number };
-        let scopeStack: Map<string, VarInfo>[] = [new Map()]; // Start with global/class scope
-        
-        // Pattern to find variable declarations
-        // Matches: Type varName in various contexts (including for loop init)
-        const varDeclPattern = /\b(int|float|bool|string|auto|vector|Man|PlayerBase|\w+)\s+(\w+)\s*(?:=|;|,|\)|<)/g;
-        
-        // Pattern to detect function declarations
-        // Must have: optional modifiers, return type (including generics), function name, parentheses for params
-        // Excludes: array access like m_Foo[0] and assignments
-        // Matches lines ending with { (normal), {} (empty body), {}; (empty body + semicolon), ; (proto/native), or ) (brace on next line)
-        const funcDeclPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+(\w+)\s*\([^)]*\)\s*(?:\{[^}]*\}?;?|;)?\s*$/;
+    private checkDuplicateVariables(ast: File, diags: Diagnostic[]): void {
 
-        // Pattern to detect proto/native function declarations (no body, just ;)
-        // Params in these don't create real variables — skip them for duplicate checking
-        const protoFuncPattern = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:proto|native)\s+/;
-        
-        // Pattern to detect for/foreach/while loops (their vars go to parent scope in Enforce)
-        const loopPattern = /\b(for|foreach|while)\s*\(/;
-        
-        // Pattern to detect class declarations (handles template params like <Class T>)
-        const classDeclPattern = /\b(?:modded\s+)?class\s+(\w+)(?:<[^>]*>)?(?:\s*(?::\s*|\s+extends\s+)(\w+))?/;
-        
-        // Track when we enter/exit functions
-        let inFunction = false;
-        let functionBraceDepth = 0;
-        let braceDepth = 0;
-        
-        // Track multi-line function declarations (parameters spanning multiple lines)
-        // When a function declaration has ( but no ) on the same line, we set this flag
-        // and skip variable extraction until we find the closing )
-        let inMultiLineFuncDecl = false;
-        
-        // Track class fields - these need to be visible inside methods
-        let classFieldScope: Map<string, VarInfo> = new Map();
-        let inClass = false;
-        let classBraceDepth = 0;
-        let currentClassName = '';
-        // Track parent method names + param counts for missing override warnings
-        // Maps method name -> array of param counts from parent classes
-        let parentMethodSignatures: Map<string, number[]> = new Map();
-        
-        // Track block comments
-        let inBlockComment = false;
-        
-        // Process line by line to track scope
-        const lines = text.split('\n');
-        
-        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
-            const line = lines[lineNum];
-            const trimmedLine = line.trim();
-            
-            // Handle block comments /* ... */
-            if (inBlockComment) {
-                if (line.includes('*/')) {
-                    inBlockComment = false;
-                }
-                continue; // Skip lines inside block comments
-            }
-            
-            // Check for block comment start
-            if (trimmedLine.startsWith('/*') || trimmedLine.startsWith('/**')) {
-                if (line.includes('*/')) {
-                    // Single-line block comment like /* foo */ — but only skip if the
-                    // ENTIRE line is a comment. If there's code AFTER the closing */,
-                    // fall through to normal processing where inline /*...*/ stripping
-                    // handles it. Example: /*sealed*/ bool IsFlipped()
-                    const afterComment = line.substring(line.indexOf('*/') + 2).trim();
-                    if (!afterComment) {
-                        continue;
-                    }
-                    // Code follows the block comment — fall through to process it
+        // ── Position helpers ───────────────────────────────────────────────
+        const posBefore = (a: Position, b: Position): boolean =>
+            a.line < b.line || (a.line === b.line && a.character < b.character);
+
+        // Do two locals' visibility ranges overlap?
+        // Each local is visible from its declaration (`start`) to its `scopeEnd`.
+        const localScopesOverlap = (a: VarDeclNode, b: VarDeclNode): boolean => {
+            if (!a.scopeEnd || !b.scopeEnd) return true; // no scopeEnd → function-wide
+            // a visible at b's start: a.start <= b.start < a.scopeEnd
+            const aVisAtB = !posBefore(b.start, a.start) && posBefore(b.start, a.scopeEnd);
+            // b visible at a's start: b.start <= a.start < b.scopeEnd
+            const bVisAtA = !posBefore(a.start, b.start) && posBefore(a.start, b.scopeEnd);
+            return aVisAtB || bVisAtA;
+        };
+
+        // Report a duplicate-variable diagnostic
+        const reportDup = (name: string, decl: SymbolNodeBase, existingLine: number) => {
+            diags.push({
+                message: `Variable '${name}' is already declared at line ${existingLine + 1}. Enforce Script does not allow duplicate variable names in the same scope.`,
+                range: { start: decl.nameStart, end: decl.nameEnd },
+                severity: DiagnosticSeverity.Error
+            });
+        };
+
+        // ── 1. Collect global variables ────────────────────────────────────
+        const globalNames = new Map<string, SymbolNodeBase>();
+        for (const node of ast.body) {
+            if (node.kind === 'VarDecl' && node.name) {
+                const existing = globalNames.get(node.name);
+                if (existing) {
+                    reportDup(node.name, node, existing.start.line);
                 } else {
-                    // Multi-line block comment starts here
-                    inBlockComment = true;
-                    continue;
+                    globalNames.set(node.name, node);
                 }
             }
-            
-            // Skip lines that are just block comment content
-            if (trimmedLine.startsWith('*') && !trimmedLine.startsWith('*/')) {
-                continue;
-            }
-            
-            // Skip lines containing doc comment markers (they may contain signature examples)
-            if (trimmedLine.includes('@param') || trimmedLine.includes('@note') || 
-                trimmedLine.includes('@return') || trimmedLine.includes('@usage') ||
-                trimmedLine.includes('@example') || trimmedLine.includes('@code')) {
-                continue;
-            }
-            
-            // Strip trailing comments for pattern matching
-            // Use indexOf for reliability
-            const commentIdx = line.indexOf('//');
-            let lineNoComment = (commentIdx >= 0 ? line.substring(0, commentIdx) : line);
-            
-            // Also strip inline block comments like: code /* comment */ more code
-            lineNoComment = lineNoComment.replace(/\/\*.*?\*\//g, '');
-            
-            // Strip string literals to avoid detecting patterns inside strings
-            // e.g., "string cbFunction" in debug messages
-            lineNoComment = lineNoComment.replace(/"(?:[^"\\]|\\.)*"/g, '""');  // Replace "..." with ""
-            lineNoComment = lineNoComment.replace(/'(?:[^'\\]|\\.)*'/g, "''");  // Replace '...' with ''
-            
-            const lineNoCommentTrimmed = lineNoComment.trim();
-            
-            // Check if this line starts a class
-            const classMatch = lineNoComment.match(classDeclPattern);
-            if (classMatch) {
-                // Starting a new class - reset all class-related state
-                inClass = true;
-                classBraceDepth = braceDepth;
-                classFieldScope = new Map(); // Fresh class field scope
-                currentClassName = classMatch[1];
-                const baseClassName = classMatch[2];
-                parentMethodSignatures = new Map();
-                
-                // Pre-populate classFieldScope with inherited fields from parent classes
-                if (baseClassName) {
-                    const hierarchy = this.getClassHierarchyOrdered(baseClassName, new Set());
-                    for (const parentClass of hierarchy) {
-                        for (const member of parentClass.members || []) {
-                            if (member.kind === 'VarDecl' && member.name) {
-                                classFieldScope.set(member.name, {
-                                    line: member.start?.line ?? -1,
-                                    character: member.start?.character ?? 0
-                                });
-                            }
-                            if (member.kind === 'FunctionDecl' && member.name) {
-                                const paramCount = (member as any).parameters?.length ?? 0;
-                                if (!parentMethodSignatures.has(member.name)) {
-                                    parentMethodSignatures.set(member.name, []);
-                                }
-                                parentMethodSignatures.get(member.name)!.push(paramCount);
-                            }
-                        }
-                    }
-                }
-                
-                // Reset scope stack to global scope + class fields (with inherited fields)
-                // This ensures class-level field declarations are checked against parent fields
-                scopeStack = [new Map(), classFieldScope];
-                inFunction = false;
-            }
-            
-            // Handle multi-line function declarations: if we're inside one,
-            // check if this line has the closing ')'
-            if (inMultiLineFuncDecl) {
-                if (lineNoComment.includes(')')) {
-                    // End of multi-line param list — trigger scope reset now
-                    inMultiLineFuncDecl = false;
-                    const wasInFunction = inFunction;
-                    scopeStack = [scopeStack[0], new Map(classFieldScope), new Map()];
-                    inFunction = true;
-                    functionBraceDepth = braceDepth;
-                }
-                // Skip variable extraction for parameter continuation lines
-                // (they are function params, handled by the scope reset above)
-                // Still process braces below though
-            }
-            
-            // Check if this line has a for/foreach/while loop
-            // In Enforce Script, loop variables are scoped to the PARENT scope, not the loop block
-            const isLoopLine = loopPattern.test(lineNoComment);
-            
-            // Check if this line starts a new function
-            // Must NOT be a loop line — for(int i ...) looks like a func decl to the regex
-            // Also exclude control flow statements (if, else, switch, do) which can false-match
-            // IMPORTANT: Only check for control flow keywords BEFORE the first '{', because
-            // single-line function bodies like "bool Foo() { return true; }" contain keywords
-            // like 'return' in the body that would cause a false isControlFlow=true.
-            const declPart = lineNoComment.includes('{') ? lineNoComment.substring(0, lineNoComment.indexOf('{')) : lineNoComment;
-            const isControlFlow = /\b(if|else|switch|do|return|new|delete|throw)\b/.test(declPart);
-            let isFuncDecl = !isLoopLine && !isControlFlow && funcDeclPattern.test(lineNoComment);
-            
-            // Detect multi-line function declarations: looks like a func decl start
-            // (has modifiers + return type + name + open paren) but no closing ')' on this line
-            if (!isFuncDecl && !isLoopLine && !isControlFlow && !inMultiLineFuncDecl) {
-                // Pattern: optional modifiers, return type, function name, opening '(' but no closing ')'
-                const multiLineFuncStart = /^\s*(?:static\s+|private\s+|protected\s+|override\s+|proto\s+|native\s+|volatile\s+|event\s+)*(?:void|int|float|bool|string|auto|ref\s+\w+(?:\s*<[\w,\s<>]+>)?|\w+(?:\s*<[\w,\s<>]+>)?)\s+\w+\s*\(/.test(lineNoComment);
-                if (multiLineFuncStart && !lineNoComment.includes(')')) {
-                    inMultiLineFuncDecl = true;
-                    // Scope reset will happen when we find the closing ')'
-                }
-            }
-            
-            if (isFuncDecl) {
-                // New function - reset to: global scope + class fields (copy) + new function scope
-                // We must copy classFieldScope to avoid it being modified by function-local variables
-                const wasInFunction = inFunction;
-                scopeStack = [scopeStack[0], new Map(classFieldScope), new Map()];
-                inFunction = true;
-                functionBraceDepth = braceDepth;
-                
-                // Check for missing override keyword — only at class level, not inside a nested function
-                if (inClass && !wasInFunction && parentMethodSignatures.size > 0) {
-                    const funcNameMatch = lineNoComment.match(funcDeclPattern);
-                    if (funcNameMatch) {
-                        const declaredFuncName = funcNameMatch[1];
-                        const hasOverride = /\boverride\b/.test(lineNoComment);
-                        if (!hasOverride && parentMethodSignatures.has(declaredFuncName)) {
-                            // Don't warn for constructors (function name === class name)
-                            if (declaredFuncName !== currentClassName) {
-                                // Extract param count from this declaration to compare with parent
-                                // Only warn if a parent has a method with the SAME param count (true override)
-                                // Different param counts = overload, not override
-                                const paramStr = lineNoComment.match(/\(([^)]*)\)/);
-                                const childParamCount = paramStr && paramStr[1].trim() !== '' 
-                                    ? paramStr[1].split(',').length 
-                                    : 0;
-                                const parentParamCounts = parentMethodSignatures.get(declaredFuncName)!;
-                                if (parentParamCounts.includes(childParamCount)) {
-                                    const fnStart = lineNoComment.indexOf(declaredFuncName);
-                                    diags.push({
-                                        message: `Method '${declaredFuncName}' overrides a method from a parent class but is missing the 'override' keyword.`,
-                                        range: {
-                                            start: { line: lineNum, character: fnStart },
-                                            end: { line: lineNum, character: fnStart + declaredFuncName.length }
-                                        },
-                                        severity: DiagnosticSeverity.Warning
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Skip variable extraction for proto/native function declarations —
-            // their parameters don't create real variables in any scope
-            const isProtoOrNative = protoFuncPattern.test(lineNoComment);
+        }
 
-            // FIRST: Find variable declarations on this line BEFORE processing braces
-            // This ensures for loop variables (int j in "for (int j = 0...") 
-            // are added to the current scope before we push a new scope for {
-            // Use lineNoComment to avoid matching variables in comments
-            // Skip if we're in a multi-line function declaration (params are not local vars)
-            let match;
-            varDeclPattern.lastIndex = 0;
-            
-            // Use lineNoComment but keep original line for position calculation
-            const lineForVars = lineNoComment;
-            while (!isProtoOrNative && !inMultiLineFuncDecl && (match = varDeclPattern.exec(lineForVars)) !== null) {
-                const typeName = match[1];
-                const varName = match[2];
-                
-                // Skip keywords that are not actual type names.
-                // 'typedef' is included because lines like "typedef set<float> TFloatSet;"
-                // match the varDeclPattern as type=typedef, name=set — which is a false positive.
-                if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'out', 'inout', 'notnull', 'owned', 'local', 'volatile', 'external', 'abstract', 'final', 'reference'].includes(typeName)) {
-                    continue;
-                }
-                
-                // Skip common false positives
-                if (['this', 'super', 'null', 'true', 'false'].includes(varName)) {
-                    continue;
-                }
-                
-                // Check all scopes in the stack for existing declaration
-                let foundDuplicate = false;
-                for (let si = 0; si < scopeStack.length; si++) {
-                    const scope = scopeStack[si];
-                    const existing = scope.get(varName);
-                    if (existing) {
-                        const startPos = { line: lineNum, character: match.index + match[1].length + 1 };
-                        const endPos = { line: lineNum, character: match.index + match[1].length + 1 + varName.length };
-                        
-                        diags.push({
-                            message: `Variable '${varName}' is already declared at line ${existing.line + 1}. Enforce Script does not allow duplicate variable names in the same scope.`,
-                            range: { start: startPos, end: endPos },
-                            severity: DiagnosticSeverity.Error
-                        });
-                        foundDuplicate = true;
-                        break;
-                    }
-                }
-                
-                // Record this declaration in the appropriate scope
-                if (!foundDuplicate && scopeStack.length > 0) {
-                    // If we're at class level (in a class but not in a function), record as class field
-                    if (inClass && !inFunction && braceDepth === classBraceDepth + 1) {
-                        classFieldScope.set(varName, {
-                            line: lineNum,
-                            character: match.index
-                        });
-                    }
-                    // Always add to current scope stack
-                    scopeStack[scopeStack.length - 1].set(varName, {
-                        line: lineNum,
-                        character: match.index
-                    });
+        // ── 2. Process classes ─────────────────────────────────────────────
+        for (const node of ast.body) {
+            if (node.kind === 'ClassDecl') {
+                this.checkDuplicatesInClass(node as ClassDeclNode, globalNames, diags, reportDup);
+            }
+        }
+
+        // ── 3. Process free functions (not inside a class) ─────────────────
+        for (const node of ast.body) {
+            if (node.kind === 'FunctionDecl') {
+                const func = node as FunctionDeclNode;
+                const isProtoOrNative = func.modifiers.includes('proto') || func.modifiers.includes('native');
+                if (!isProtoOrNative) {
+                    this.checkDuplicatesInFunction(
+                        func, new Map(), new Map(), globalNames, diags,
+                        localScopesOverlap, reportDup
+                    );
                 }
             }
-            
-            // THEN: Process braces AFTER variable declarations
-            // This ensures for loop vars are in parent scope
-            for (let charIdx = 0; charIdx < line.length; charIdx++) {
-                const char = line[charIdx];
-                if (char === '{') {
-                    braceDepth++;
-                    // Push new scope
-                    scopeStack.push(new Map());
-                } else if (char === '}') {
-                    braceDepth--;
-                    // Pop scope
-                    if (scopeStack.length > 1) {
-                        scopeStack.pop();
+        }
+    }
+
+    /**
+     * Check duplicates within a single class: fields vs inherited, missing override,
+     * and delegate to checkDuplicatesInFunction for each method.
+     */
+    private checkDuplicatesInClass(
+        cls: ClassDeclNode,
+        globalNames: Map<string, SymbolNodeBase>,
+        diags: Diagnostic[],
+        reportDup: (name: string, decl: SymbolNodeBase, existingLine: number) => void
+    ): void {
+
+        // Position helper (kept local so each call is self-contained)
+        const posBefore = (a: Position, b: Position): boolean =>
+            a.line < b.line || (a.line === b.line && a.character < b.character);
+        const localScopesOverlap = (a: VarDeclNode, b: VarDeclNode): boolean => {
+            if (!a.scopeEnd || !b.scopeEnd) return true;
+            const aVisAtB = !posBefore(b.start, a.start) && posBefore(b.start, a.scopeEnd);
+            const bVisAtA = !posBefore(a.start, b.start) && posBefore(a.start, b.scopeEnd);
+            return aVisAtB || bVisAtA;
+        };
+
+        // ── Collect class fields ───────────────────────────────────────────
+        const classFields = new Map<string, SymbolNodeBase>();
+        for (const member of cls.members || []) {
+            if (member.kind === 'VarDecl' && member.name) {
+                classFields.set(member.name, member);
+            }
+        }
+
+        // ── Collect inherited fields & parent method signatures ────────────
+        const inheritedFields = new Map<string, SymbolNodeBase>();
+        const parentMethodSigs = new Map<string, number[]>();
+
+        if (cls.base?.identifier) {
+            const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
+            for (const parentClass of hierarchy) {
+                for (const member of parentClass.members || []) {
+                    if (member.kind === 'VarDecl' && member.name) {
+                        if (!inheritedFields.has(member.name)) {
+                            inheritedFields.set(member.name, member);
+                        }
                     }
-                    // Check if we exited a function
-                    if (inFunction && braceDepth <= functionBraceDepth) {
-                        inFunction = false;
+                    if (member.kind === 'FunctionDecl' && member.name) {
+                        const paramCount = (member as FunctionDeclNode).parameters?.length ?? 0;
+                        if (!parentMethodSigs.has(member.name)) {
+                            parentMethodSigs.set(member.name, []);
+                        }
+                        parentMethodSigs.get(member.name)!.push(paramCount);
                     }
-                    // Check if we exited a class
-                    if (inClass && braceDepth <= classBraceDepth) {
-                        inClass = false;
-                        classFieldScope = new Map();
+                }
+            }
+        }
+
+        // ── Check class fields against inherited fields & globals ──────────
+        for (const [fieldName, fieldNode] of classFields) {
+            const inh = inheritedFields.get(fieldName);
+            if (inh) {
+                reportDup(fieldName, fieldNode, inh.start.line);
+                continue;
+            }
+            const glob = globalNames.get(fieldName);
+            if (glob) {
+                reportDup(fieldName, fieldNode, glob.start.line);
+            }
+        }
+
+        // ── Check each method ──────────────────────────────────────────────
+        for (const member of cls.members || []) {
+            if (member.kind !== 'FunctionDecl') continue;
+            const func = member as FunctionDeclNode;
+
+            // Missing override check
+            if (parentMethodSigs.size > 0 && func.name && func.name !== cls.name) {
+                const hasOverride = func.modifiers.includes('override');
+                if (!hasOverride && parentMethodSigs.has(func.name)) {
+                    const childParamCount = func.parameters?.length ?? 0;
+                    const parentParamCounts = parentMethodSigs.get(func.name)!;
+                    if (parentParamCounts.includes(childParamCount)) {
+                        diags.push({
+                            message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
+                            range: { start: func.nameStart, end: func.nameEnd },
+                            severity: DiagnosticSeverity.Warning
+                        });
                     }
+                }
+            }
+
+            // Duplicate locals check (skip proto/native)
+            const isProtoOrNative = func.modifiers.includes('proto') || func.modifiers.includes('native');
+            if (!isProtoOrNative) {
+                // Build combined ancestor map: globals < inherited < class fields
+                // (insertion order means closer scopes overwrite farther ones,
+                //  but for duplicate checking we iterate all of them, so the order
+                //  only controls which "existing line" is reported first — we
+                //  scan outermost first, matching the old text-based behaviour.)
+                this.checkDuplicatesInFunction(
+                    func, classFields, inheritedFields, globalNames, diags,
+                    localScopesOverlap, reportDup
+                );
+            }
+        }
+    }
+
+    /**
+     * Check for duplicate locals/params within a single function, also
+     * checking against class fields, inherited fields, and globals.
+     */
+    private checkDuplicatesInFunction(
+        func: FunctionDeclNode,
+        classFields: Map<string, SymbolNodeBase>,
+        inheritedFields: Map<string, SymbolNodeBase>,
+        globalNames: Map<string, SymbolNodeBase>,
+        diags: Diagnostic[],
+        localScopesOverlap: (a: VarDeclNode, b: VarDeclNode) => boolean,
+        reportDup: (name: string, decl: SymbolNodeBase, existingLine: number) => void
+    ): void {
+
+        // Scan order: globals → inherited → class fields (outermost first)
+        // This matches the old text-based checker's scope-stack[0..n] scan order.
+        const findAncestorConflict = (name: string): SymbolNodeBase | undefined => {
+            return globalNames.get(name)
+                ?? inheritedFields.get(name)
+                ?? classFields.get(name);
+        };
+
+        // ── Check parameters ─────────────────────────────────────────
+        // Build a set of already-seen param names for intra-param dups.
+        const paramNames = new Map<string, SymbolNodeBase>();
+        for (const p of func.parameters || []) {
+            if (!p.name) continue;
+            // Check against ancestors
+            const ancestor = findAncestorConflict(p.name);
+            if (ancestor) {
+                reportDup(p.name, p, ancestor.start.line);
+                continue; // don't add to paramNames if it's already a dup
+            }
+            // Check against prior params in same function
+            const priorParam = paramNames.get(p.name);
+            if (priorParam) {
+                reportDup(p.name, p, priorParam.start.line);
+            } else {
+                paramNames.set(p.name, p);
+            }
+        }
+
+        // ── Check locals ─────────────────────────────────────────────
+        const locals = func.locals || [];
+        for (let i = 0; i < locals.length; i++) {
+            const local = locals[i];
+            if (!local.name) continue;
+
+            // Check against ancestors (globals/inherited/class fields)
+            const ancestor = findAncestorConflict(local.name);
+            if (ancestor) {
+                reportDup(local.name, local, ancestor.start.line);
+                continue;
+            }
+
+            // Check against parameters
+            const param = paramNames.get(local.name);
+            if (param) {
+                reportDup(local.name, local, param.start.line);
+                continue;
+            }
+
+            // Check against earlier locals with overlapping scopes
+            for (let j = 0; j < i; j++) {
+                const other = locals[j];
+                if (other.name !== local.name) continue;
+                if (localScopesOverlap(other, local)) {
+                    reportDup(local.name, local, other.start.line);
+                    break; // only report first conflict
                 }
             }
         }

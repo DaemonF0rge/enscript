@@ -91,6 +91,91 @@ test('does not false-positive on case labels', () => {
     expect(func.locals.length).toBe(0);
 });
 
+// ── Phase 3: scopeEnd tests ────────────────────────────────────────────
+
+test('scopeEnd is set for locals in nested blocks', () => {
+    const code = `class Foo {
+    void Bar() {
+        int outer = 1;
+        if (true) {
+            int inner = 2;
+        }
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.locals.length).toBe(2);
+
+    const outerLocal = func.locals.find((l: any) => l.name === 'outer');
+    const innerLocal = func.locals.find((l: any) => l.name === 'inner');
+    expect(outerLocal).toBeDefined();
+    expect(innerLocal).toBeDefined();
+
+    // outer is in the function body scope — its scopeEnd is the function's closing '}'
+    expect(outerLocal.scopeEnd).toBeDefined();
+    // inner is in the if-block scope — its scopeEnd is the if-block's closing '}'
+    expect(innerLocal.scopeEnd).toBeDefined();
+
+    // inner's scope should end BEFORE outer's scope
+    // (inner ends at the if-block '}', outer ends at the function '}')
+    expect(innerLocal.scopeEnd.line).toBeLessThan(outerLocal.scopeEnd.line);
+});
+
+test('scopeEnd for loop variables is function scope', () => {
+    // for-loop variables are declared before the '{', so they belong
+    // to the parent (function body) scope, not the loop block scope.
+    const code = `class Foo {
+    void Bar() {
+        for (int j = 0; j < 10; j++) {
+            int inside = 1;
+        }
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+
+    const jLocal = func.locals.find((l: any) => l.name === 'j');
+    const insideLocal = func.locals.find((l: any) => l.name === 'inside');
+    expect(jLocal).toBeDefined();
+    expect(insideLocal).toBeDefined();
+
+    // j is in the function body scope (declared before the for-loop '{')
+    // inside is in the for-loop block scope
+    // So j.scopeEnd should be >= insideLocal.scopeEnd
+    expect(jLocal.scopeEnd.line).toBeGreaterThanOrEqual(insideLocal.scopeEnd.line);
+});
+
+test('scopeEnd allows sibling-block variables with same name', () => {
+    // Variables in sibling (non-overlapping) blocks have separate scopes
+    const code = `class Foo {
+    void Bar() {
+        if (true) {
+            int x = 1;
+        }
+        if (true) {
+            int x = 2;
+        }
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+
+    // Both 'x' locals should exist
+    const xLocals = func.locals.filter((l: any) => l.name === 'x');
+    expect(xLocals.length).toBe(2);
+
+    // Their scopes should NOT overlap: first x's scopeEnd < second x's start
+    const first = xLocals[0];
+    const second = xLocals[1];
+    expect(first.scopeEnd.line).toBeLessThanOrEqual(second.start.line);
+});
+
 test('playground', () => {
     const target_file = path.join("P:\\enscript\\test", "test_enscript.c");
     const text = fs.readFileSync(target_file, "utf8");
