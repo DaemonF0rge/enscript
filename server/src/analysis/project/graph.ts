@@ -2336,6 +2336,301 @@ export class Analyzer {
     // This prevents false positives during initial indexing
     private static readonly MIN_INDEX_SIZE_FOR_TYPE_CHECKS = 100;
 
+    // ========================================================================
+    // DIAGNOSTIC CONTEXT — shared pre-computed data for all diagnostic passes
+    // ========================================================================
+    // Built once per runDiagnostics() invocation instead of duplicated in
+    // each checker. Contains:
+    //   - text: ifdef-stripped source text (preserves line numbers)
+    //   - lines: text.split('\n') — used by line-based scanners
+    //   - lineOffsets: cumulative character offsets per line for O(1) lookup
+    //   - ast: parsed AST for this document
+    //   - doc: the TextDocument (needed for positionAt)
+    //   - scopedVars: unified scoped variable map (used by type mismatch and
+    //                 call arg checkers with different lookup semantics)
+    // ========================================================================
+
+    /**
+     * Pre-computed line offset table for O(1) line-from-position lookup.
+     * lineOffsets[i] = character index where line i starts.
+     * To find which line a character position is on, binary-search this array.
+     */
+    private static buildLineOffsets(text: string): number[] {
+        const offsets: number[] = [0]; // Line 0 starts at offset 0
+        for (let i = 0; i < text.length; i++) {
+            if (text[i] === '\n') {
+                offsets.push(i + 1);
+            }
+        }
+        return offsets;
+    }
+
+    /**
+     * O(1) line number from character position via binary search on pre-built offsets.
+     * Equivalent to the old getLineFromPos but without O(n) scan per call.
+     */
+    private static getLineFromOffset(lineOffsets: number[], pos: number): number {
+        // Binary search: find the last lineOffsets[i] <= pos
+        let lo = 0, hi = lineOffsets.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (lineOffsets[mid] <= pos) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+
+    /**
+     * Check if a character position falls inside a comment or string literal.
+     * Uses the same algorithm as the previously duplicated closures in
+     * checkTypeMismatches and checkFunctionCallArgs.
+     *
+     * @param text The full (ifdef-stripped) source text
+     * @param position Character offset to test
+     */
+    private static isInsideCommentOrStringAt(text: string, position: number): boolean {
+        // Check single-line comments
+        let lineStart = text.lastIndexOf('\n', position) + 1;
+        let lineEnd = text.indexOf('\n', position);
+        if (lineEnd === -1) lineEnd = text.length;
+        const line = text.substring(lineStart, lineEnd);
+        const posInLine = position - lineStart;
+
+        // Check if there's a // before this position on the same line
+        const commentIdx = line.indexOf('//');
+        if (commentIdx >= 0 && commentIdx < posInLine) {
+            return true;
+        }
+
+        // Check block comments - scan backwards for /* that isn't closed
+        let i = position - 1;
+        while (i >= 0) {
+            if (i > 0 && text[i - 1] === '*' && text[i] === '/') {
+                // Found end of block comment, we're outside
+                break;
+            }
+            if (i > 0 && text[i - 1] === '/' && text[i] === '*') {
+                // Found start of block comment, we're inside
+                return true;
+            }
+            i--;
+        }
+
+        // Check strings - count unescaped quotes before position on same line
+        let inString = false;
+        let stringChar = '';
+        for (let j = 0; j < posInLine; j++) {
+            const ch = line[j];
+            if (!inString && (ch === '"' || ch === "'")) {
+                inString = true;
+                stringChar = ch;
+            } else if (inString && ch === stringChar) {
+                let backslashCount = 0;
+                let bi = j - 1;
+                while (bi >= 0 && line[bi] === '\\') { backslashCount++; bi--; }
+                if (backslashCount % 2 === 0) {
+                    inString = false;
+                }
+            }
+        }
+        return inString;
+    }
+
+    /** Scoped variable entry — tracks type and scope range with class-field distinction */
+    private static readonly SCOPED_VAR_TYPE_KEYWORDS = new Set([
+        'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
+        'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
+        'const', 'proto', 'native', 'Print', 'foreach'
+    ]);
+    private static readonly SCOPED_VAR_NAME_KEYWORDS = new Set([
+        'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'
+    ]);
+
+    /**
+     * Build the unified scoped variable map from AST declarations + regex body scan.
+     * Contains ALL variables: globals, class fields, inherited fields, func params,
+     * func locals (from AST), and regex-detected locals in function bodies.
+     *
+     * This replaces the per-checker duplicate data collection while preserving
+     * every data source exactly.
+     */
+    private buildScopedVarMap(
+        ast: File,
+        text: string,
+        lines: string[]
+    ): Map<string, { type: string; startLine: number; endLine: number; isClassField: boolean }[]> {
+        type ScopedVarEntry = { type: string; startLine: number; endLine: number; isClassField: boolean };
+        const scopedVars = new Map<string, ScopedVarEntry[]>();
+
+        const add = (name: string, type: string, startLine: number, endLine: number, isClassField: boolean) => {
+            if (!scopedVars.has(name)) {
+                scopedVars.set(name, []);
+            }
+            scopedVars.get(name)!.push({ type, startLine, endLine, isClassField });
+        };
+
+        // ── Phase A: AST-based collection ──────────────────────────────────
+        for (const node of ast.body) {
+            // Top-level var declarations (globals)
+            if (node.kind === 'VarDecl' && node.name && (node as VarDeclNode).type?.identifier) {
+                const startLine = node.start?.line ?? 0;
+                add(node.name, (node as VarDeclNode).type.identifier, startLine, Number.MAX_SAFE_INTEGER, false);
+            }
+
+            if (node.kind === 'FunctionDecl') {
+                const funcStart = node.start?.line ?? 0;
+                const funcEnd = node.end?.line ?? Number.MAX_SAFE_INTEGER;
+                for (const param of (node as FunctionDeclNode).parameters || []) {
+                    if (param.name && param.type?.identifier) {
+                        add(param.name, param.type.identifier, funcStart, funcEnd, false);
+                    }
+                }
+                // Collect locals from AST (parser-detected locals)
+                for (const local of (node as FunctionDeclNode).locals || []) {
+                    if (local.name && local.type?.identifier) {
+                        const localStart = local.start?.line ?? funcStart;
+                        add(local.name, local.type.identifier, localStart, funcEnd, false);
+                    }
+                }
+            }
+
+            if (node.kind === 'ClassDecl') {
+                const cls = node as ClassDeclNode;
+                const clsStart = cls.start?.line ?? 0;
+                const clsEnd = cls.end?.line ?? Number.MAX_SAFE_INTEGER;
+
+                for (const member of cls.members || []) {
+                    // Class fields — marked as class fields for priority lookup
+                    if (member.kind === 'VarDecl' && member.name && (member as VarDeclNode).type?.identifier) {
+                        add(member.name, (member as VarDeclNode).type.identifier, clsStart, clsEnd, true);
+                    }
+                    // Methods — collect params and locals
+                    if (member.kind === 'FunctionDecl') {
+                        const func = member as FunctionDeclNode;
+                        const fStart = func.start?.line ?? clsStart;
+                        const fEnd = func.end?.line ?? clsEnd;
+                        for (const p of func.parameters || []) {
+                            if (p.name && p.type?.identifier) {
+                                add(p.name, p.type.identifier, fStart, fEnd, false);
+                            }
+                        }
+                        for (const l of func.locals || []) {
+                            if (l.name && l.type?.identifier) {
+                                const localStart = l.start?.line ?? fStart;
+                                add(l.name, l.type.identifier, localStart, fEnd, false);
+                            }
+                        }
+                    }
+                }
+
+                // Inherited fields from parent classes — marked as class fields.
+                // This was only done in checkTypeMismatches; checkFunctionCallArgs
+                // compensated via resolveVariableType fallback. Including them in the
+                // shared map is safe because they have large ranges (class scope) and
+                // checkFunctionCallArgs' smallest-range heuristic will prefer local
+                // declarations over them anyway, matching prior behavior.
+                if (cls.base?.identifier) {
+                    const parentClasses = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
+                    for (const parentClass of parentClasses) {
+                        for (const member of parentClass.members || []) {
+                            if (member.kind === 'VarDecl' && member.name) {
+                                const varMember = member as VarDeclNode;
+                                if (varMember.type?.identifier) {
+                                    add(member.name, varMember.type.identifier, clsStart, clsEnd, true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase B: Regex-based local variable scan ───────────────────────
+        // The parser's locals detection covers many cases but can miss some.
+        // This regex scan supplements it for function bodies. This preserves
+        // every regex pattern and keyword filter from both original scanners.
+        {
+            let inBlockComment = false;
+
+            const scanFunctionBody = (funcStart: number, funcEnd: number) => {
+                for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
+                    let line = lines[lineIdx];
+
+                    // Handle block comments
+                    if (inBlockComment) {
+                        if (line.includes('*/')) inBlockComment = false;
+                        continue;
+                    }
+                    if (line.trimStart().startsWith('/*')) {
+                        if (!line.includes('*/')) inBlockComment = true;
+                        continue;
+                    }
+
+                    // Strip comments and strings
+                    const commentIdx = line.indexOf('//');
+                    if (commentIdx >= 0) line = line.substring(0, commentIdx);
+                    line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+                    line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
+                    line = line.trim();
+
+                    // Skip empty lines
+                    if (!line) continue;
+
+                    // Match: Type varName; or Type varName = ...;
+                    const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
+                    let m;
+                    while ((m = localDeclPattern.exec(line)) !== null) {
+                        const typeName = m[1];
+                        const varName = m[2];
+
+                        if (Analyzer.SCOPED_VAR_TYPE_KEYWORDS.has(typeName)) continue;
+                        if (Analyzer.SCOPED_VAR_NAME_KEYWORDS.has(varName)) continue;
+
+                        add(varName, typeName, lineIdx, funcEnd, false);
+                    }
+
+                    // Also match foreach variable declarations:
+                    //   foreach (Type varName : collection)
+                    const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
+                    let fm;
+                    while ((fm = foreachPattern.exec(line)) !== null) {
+                        add(fm[2], fm[1], lineIdx, funcEnd, false);
+                    }
+                }
+            };
+
+            for (const node of ast.body) {
+                if (node.kind === 'ClassDecl') {
+                    const classNode = node as ClassDeclNode;
+                    for (const member of classNode.members || []) {
+                        if (member.kind === 'FunctionDecl') {
+                            const func = member as FunctionDeclNode;
+                            const funcStart = func.start?.line ?? 0;
+                            const funcEnd = func.end?.line ?? 0;
+                            if (funcEnd > funcStart) {
+                                scanFunctionBody(funcStart, funcEnd);
+                            }
+                        }
+                    }
+                }
+                // Also scan top-level functions
+                if (node.kind === 'FunctionDecl') {
+                    const func = node as FunctionDeclNode;
+                    const funcStart = func.start?.line ?? 0;
+                    const funcEnd = func.end?.line ?? 0;
+                    if (funcEnd > funcStart) {
+                        scanFunctionBody(funcStart, funcEnd);
+                    }
+                }
+            }
+        }
+
+        return scopedVars;
+    }
+
     runDiagnostics(doc: TextDocument): Diagnostic[] {
         const ast = this.ensure(doc);
         const diags: Diagnostic[] = [];
@@ -2345,26 +2640,39 @@ export class Analyzer {
             diags.push(...ast.diagnostics);
         }
         
+        // ── Build shared diagnostic context once ───────────────────────────
+        // These pre-computed values are passed to each checker so the
+        // expensive work (ifdef stripping, line splitting, line offset table,
+        // scoped variable map) is done only once per diagnostic run.
+        const text = this.stripSkippedIfdefRegions(doc.getText());
+        const lines = text.split('\n');
+        const lineOffsets = Analyzer.buildLineOffsets(text);
+        
         // Only run type/symbol checks if we have enough indexed files
         // This prevents false positives during initial workspace indexing
         if (this.docCache.size >= Analyzer.MIN_INDEX_SIZE_FOR_TYPE_CHECKS) {
             // Check for unknown types and symbols
             this.checkUnknownSymbols(ast, diags);
             
+            // Build scoped variable map once (used by both type mismatch and
+            // call arg checkers). Placed here because it requires the index
+            // to be populated (getClassHierarchyOrdered for inherited fields).
+            const scopedVars = this.buildScopedVarMap(ast, text, lines);
+            
             // Check for type mismatches in assignments
-            this.checkTypeMismatches(doc, diags);
+            this.checkTypeMismatches(doc, diags, text, lines, lineOffsets, ast, scopedVars);
             
             // Check function call arguments (param count and types)
-            this.checkFunctionCallArgs(doc, diags);
+            this.checkFunctionCallArgs(doc, diags, text, lines, lineOffsets, ast, scopedVars);
         }
         
         // Check for multi-line statements (not supported in Enforce Script)
         // This doesn't require indexing - it's purely syntactic
-        this.checkMultiLineStatements(doc, diags);
+        this.checkMultiLineStatements(doc, diags, text, lines);
         
         // Check for duplicate variable declarations in same scope
         // Enforce Script doesn't allow duplicate variable names even in sibling for loops
-        this.checkDuplicateVariables(doc, diags);
+        this.checkDuplicateVariables(doc, diags, text);
         
         return diags;
     }
@@ -2378,8 +2686,7 @@ export class Analyzer {
      *   for (int j = 0; j < 10; j++) { }
      *   for (int j = 0; j < 10; j++) { }  // ERROR: 'j' already declared
      */
-    private checkDuplicateVariables(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = this.stripSkippedIfdefRegions(doc.getText());
+    private checkDuplicateVariables(doc: TextDocument, diags: Diagnostic[], text: string): void {
         
         // Track variables by scope - use a stack of scopes
         // Each scope has a map of variable names to their declaration info
@@ -2862,37 +3169,25 @@ export class Analyzer {
      * - Declaration with init: Type varName = FunctionCall();
      * - Re-assignment: varName = otherVar;
      */
-    private checkTypeMismatches(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = this.stripSkippedIfdefRegions(doc.getText());
-        const ast = this.ensure(doc);
-        
-        // Scoped variable tracking - each variable knows its valid line range
-        interface ScopedVar {
-            type: string;
-            startLine: number;
-            endLine: number;  // -1 means class field (valid everywhere in class)
-            isClassField: boolean;
-        }
-        
-        // Map of variable name -> array of scoped declarations
-        const scopedVars = new Map<string, ScopedVar[]>();
-        
-        // Helper to add a scoped variable
-        const addScopedVar = (name: string, type: string, startLine: number, endLine: number, isClassField: boolean) => {
-            if (!scopedVars.has(name)) {
-                scopedVars.set(name, []);
-            }
-            scopedVars.get(name)!.push({ type, startLine, endLine, isClassField });
-        };
-        
+    private checkTypeMismatches(
+        doc: TextDocument,
+        diags: Diagnostic[],
+        text: string,
+        lines: string[],
+        lineOffsets: number[],
+        ast: File,
+        scopedVars: Map<string, { type: string; startLine: number; endLine: number; isClassField: boolean }[]>
+    ): void {
         // Helper to get the type of a variable at a specific line
+        // Uses isClassField priority: local vars preferred over class fields,
+        // then smaller ranges preferred within the same category.
         const getVarTypeAtLine = (name: string, line: number): string | undefined => {
             const vars = scopedVars.get(name);
             if (!vars) return undefined;
             
             // Find the most specific scope that contains this line
             // Priority: 1) local vars in range, 2) class fields in range
-            let bestMatch: ScopedVar | undefined;
+            let bestMatch: { type: string; startLine: number; endLine: number; isClassField: boolean } | undefined;
             
             for (const v of vars) {
                 // ALL variables (including class fields) must have the line within their scope range
@@ -2919,279 +3214,12 @@ export class Analyzer {
             return bestMatch?.type;
         };
         
-        // Collect types from all declarations in this file with proper scoping
-        const collectVarTypes = (nodes: any[], classStartLine?: number, classEndLine?: number) => {
-            for (const node of nodes) {
-                // Top-level var declarations (globals)
-                if (node.kind === 'VarDecl' && node.name && node.type?.identifier) {
-                    const startLine = node.start?.line ?? 0;
-                    addScopedVar(node.name, node.type.identifier, startLine, Number.MAX_SAFE_INTEGER, false);
-                }
-                
-                if (node.kind === 'FunctionDecl') {
-                    const funcStart = node.start?.line ?? 0;
-                    const funcEnd = node.end?.line ?? Number.MAX_SAFE_INTEGER;
-                    
-                    // Collect parameters - scoped to this function
-                    for (const param of node.parameters || []) {
-                        if (param.name && param.type?.identifier) {
-                            addScopedVar(param.name, param.type.identifier, funcStart, funcEnd, false);
-                        }
-                    }
-                    // Collect locals - scoped to this function
-                    for (const local of node.locals || []) {
-                        if (local.name && local.type?.identifier) {
-                            const localStart = local.start?.line ?? funcStart;
-                            addScopedVar(local.name, local.type.identifier, localStart, funcEnd, false);
-                        }
-                    }
-                }
-                
-                if (node.kind === 'ClassDecl') {
-                    const clsStart = node.start?.line ?? 0;
-                    const clsEnd = node.end?.line ?? Number.MAX_SAFE_INTEGER;
-                    
-                    // Collect class fields - they're accessible anywhere in the class
-                    for (const member of node.members || []) {
-                        if (member.kind === 'VarDecl' && member.name && member.type?.identifier) {
-                            addScopedVar(member.name, member.type.identifier, clsStart, clsEnd, true);
-                        }
-                        // Also process methods within the class
-                        if (member.kind === 'FunctionDecl') {
-                            const funcStart = member.start?.line ?? clsStart;
-                            const funcEnd = member.end?.line ?? clsEnd;
-                            
-                            for (const param of member.parameters || []) {
-                                if (param.name && param.type?.identifier) {
-                                    addScopedVar(param.name, param.type.identifier, funcStart, funcEnd, false);
-                                }
-                            }
-                            for (const local of member.locals || []) {
-                                if (local.name && local.type?.identifier) {
-                                    const localStart = local.start?.line ?? funcStart;
-                                    addScopedVar(local.name, local.type.identifier, localStart, funcEnd, false);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Also collect inherited fields from parent classes
-                    // This ensures fields from base classes are accessible in derived classes
-                    if (node.base?.identifier) {
-                        const parentClasses = this.getClassHierarchyOrdered(node.base.identifier, new Set());
-                        for (const parentClass of parentClasses) {
-                            for (const member of parentClass.members || []) {
-                                if (member.kind === 'VarDecl' && member.name) {
-                                    const varMember = member as VarDeclNode;
-                                    if (varMember.type?.identifier) {
-                                        // Add inherited fields with the child class's scope
-                                        addScopedVar(member.name, varMember.type.identifier, clsStart, clsEnd, true);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        
-        collectVarTypes(ast.body);
-        
-        // The parser doesn't parse function bodies (locals is always []),
-        // so we need to scan for local variable declarations using regex.
-        // We scan the text line-by-line, tracking which function scope we're in.
-        {
-            const lines = text.split('\n');
-            let inBlockComment = false;
-            
-            // For each function in the AST, scan its body for local declarations
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl') {
-                    const classNode = node as ClassDeclNode;
-                    for (const member of classNode.members || []) {
-                        if (member.kind === 'FunctionDecl') {
-                            const func = member as FunctionDeclNode;
-                            const funcStart = func.start?.line ?? 0;
-                            const funcEnd = func.end?.line ?? 0;
-                            if (funcEnd <= funcStart) continue;
-                            
-                            // Scan lines within this function for variable declarations
-                            for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
-                                let line = lines[lineIdx];
-                                
-                                // Handle block comments
-                                if (inBlockComment) {
-                                    if (line.includes('*/')) inBlockComment = false;
-                                    continue;
-                                }
-                                if (line.trimStart().startsWith('/*')) {
-                                    if (!line.includes('*/')) inBlockComment = true;
-                                    continue;
-                                }
-                                
-                                // Strip comments and strings
-                                const commentIdx = line.indexOf('//');
-                                if (commentIdx >= 0) line = line.substring(0, commentIdx);
-                                line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-                                line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
-                                line = line.trim();
-                                
-                                // Skip empty, control flow, return, etc.
-                                if (!line) continue;
-                                
-                                // Match: Type varName; or Type varName = ...;
-                                // Must start with a type (capitalized or known primitive)
-                                // Exclude: keywords, function calls, return statements
-                                const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
-                                let m;
-                                while ((m = localDeclPattern.exec(line)) !== null) {
-                                    const typeName = m[1];
-                                    const varName = m[2];
-                                    
-                                    // Skip if type is a keyword/modifier
-                                    if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
-                                         'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
-                                         'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
-                                        continue;
-                                    }
-                                    // Skip if varName is a keyword
-                                    if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
-                                        continue;
-                                    }
-                                    
-                                    addScopedVar(varName, typeName, lineIdx, funcEnd, false);
-                                }
-                                // Also match foreach variable declarations:
-                                //   foreach (Type varName : collection)
-                                const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
-                                let fm;
-                                while ((fm = foreachPattern.exec(line)) !== null) {
-                                    addScopedVar(fm[2], fm[1], lineIdx, funcEnd, false);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Also scan top-level functions
-                if (node.kind === 'FunctionDecl') {
-                    const func = node as FunctionDeclNode;
-                    const funcStart = func.start?.line ?? 0;
-                    const funcEnd = func.end?.line ?? 0;
-                    if (funcEnd <= funcStart) continue;
-                    
-                    for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
-                        let line = lines[lineIdx];
-                        
-                        if (inBlockComment) {
-                            if (line.includes('*/')) inBlockComment = false;
-                            continue;
-                        }
-                        if (line.trimStart().startsWith('/*')) {
-                            if (!line.includes('*/')) inBlockComment = true;
-                            continue;
-                        }
-                        
-                        const commentIdx = line.indexOf('//');
-                        if (commentIdx >= 0) line = line.substring(0, commentIdx);
-                        line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-                        line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
-                        line = line.trim();
-                        
-                        if (!line) continue;
-                        
-                        const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
-                        let m;
-                        while ((m = localDeclPattern.exec(line)) !== null) {
-                            const typeName = m[1];
-                            const varName = m[2];
-                            
-                            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
-                                 'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
-                                 'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
-                                continue;
-                            }
-                            if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
-                                continue;
-                            }
-                            
-                            addScopedVar(varName, typeName, lineIdx, funcEnd, false);
-                        }
-                        // Also match foreach variable declarations:
-                        //   foreach (Type varName : collection)
-                        const foreachPatternTL = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
-                        let fmTL;
-                        while ((fmTL = foreachPatternTL.exec(line)) !== null) {
-                            addScopedVar(fmTL[2], fmTL[1], lineIdx, funcEnd, false);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Helper to check if a position is inside a comment or string
-        const isInsideCommentOrString = (position: number): boolean => {
-            // Check single-line comments
-            let lineStart = text.lastIndexOf('\n', position) + 1;
-            let lineEnd = text.indexOf('\n', position);
-            if (lineEnd === -1) lineEnd = text.length;
-            const line = text.substring(lineStart, lineEnd);
-            const posInLine = position - lineStart;
-            
-            // Check if there's a // before this position on the same line
-            const commentIdx = line.indexOf('//');
-            if (commentIdx >= 0 && commentIdx < posInLine) {
-                return true;
-            }
-            
-            // Check block comments - scan backwards for /* that isn't closed
-            let i = position - 1;
-            while (i >= 0) {
-                if (i > 0 && text[i-1] === '*' && text[i] === '/') {
-                    // Found end of block comment, we're outside
-                    break;
-                }
-                if (i > 0 && text[i-1] === '/' && text[i] === '*') {
-                    // Found start of block comment, we're inside
-                    return true;
-                }
-                i--;
-            }
-            
-            // Check strings - count unescaped quotes before position on same line
-            let inString = false;
-            let stringChar = '';
-            for (let j = 0; j < posInLine; j++) {
-                const ch = line[j];
-                if (!inString && (ch === '"' || ch === "'")) {
-                    inString = true;
-                    stringChar = ch;
-                } else if (inString && ch === stringChar) {
-                    let backslashCount = 0;
-                    let bi = j - 1;
-                    while (bi >= 0 && line[bi] === '\\') { backslashCount++; bi--; }
-                    if (backslashCount % 2 === 0) {
-                        inString = false;
-                    }
-                }
-            }
-            return inString;
-        };
-        
         // For variable type scanning, we can still use stripped text since we just need types
         const textForScanning = text
             .replace(/\/\/.*$/gm, '')  // Remove single-line comments
             .replace(/\/\*[\s\S]*?\*\//g, '')  // Remove multi-line comments
             .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // Replace "..." with ""
             .replace(/'(?:[^'\\]|\\.)*'/g, "''");  // Replace '...' with ''
-        
-        // Helper to get line number from character position
-        const getLineFromPos = (pos: number): number => {
-            let line = 0;
-            for (let i = 0; i < pos && i < text.length; i++) {
-                if (text[i] === '\n') line++;
-            }
-            return line;
-        };
         
         // Pattern 1: Type varName = FunctionCall();
         // e.g., int i = GetGame();
@@ -3201,7 +3229,7 @@ export class Analyzer {
         let match;
         while ((match = funcAssignPattern.exec(text)) !== null) {
             // Skip if inside comment or string
-            if (isInsideCommentOrString(match.index)) {
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) {
                 continue;
             }
             
@@ -3308,7 +3336,7 @@ export class Analyzer {
                 }
                 // Try to resolve as a method of the containing class first (for unqualified calls like Find())
                 // This handles cases where the method is inherited or defined in the current class
-                const lineNum = getLineFromPos(match.index);
+                const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
                 const containingClass = this.findContainingClass(ast, { line: lineNum, character: 0 });
                 if (containingClass) {
                     returnType = this.resolveMethodReturnType(containingClass.name, funcName);
@@ -3334,7 +3362,7 @@ export class Analyzer {
         
         while ((match = varDeclAssignPattern.exec(text)) !== null) {
             // Skip if inside comment or string
-            if (isInsideCommentOrString(match.index)) {
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) {
                 continue;
             }
             
@@ -3361,7 +3389,7 @@ export class Analyzer {
             }
             
             // Look up the type of the source variable at this line
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             const sourceType = getVarTypeAtLine(sourceVar, lineNum);
             
             if (sourceType) {
@@ -3375,7 +3403,7 @@ export class Analyzer {
         
         while ((match = reassignPattern.exec(text)) !== null) {
             // Skip if inside comment or string
-            if (isInsideCommentOrString(match.index)) {
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) {
                 continue;
             }
             
@@ -3401,7 +3429,7 @@ export class Analyzer {
             }
             
             // Look up types for both variables at this line
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             const targetType = getVarTypeAtLine(targetVar, lineNum);
             const sourceType = getVarTypeAtLine(sourceVar, lineNum);
             
@@ -3429,7 +3457,7 @@ export class Analyzer {
         
         while ((match = reassignFuncPattern.exec(text)) !== null) {
             // Skip if inside comment or string
-            if (isInsideCommentOrString(match.index)) {
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) {
                 continue;
             }
             
@@ -3466,7 +3494,7 @@ export class Analyzer {
             }
             
             // Look up type of target variable at this line and resolve return type (single or chain)
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             const targetType = getVarTypeAtLine(targetVar, lineNum);
             let returnType: string | null;
             let chainEnd = 0;
@@ -3566,7 +3594,7 @@ export class Analyzer {
         const varChainDeclPattern = /\b(\w+)[ \t]+(\w+)\s*=\s*(\w+)\s*\./g;
         
         while ((match = varChainDeclPattern.exec(text)) !== null) {
-            if (isInsideCommentOrString(match.index)) continue;
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) continue;
             if (match[0].includes('\n')) continue;
             
             const declaredType = match[1];
@@ -3576,7 +3604,7 @@ export class Analyzer {
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'typedef'].includes(declaredType)) continue;
             
             // Get the type of the source variable
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             const sourceVarType = getVarTypeAtLine(sourceVar, lineNum);
             if (!sourceVarType) continue;
             
@@ -3612,7 +3640,7 @@ export class Analyzer {
         const varChainReassignPattern = /(?:^|[;{})\n])(\s*)(\w+)\s*=\s*(\w+)\s*\./g;
         
         while ((match = varChainReassignPattern.exec(text)) !== null) {
-            if (isInsideCommentOrString(match.index)) continue;
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) continue;
             
             const leadingWs = match[1];
             const targetVar = match[2];
@@ -3623,7 +3651,7 @@ export class Analyzer {
             
             if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'else'].includes(targetVar)) continue;
             
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             const targetType = getVarTypeAtLine(targetVar, lineNum);
             const sourceVarType = getVarTypeAtLine(sourceVar, lineNum);
             if (!targetType || !sourceVarType) continue;
@@ -4030,141 +4058,19 @@ export class Analyzer {
      * Validate function/method call arguments in the document.
      * Checks argument count and types against all overloads.
      */
-    private checkFunctionCallArgs(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = this.stripSkippedIfdefRegions(doc.getText());
-        const ast = this.ensure(doc);
-        
-        // Build scoped variable type lookup (reuse same approach as checkTypeMismatches)
-        const varTypes = new Map<string, { type: string; startLine: number; endLine: number }[]>();
-        
-        const addVar = (name: string, type: string, start: number, end: number) => {
-            if (!varTypes.has(name)) varTypes.set(name, []);
-            varTypes.get(name)!.push({ type, startLine: start, endLine: end });
-        };
-        
-        // Collect variable types from AST
-        for (const node of ast.body) {
-            if (node.kind === 'VarDecl' && node.name && (node as VarDeclNode).type?.identifier) {
-                addVar(node.name, (node as VarDeclNode).type.identifier, node.start?.line ?? 0, Number.MAX_SAFE_INTEGER);
-            }
-            if (node.kind === 'ClassDecl') {
-                const cls = node as ClassDeclNode;
-                const clsStart = cls.start?.line ?? 0;
-                const clsEnd = cls.end?.line ?? Number.MAX_SAFE_INTEGER;
-                for (const member of cls.members || []) {
-                    if (member.kind === 'VarDecl' && member.name && (member as VarDeclNode).type?.identifier) {
-                        addVar(member.name, (member as VarDeclNode).type.identifier, clsStart, clsEnd);
-                    }
-                    if (member.kind === 'FunctionDecl') {
-                        const func = member as FunctionDeclNode;
-                        const fStart = func.start?.line ?? clsStart;
-                        const fEnd = func.end?.line ?? clsEnd;
-                        for (const p of func.parameters || []) {
-                            if (p.name && p.type?.identifier) addVar(p.name, p.type.identifier, fStart, fEnd);
-                        }
-                        for (const l of func.locals || []) {
-                            if (l.name && l.type?.identifier) addVar(l.name, l.type.identifier, l.start?.line ?? fStart, fEnd);
-                        }
-                    }
-                }
-            }
-            if (node.kind === 'FunctionDecl') {
-                const func = node as FunctionDeclNode;
-                const fStart = func.start?.line ?? 0;
-                const fEnd = func.end?.line ?? Number.MAX_SAFE_INTEGER;
-                for (const p of func.parameters || []) {
-                    if (p.name && p.type?.identifier) addVar(p.name, p.type.identifier, fStart, fEnd);
-                }
-            }
-        }
-        
-        // The parser doesn't parse function bodies (locals is always []),
-        // so we need to scan for local variable declarations using regex.
-        // This includes regular variable declarations and foreach loop variables.
-        {
-            const lines = text.split('\n');
-            let inBlockComment = false;
-            
-            const scanFunctionBody = (funcStart: number, funcEnd: number) => {
-                for (let lineIdx = funcStart; lineIdx <= funcEnd && lineIdx < lines.length; lineIdx++) {
-                    let line = lines[lineIdx];
-                    
-                    // Handle block comments
-                    if (inBlockComment) {
-                        if (line.includes('*/')) inBlockComment = false;
-                        continue;
-                    }
-                    if (line.trimStart().startsWith('/*')) {
-                        if (!line.includes('*/')) inBlockComment = true;
-                        continue;
-                    }
-                    
-                    // Strip comments and strings
-                    const commentIdx = line.indexOf('//');
-                    if (commentIdx >= 0) line = line.substring(0, commentIdx);
-                    line = line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-                    line = line.replace(/'(?:[^'\\]|\\.)*'/g, "''");
-                    line = line.trim();
-                    
-                    if (!line) continue;
-                    
-                    // Match: Type varName; or Type varName = ...;
-                    const localDeclPattern = /\b([A-Z]\w+|int|float|bool|string|auto|vector|ref|autoptr)\s+(\w+)\s*(?:[=;,])/g;
-                    let m;
-                    while ((m = localDeclPattern.exec(line)) !== null) {
-                        const typeName = m[1];
-                        const varName = m[2];
-                        
-                        // Skip if type is a keyword/modifier
-                        if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum',
-                             'else', 'case', 'override', 'static', 'private', 'protected', 'ref', 'autoptr',
-                             'const', 'proto', 'native', 'Print', 'foreach'].includes(typeName)) {
-                            continue;
-                        }
-                        // Skip if varName is a keyword
-                        if (['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'true', 'false', 'null'].includes(varName)) {
-                            continue;
-                        }
-                        
-                        addVar(varName, typeName, lineIdx, funcEnd);
-                    }
-                    
-                    // Match foreach variable declarations: foreach (Type varName : collection)
-                    const foreachPattern = /\bforeach\s*\(\s*([A-Z]\w+|int|float|bool|string|auto)\s+(\w+)\s*:/g;
-                    let fm;
-                    while ((fm = foreachPattern.exec(line)) !== null) {
-                        addVar(fm[2], fm[1], lineIdx, funcEnd);
-                    }
-                }
-            };
-            
-            for (const node of ast.body) {
-                if (node.kind === 'ClassDecl') {
-                    const classNode = node as ClassDeclNode;
-                    for (const member of classNode.members || []) {
-                        if (member.kind === 'FunctionDecl') {
-                            const func = member as FunctionDeclNode;
-                            const funcStart = func.start?.line ?? 0;
-                            const funcEnd = func.end?.line ?? 0;
-                            if (funcEnd > funcStart) {
-                                scanFunctionBody(funcStart, funcEnd);
-                            }
-                        }
-                    }
-                }
-                if (node.kind === 'FunctionDecl') {
-                    const func = node as FunctionDeclNode;
-                    const funcStart = func.start?.line ?? 0;
-                    const funcEnd = func.end?.line ?? 0;
-                    if (funcEnd > funcStart) {
-                        scanFunctionBody(funcStart, funcEnd);
-                    }
-                }
-            }
-        }
-        
+    private checkFunctionCallArgs(
+        doc: TextDocument,
+        diags: Diagnostic[],
+        text: string,
+        lines: string[],
+        lineOffsets: number[],
+        ast: File,
+        scopedVars: Map<string, { type: string; startLine: number; endLine: number; isClassField: boolean }[]>
+    ): void {
+        // Variable type lookup — uses simple smallest-range heuristic (no isClassField
+        // distinction), with resolveVariableType fallback for cross-file resolution.
         const getVarTypeAtLine = (name: string, line: number): string | undefined => {
-            const entries = varTypes.get(name);
+            const entries = scopedVars.get(name);
             if (entries) {
                 let best: { type: string; startLine: number; endLine: number } | undefined;
                 for (const e of entries) {
@@ -4179,47 +4085,6 @@ export class Analyzer {
             // Fall back to full cross-file resolution (globals, class hierarchy, etc.)
             const pos: Position = { line, character: 0 };
             return this.resolveVariableType(doc, pos, name) ?? undefined;
-        };
-        
-        // Helper: check if position is in comment or string
-        const isInsideCommentOrString = (position: number): boolean => {
-            let lineStart = text.lastIndexOf('\n', position) + 1;
-            let lineEnd = text.indexOf('\n', position);
-            if (lineEnd === -1) lineEnd = text.length;
-            const line = text.substring(lineStart, lineEnd);
-            const posInLine = position - lineStart;
-            
-            const commentIdx = line.indexOf('//');
-            if (commentIdx >= 0 && commentIdx < posInLine) return true;
-            
-            let i = position - 1;
-            while (i >= 0) {
-                if (i > 0 && text[i-1] === '*' && text[i] === '/') break;
-                if (i > 0 && text[i-1] === '/' && text[i] === '*') return true;
-                i--;
-            }
-            
-            let inStr = false;
-            let sCh = '';
-            for (let j = 0; j < posInLine; j++) {
-                const ch = line[j];
-                if (!inStr && (ch === '"' || ch === "'")) { inStr = true; sCh = ch; }
-                else if (inStr && ch === sCh) {
-                    let backslashCount = 0;
-                    let bi = j - 1;
-                    while (bi >= 0 && line[bi] === '\\') { backslashCount++; bi--; }
-                    if (backslashCount % 2 === 0) { inStr = false; }
-                }
-            }
-            return inStr;
-        };
-        
-        const getLineFromPos = (pos: number): number => {
-            let line = 0;
-            for (let i = 0; i < pos && i < text.length; i++) {
-                if (text[i] === '\n') line++;
-            }
-            return line;
         };
         
         // Keywords and built-ins that look like function calls but aren't
@@ -4237,7 +4102,7 @@ export class Analyzer {
         let match: RegExpExecArray | null;
         
         while ((match = callPattern.exec(text)) !== null) {
-            if (isInsideCommentOrString(match.index)) continue;
+            if (Analyzer.isInsideCommentOrStringAt(text, match.index)) continue;
             
             const funcName = match[1];
             if (skipNames.has(funcName)) continue;
@@ -4308,7 +4173,7 @@ export class Analyzer {
             
             // Determine if this is a method call or global call
             const textBeforeFunc = text.substring(Math.max(0, match.index - 200), match.index);
-            const lineNum = getLineFromPos(match.index);
+            const lineNum = Analyzer.getLineFromOffset(lineOffsets, match.index);
             
             let overloads: FunctionDeclNode[] = [];
             let chainAttempted = false;
@@ -4609,9 +4474,7 @@ export class Analyzer {
      *   Print("text" +
      *       "more text");  // ERROR!
      */
-    private checkMultiLineStatements(doc: TextDocument, diags: Diagnostic[]): void {
-        const text = this.stripSkippedIfdefRegions(doc.getText());
-        const lines = text.split('\n');
+    private checkMultiLineStatements(doc: TextDocument, diags: Diagnostic[], text: string, lines: string[]): void {
         
         // Track if we're inside a block comment
         let inBlockComment = false;
