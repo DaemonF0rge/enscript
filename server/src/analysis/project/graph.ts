@@ -1227,6 +1227,24 @@ export class Analyzer {
     }
 
     /**
+     * Check if a chain/expression text contains `[...]` indexing OUTSIDE of
+     * parenthesised argument lists.  e.g.:
+     *   ".GetOrientation()[0]"            → true   ([0] is after the call)
+     *   ".GetAimDelta(pDt)[0] * RAD2DEG"  → true
+     *   ".GetSurface(pos[0], pos[2])"     → false  ([0]/[2] inside args)
+     */
+    private hasIndexingAfterCall(text: string): boolean {
+        let parenDepth = 0;
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (ch === '(') parenDepth++;
+            else if (ch === ')') { if (parenDepth > 0) parenDepth--; }
+            else if (ch === '[' && parenDepth === 0) return true;
+        }
+        return false;
+    }
+
+    /**
      * Find the TypedefNode for a given type name.
      * Returns null if the type is not a typedef.
      * Uses the pre-built typedef index for O(1) lookup.
@@ -1420,10 +1438,23 @@ export class Analyzer {
         }
         
         // If no chained calls, return the first function's resolved type
-        if (calls.length === 0) return currentType;
+        if (calls.length === 0) {
+            // Check for array indexing after the single call, e.g., GetOrientation()[0]
+            if (this.hasIndexingAfterCall(afterFirst)) {
+                return this.resolveIndexedType(currentType);
+            }
+            return currentType;
+        }
         
         // Delegate remaining chain steps
-        return this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        const result = this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        
+        // If the chain contains array indexing outside of args, resolve to element type
+        if (result && this.hasIndexingAfterCall(afterFirst)) {
+            return this.resolveIndexedType(result);
+        }
+        
+        return result;
     }
 
     /**
@@ -1455,14 +1486,13 @@ export class Analyzer {
         
         const result = this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
         
-        // If the chain text ends with array indexing like [expr],
-        // the result is the element type, not the container type.
-        // Since we don't always know the element type, return null to avoid
-        // false type mismatch errors.
-        if (result && /\[.*\]\s*$/.test(chainText)) {
-            if (['array', 'set', 'map'].includes(result)) {
-                return null;
-            }
+        // If the chain contains array indexing like [expr] after the last
+        // method call, resolve to the element type. Matches [0], [i], etc.
+        // even when followed by arithmetic like * Math.RAD2DEG.
+        // Uses hasIndexingAfterCall to avoid false positives from []
+        // inside function arguments like .GetSurface(pos[0], pos[2]).
+        if (result && this.hasIndexingAfterCall(chainText)) {
+            return this.resolveIndexedType(result);
         }
         
         return result;
@@ -3969,7 +3999,7 @@ export class Analyzer {
         
         // Keywords and built-ins that look like function calls but aren't
         const skipNames = new Set([
-            'if', 'while', 'for', 'foreach', 'switch', 'return', 'new', 'delete',
+            'if', 'while', 'for', 'foreach', 'switch', 'case', 'return', 'new', 'delete',
             'super', 'this', 'class', 'enum', 'typedef', 'Print', 'PrintFormat',
             'cast', 'sizeof', 'typeof', 'typename', 'thread', 'ref',
             'array', 'set', 'map', 'autoptr'
