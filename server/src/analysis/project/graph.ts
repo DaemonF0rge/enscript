@@ -254,6 +254,9 @@ export class Analyzer {
     /** Typedef index: name -> TypedefNode */
     private typedefIndex: Map<string, TypedefNode> = new Map();
     
+    /** Constructor index: className -> className (tracks which class names have constructors) */
+    private constructorIndex: Map<string, string> = new Map();
+    
     /** Update all indexes from a file's AST */
     private updateAllIndexes(uri: string, ast: File): void {
         // Remove old entries from this URI
@@ -265,13 +268,21 @@ export class Analyzer {
             
             if (node.kind === 'ClassDecl') {
                 const classNode = node as ClassDeclNode;
-                (classNode as any)._sourceUri = uri;  // Tag with source URI for removal
+                (classNode as any)._sourceUri = uri;
                 let existing = this.classIndex.get(node.name);
                 if (!existing) {
                     existing = [];
                     this.classIndex.set(node.name, existing);
                 }
                 existing.push(classNode);
+                
+                // Track constructors: any member function whose name matches the class name
+                for (const member of classNode.members || []) {
+                    if (member.kind === 'FunctionDecl' && member.name === node.name) {
+                        this.constructorIndex.set(node.name, node.name);
+                        break;
+                    }
+                }
             } else if (node.kind === 'EnumDecl') {
                 (node as any)._sourceUri = uri;
                 this.enumIndex.set(node.name, node as EnumDeclNode);
@@ -324,6 +335,14 @@ export class Analyzer {
         for (const [name, node] of this.typedefIndex) {
             if ((node as any)._sourceUri === uri) {
                 this.typedefIndex.delete(name);
+            }
+        }
+        
+        // Remove constructor index entries for classes that were removed
+        // Re-check: if classIndex no longer has the name, remove from constructorIndex
+        for (const [name] of this.constructorIndex) {
+            if (!this.classIndex.has(name)) {
+                this.constructorIndex.delete(name);
             }
         }
     }
@@ -1032,7 +1051,12 @@ export class Analyzer {
      * Searches top-level functions and class methods across all indexed files
      */
     private resolveFunctionReturnType(funcName: string): string | null {
-        return this.resolveFunctionReturnTypeNode(funcName)?.identifier ?? null;
+        const result = this.resolveFunctionReturnTypeNode(funcName)?.identifier ?? null;
+        // Implicit constructors: class/typedef exists but has no explicit constructor declaration
+        if (!result && (this.classIndex.has(funcName) || this.typedefIndex.has(funcName))) {
+            return funcName;
+        }
+        return result;
     }
 
     /**
@@ -1040,6 +1064,13 @@ export class Analyzer {
      * Uses pre-built indexes for fast lookup.
      */
     private resolveFunctionReturnTypeNode(funcName: string): TypeNode | null {
+        
+        // Check if this is a constructor call via the pre-built index (O(1))
+        const ctorClass = this.constructorIndex.get(funcName);
+        if (ctorClass) {
+            // Constructors are declared void but return an instance of the class
+            return { identifier: ctorClass, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
+        }
         
         // Check top-level functions via function index (O(1))
         const funcs = this.functionIndex.get(funcName);
@@ -1151,6 +1182,12 @@ export class Analyzer {
      * Includes genericArgs for template types like map<string, int>.
      */
     private resolveMethodReturnTypeNode(className: string, methodName: string): TypeNode | null {
+        // Constructor call: if looking up a method whose name matches a known constructor
+        const ctorClass = this.constructorIndex.get(methodName);
+        if (ctorClass) {
+            return { identifier: ctorClass, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
+        }
+        
         // Resolve typedefs first (e.g., testMapType → map)
         const resolvedClass = this.resolveTypedef(className);
         const visited = new Set<string>();
@@ -1479,7 +1516,14 @@ export class Analyzer {
         
         // Resolve the first function's return type
         const firstTypeNode = this.resolveFunctionReturnTypeNode(firstFunc);
-        if (!firstTypeNode?.identifier) return null;
+        if (!firstTypeNode?.identifier) {
+            // No return type found — check if it's an implicit constructor (class/typedef with no declaration)
+            if (this.classIndex.has(firstFunc) || this.typedefIndex.has(firstFunc)) {
+                if (calls.length === 0) return firstFunc;
+                return this.resolveVariableChainType(firstFunc, calls.join('.'));
+            }
+            return null;
+        }
         
         let currentType = firstTypeNode.identifier;
         
@@ -4139,9 +4183,9 @@ export class Analyzer {
             if (declCheck) {
                 // Could be a declaration. Check more carefully — if the next non-whitespace
                 // before the type name is '{', ';', or start-of-line, it's a declaration
-                const typeName = declCheck[0].trim();
+                const fullMatch = declCheck[0]; // includes trailing whitespace
                 // Skip if it looks like a declaration context (not preceded by = or , or ( )
-                const preDeclText = text.substring(Math.max(0, match.index - 80), match.index - typeName.length).trimEnd();
+                const preDeclText = text.substring(Math.max(0, match.index - 80), match.index - fullMatch.length).trimEnd();
                 const lastChar = preDeclText[preDeclText.length - 1];
                 if (!lastChar || lastChar === '{' || lastChar === '}' || lastChar === ';' || lastChar === ')' || lastChar === '\n') {
                     continue; // It's a declaration, skip
@@ -4400,6 +4444,12 @@ export class Analyzer {
             }
             
             if (overloads.length === 0) {
+                // Skip if the function name is a known class or typedef — it's a constructor call
+                // e.g., TStringArray() where TStringArray is typedef array<string>
+                if (this.classIndex.has(funcName) || this.typedefIndex.has(funcName)) {
+                    continue;
+                }
+                
                 // Warn about unknown functions only when the index is large enough to be confident
                 if (this.docCache.size >= 500) {
                     // Skip warning for chain calls where we couldn't resolve the target type —
