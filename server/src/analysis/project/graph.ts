@@ -2570,6 +2570,12 @@ export class Analyzer {
         if (ast.diagnostics && ast.diagnostics.length > 0) {
             diags.push(...ast.diagnostics);
         }
+
+        // ── Multi-line string literal detection ───────────────────────────
+        // Enforce Script does not support multi-line strings.
+        // Scan the raw text for string literals that span multiple lines.
+        // Done here (not in the parser) so it works even when parsing fails.
+        this.checkMultiLineStrings(doc, diags);
         
         // ── Build shared diagnostic context once ───────────────────────────
         // These pre-computed values are passed to each checker so the
@@ -2602,6 +2608,7 @@ export class Analyzer {
         // Check for multi-line statements (not supported in Enforce Script)
         // This doesn't require indexing - it's purely syntactic
         this.checkMultiLineStatements(doc, diags, text, lines);
+
         
         // Check for duplicate variable declarations in same scope
         // Now AST-based: uses parser's locals with scopeEnd ranges instead
@@ -4340,6 +4347,63 @@ export class Analyzer {
     }
 
     /**
+     * Check for multi-line string literals (not supported in Enforce Script).
+     * Scans the raw text for quoted strings that span across newlines.
+     * This runs independently of the parser so it works even when parsing fails.
+     */
+    private checkMultiLineStrings(doc: TextDocument, diags: Diagnostic[]): void {
+        const text = doc.getText();
+        let i = 0;
+        while (i < text.length) {
+            const ch = text[i];
+
+            // Skip single-line comments
+            if (ch === '/' && text[i + 1] === '/') {
+                while (i < text.length && text[i] !== '\n') i++;
+                continue;
+            }
+            // Skip block comments
+            if (ch === '/' && text[i + 1] === '*') {
+                i += 2;
+                while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                i += 2;
+                continue;
+            }
+
+            // String literal
+            if (ch === '"') {
+                const start = i;
+                i++; // skip opening quote
+                let hasNewline = false;
+                while (i < text.length && text[i] !== '"') {
+                    if (text[i] === '\\' && i + 1 < text.length) {
+                        i += 2; // skip escape sequence
+                    } else {
+                        if (text[i] === '\n') hasNewline = true;
+                        i++;
+                    }
+                }
+                i++; // skip closing quote (or end of file)
+
+                if (hasNewline) {
+                    diags.push({
+                        range: {
+                            start: doc.positionAt(start),
+                            end: doc.positionAt(i)
+                        },
+                        message: 'Multi-line string literals are not supported in Enforce Script. Use string concatenation with + instead.',
+                        severity: DiagnosticSeverity.Error,
+                        source: 'enforce-script'
+                    });
+                }
+                continue;
+            }
+
+            i++;
+        }
+    }
+
+    /**
      * Check for multi-line statements which are NOT supported in Enforce Script.
      * Each statement must be on a single line.
      * 
@@ -4395,7 +4459,29 @@ export class Analyzer {
             // Skip declaration starts (class, if, for, etc.)
             const isDeclarationStart = /^(class|modded|enum|struct|typedef|if|else|for|while|switch|foreach)\b/.test(line);
             
-            if (unclosedParens && !endsWithTerminator && !isDeclarationStart && i + 1 < lines.length) {
+            // Skip preprocessor lines
+            if (line.startsWith('#')) continue;
+            
+            // Detect expression continuation via operators:
+            //   string x = "a" + b +     ← line ends with binary operator
+            //       "c";
+            const endsWithBinaryOp = /(?:\+(?!\+)|-(?!-)|[*\/%&|^~]|&&|\|\|)\s*$/.test(line);
+            
+            // Detect continuation on next line starting with operator:
+            //   string x = "a" + b       ← line does NOT end with ; or operator
+            //       + "c";               ← next line STARTS with +
+            let nextLineContinuation = false;
+            if (!unclosedParens && !endsWithBinaryOp && !endsWithTerminator && !isDeclarationStart) {
+                let nextIdx = i + 1;
+                while (nextIdx < lines.length && !lines[nextIdx].trim()) nextIdx++;
+                if (nextIdx < lines.length) {
+                    const nextTrimmed = lines[nextIdx].trim();
+                    // Next line starts with a binary operator (but not ++ or --)
+                    nextLineContinuation = /^(?:\+(?!\+)|-(?!-)|[*\/%]|&&|\|\||\.(?!\.))/.test(nextTrimmed);
+                }
+            }
+            
+            if ((unclosedParens || endsWithBinaryOp || nextLineContinuation) && !endsWithTerminator && !isDeclarationStart && i + 1 < lines.length) {
                 // Check if next non-empty line continues this statement
                 let nextLineIdx = i + 1;
                 while (nextLineIdx < lines.length && !lines[nextLineIdx].trim()) {

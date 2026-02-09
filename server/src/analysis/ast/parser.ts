@@ -187,26 +187,6 @@ export function parse(
     // ====================================================================
     const diagnostics: Diagnostic[] = [];
     
-    // ====================================================================
-    // MULTI-LINE STRING DETECTION
-    // ====================================================================
-    // Enforce Script does not support multi-line string literals.
-    // Detect any string token that spans multiple lines and report an error.
-    // ====================================================================
-    for (const tok of toks) {
-        if (tok.kind === TokenKind.String && tok.value.includes('\n')) {
-            diagnostics.push({
-                range: {
-                    start: doc.positionAt(tok.start),
-                    end: doc.positionAt(tok.end)
-                },
-                message: 'Multi-line string literals are not supported in Enforce Script. Use string concatenation with + instead.',
-                severity: DiagnosticSeverity.Error,
-                source: 'enforce-script'
-            });
-        }
-    }
-    
     /**
      * Add a diagnostic error or warning
      */

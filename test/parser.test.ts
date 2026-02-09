@@ -254,6 +254,26 @@ test('comparison > across functions does not false-positive', () => {
     expect(falseLocals.length).toBe(0);
 });
 
+test('multi-line string detection moved to runDiagnostics', () => {
+    // Multi-line string detection was moved from the parser to Analyzer.runDiagnostics()
+    // so it works even when the parser throws a ParseError.
+    // The parser itself should NOT produce multi-line string diagnostics anymore.
+    const code = 'class Foo {\n    void Bar() {\n        string s = "hello\nworld";\n    }\n};';
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const mlDiag = ast.diagnostics.find(d => d.message.includes('Multi-line string'));
+    expect(mlDiag).toBeUndefined();
+});
+
+test('no false positive for single-line strings', () => {
+    const code = 'class Foo {\n    void Bar() {\n        string s = "hello" + " " + "world";\n    }\n};';
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    // Should NOT have a multi-line string diagnostic
+    const mlDiag = ast.diagnostics.find(d => d.message.includes('Multi-line string'));
+    expect(mlDiag).toBeUndefined();
+});
+
 test('playground', () => {
     const target_file = path.join("P:\\enscript\\test", "test_enscript.c");
     const text = fs.readFileSync(target_file, "utf8");
