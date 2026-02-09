@@ -57,7 +57,7 @@
             "properties": {
                 "enscript.includePaths": {
                     "type": "array",
-                    "default": [],
+                    "default": ["P:\\scripts"],
                     "description": "List of paths to index for base game data (e.g. P:\\scripts\\ folder)",
                     "items": {
                         "type": "string"
