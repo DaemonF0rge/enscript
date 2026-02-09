@@ -4446,26 +4446,33 @@ export class Analyzer {
             const closeBraces = (line.match(/\}/g) || []).length;
             braceDepth += openBraces - closeBraces;
             
+            // Strip inline comments before checking operators/terminators
+            // "x = 1.0; // 100%" → "x = 1.0;" (otherwise % looks like a binary op)
+            const codePart = line.replace(/\/\/.*$/, '').trimEnd();
+            
+            // Skip lines that are only a comment (nothing left after stripping)
+            if (!codePart) continue;
+            
             // Only check for unclosed parentheses - this is the real multi-line issue
             // e.g., Print("text" +
             //         "more");   <-- not allowed in Enforce Script
-            const openParens = (line.match(/\(/g) || []).length;
-            const closeParens = (line.match(/\)/g) || []).length;
+            const openParens = (codePart.match(/\(/g) || []).length;
+            const closeParens = (codePart.match(/\)/g) || []).length;
             const unclosedParens = openParens > closeParens;
             
             // Skip lines ending with { or ; or } - those are complete
-            const endsWithTerminator = /[{};]\s*$/.test(line);
+            const endsWithTerminator = /[{};]\s*$/.test(codePart);
             
             // Skip declaration starts (class, if, for, etc.)
-            const isDeclarationStart = /^(class|modded|enum|struct|typedef|if|else|for|while|switch|foreach)\b/.test(line);
+            const isDeclarationStart = /^(class|modded|enum|struct|typedef|if|else|for|while|switch|foreach)\b/.test(codePart);
             
             // Skip preprocessor lines
-            if (line.startsWith('#')) continue;
+            if (codePart.startsWith('#')) continue;
             
             // Detect expression continuation via operators:
             //   string x = "a" + b +     ← line ends with binary operator
             //       "c";
-            const endsWithBinaryOp = /(?:\+(?!\+)|-(?!-)|[*\/%&|^~]|&&|\|\|)\s*$/.test(line);
+            const endsWithBinaryOp = /(?:\+(?!\+)|-(?!-)|[*\/%&|^~]|&&|\|\|)\s*$/.test(codePart);
             
             // Detect continuation on next line starting with operator:
             //   string x = "a" + b       ← line does NOT end with ; or operator
