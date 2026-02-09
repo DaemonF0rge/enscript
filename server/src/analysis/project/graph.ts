@@ -1269,6 +1269,38 @@ export class Analyzer {
     }
 
     /**
+     * Check if text contains a top-level comparison or boolean operator.
+     * "Top-level" means not inside parentheses or brackets.
+     * Used to detect expressions like: item.GetType() == receiver_item.GetType()
+     * where the overall result is bool, even though individual calls return string.
+     */
+    private hasTopLevelComparisonOperator(text: string): boolean {
+        let depth = 0;
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            // Skip over string literals so operators inside strings are ignored
+            if (ch === '"' || ch === "'") {
+                const q = ch;
+                i++;
+                while (i < text.length && text[i] !== q) {
+                    if (text[i] === '\\') i++;
+                    i++;
+                }
+                continue;
+            }
+            if (ch === '(' || ch === '[') { depth++; continue; }
+            if (ch === ')' || ch === ']') { if (depth > 0) depth--; continue; }
+            if (depth > 0) continue;
+            // Check for two-character operators first
+            const next = i + 1 < text.length ? text[i + 1] : '';
+            if ((ch === '=' || ch === '!' || ch === '<' || ch === '>') && next === '=') return true;
+            if (ch === '&' && next === '&') return true;
+            if (ch === '|' && next === '|') return true;
+        }
+        return false;
+    }
+
+    /**
      * Find the TypedefNode for a given type name.
      * Returns null if the type is not a typedef.
      * Uses the pre-built typedef index for O(1) lookup.
@@ -3275,6 +3307,15 @@ export class Analyzer {
             }
             
             if (returnType) {
+                // Skip if the full RHS contains a comparison/boolean operator and declared type is bool
+                // e.g., bool equal_typed = item.GetType() == receiver_item.GetType();
+                if (declaredType === 'bool') {
+                    const stmtEnd1 = afterMatch.indexOf(';');
+                    const fullRhs = funcName + '(' + afterMatch.substring(0, stmtEnd1 >= 0 ? stmtEnd1 : afterMatch.length);
+                    if (this.hasTopLevelComparisonOperator(fullRhs)) {
+                        continue;
+                    }
+                }
                 this.addTypeMismatchDiagnostic(doc, diags, match.index, highlightLength, declaredType, returnType);
             }
         }
@@ -3502,6 +3543,14 @@ export class Analyzer {
                 if (targetType === returnType) {
                     continue;
                 }
+                // Skip if the full RHS contains a comparison/boolean operator and target type is bool
+                if (targetType === 'bool') {
+                    const stmtEnd4 = afterMatch.indexOf(';');
+                    const fullRhs4 = funcName + '(' + afterMatch.substring(0, stmtEnd4 >= 0 ? stmtEnd4 : afterMatch.length);
+                    if (this.hasTopLevelComparisonOperator(fullRhs4)) {
+                        continue;
+                    }
+                }
                 // Calculate actual start position (skip the leading delimiter and whitespace)
                 const actualStart = match.index + 1 + leadingWhitespace.length;
                 const actualLength = match[0].length - 1 - leadingWhitespace.length + chainEnd;
@@ -3550,6 +3599,13 @@ export class Analyzer {
             // Calculate highlight: from match start to end of chain (before semicolon)
             const highlightLength = match[0].length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
             
+            // Skip if the full RHS contains a comparison/boolean operator and declared type is bool
+            if (declaredType === 'bool') {
+                const fullRhs5 = chainText; // chainText is everything from '.' to ';'
+                if (this.hasTopLevelComparisonOperator(fullRhs5)) {
+                    continue;
+                }
+            }
             this.addTypeMismatchDiagnostic(doc, diags, match.index, highlightLength, declaredType, returnType);
         }
         
@@ -3596,6 +3652,13 @@ export class Analyzer {
             
             if (/^[A-Z]$/.test(targetType) || /^[A-Z]$/.test(returnType)) continue;
             if (targetType === returnType) continue;
+            
+            // Skip if the full RHS contains a comparison/boolean operator and target type is bool
+            if (targetType === 'bool') {
+                if (this.hasTopLevelComparisonOperator(chainText)) {
+                    continue;
+                }
+            }
             
             const actualStart = match.index + 1 + leadingWs.length;
             const actualLength = match[0].length - 1 - leadingWs.length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
@@ -3738,6 +3801,11 @@ export class Analyzer {
     ): string | null {
         const arg = argText.trim();
         if (!arg) return null;
+        
+        // If the argument contains a top-level comparison/boolean operator,
+        // the expression evaluates to bool regardless of operand types.
+        // e.g., pm.CreateParticleByPath(path, pp) == null  →  bool
+        if (this.hasTopLevelComparisonOperator(arg)) return 'bool';
         
         // String literal
         if (arg.startsWith('"') || arg.startsWith("'")) return 'string';
@@ -4101,7 +4169,12 @@ export class Analyzer {
             }
             if (depth !== 0) continue; // Unbalanced parens
             
-            const argsText = text.substring(argsStart, pos - 1).trim();
+            // Strip /* ... */ block comments from args text — DayZ convention uses
+            // these to comment out parameters that still exist in the engine.
+            // e.g., Func(item/*, widget*/, x) → Func(item            , x)
+            // Replace with spaces to preserve character positions for line counting.
+            const rawArgsText = text.substring(argsStart, pos - 1).trim();
+            const argsText = rawArgsText.replace(/\/\*[\s\S]*?\*\//g, m => ' '.repeat(m.length)).trim();
             const argStrings = argsText ? this.parseCallArguments(argsText) : [];
             const argCount = argStrings.length;
             
@@ -4502,7 +4575,13 @@ export class Analyzer {
             
             // Strip inline comments before checking operators/terminators
             // "x = 1.0; // 100%" → "x = 1.0;" (otherwise % looks like a binary op)
-            const codePart = line.replace(/\/\/.*$/, '').trimEnd();
+            // Neutralize string contents (replace chars with spaces) so "//" inside strings
+            // isn't treated as a comment. Must preserve length so indices stay aligned.
+            // e.g., GetGame().OpenURL("https://example.com");  — the :// is NOT a comment
+            const neutralized = line.replace(/"(?:[^"\\]|\\.)*"/g, m => '"' + ' '.repeat(m.length - 2) + '"')
+                                    .replace(/'(?:[^'\\]|\\.)*'/g, m => "'" + ' '.repeat(m.length - 2) + "'");
+            const commentIdx = neutralized.indexOf('//');
+            const codePart = (commentIdx >= 0 ? line.substring(0, commentIdx) : line).trimEnd();
             
             // Skip lines that are only a comment (nothing left after stripping)
             if (!codePart) continue;
@@ -4514,8 +4593,9 @@ export class Analyzer {
             const closeParens = (codePart.match(/\)/g) || []).length;
             const unclosedParens = openParens > closeParens;
             
-            // Skip lines ending with { or ; or } - those are complete
-            const endsWithTerminator = /[{};]\s*$/.test(codePart);
+            // Skip lines ending with { or ; or } or , - those are complete
+            // Comma handles enum values, array initializers, etc.
+            const endsWithTerminator = /[{};,]\s*$/.test(codePart);
             
             // Skip declaration starts (class, if, for, etc.)
             const isDeclarationStart = /^(class|modded|enum|struct|typedef|if|else|for|while|switch|foreach)\b/.test(codePart);

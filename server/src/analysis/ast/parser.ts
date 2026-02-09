@@ -262,7 +262,35 @@ export function parse(
     /* scan parameter list quickly, ignore default values */
     const fastParamScan = (doc: TextDocument): VarDeclNode[] => {
         const list: VarDeclNode[] = [];
+        const parenStart = pos; // save position before '('
         expect('(');
+        
+        // Count commented-out parameters: block comments between ( and ) that
+        // contain commas indicate hidden engine parameters. This is a DayZ convention:
+        //   void Func(EntityAI item/*, Widget w*/, int x = 0)
+        // Here "Widget w" is commented out but still exists in the engine.
+        // We need to count these so callers passing the right number of args aren't flagged.
+        let commentedParamCount = 0;
+        {
+            let scanPos = parenStart + 1; // after '('
+            let scanDepth = 1;
+            while (scanPos < toks.length && scanDepth > 0) {
+                const tok = toks[scanPos];
+                if (tok.value === '(') scanDepth++;
+                else if (tok.value === ')') { scanDepth--; if (scanDepth === 0) break; }
+                if (tok.kind === TokenKind.Comment && tok.value.startsWith('/*')) {
+                    // Count commas inside this block comment — each comma = one hidden param boundary
+                    // But we also need to count the param itself if it doesn't end with a comma
+                    // Simple heuristic: if the comment contains what looks like a type+name, count it
+                    const commentContent = tok.value.slice(2, -2).trim();
+                    // Count the number of comma-separated segments that look like parameters
+                    const segments = commentContent.split(',').map(s => s.trim()).filter(s => s.length > 0);
+                    commentedParamCount += segments.length;
+                }
+                scanPos++;
+            }
+        }
+        
         while (!eof() && peek().value !== ')') {
             const varDecl = expectVarDecl(doc, true);
             // Skip any remaining tokens until ')' or ',' (default values are already consumed by parseDecl)
@@ -275,6 +303,31 @@ export function parse(
         }
 
         expect(')');
+        
+        // Add dummy parameters for commented-out engine params
+        for (let ci = 0; ci < commentedParamCount; ci++) {
+            list.push({
+                kind: 'VarDecl',
+                uri: doc.uri,
+                name: `__commented_param_${ci}`,
+                nameStart: { line: 0, character: 0 },
+                nameEnd: { line: 0, character: 0 },
+                type: {
+                    kind: 'Type',
+                    uri: doc.uri,
+                    identifier: 'void',
+                    start: { line: 0, character: 0 },
+                    end: { line: 0, character: 0 },
+                    arrayDims: [],
+                    modifiers: [],
+                },
+                annotations: [],
+                modifiers: [],
+                start: { line: 0, character: 0 },
+                end: { line: 0, character: 0 },
+                hasDefault: true, // Mark as optional so callers can omit
+            } as VarDeclNode);
+        }
 
         return list;
     };
