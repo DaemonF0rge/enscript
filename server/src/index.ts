@@ -14,7 +14,6 @@ import * as fs from 'fs/promises';
 import { findAllFiles, readFileUtf8 } from './util/fs';
 import { Analyzer } from './analysis/project/graph';
 import { getConfiguration } from './util/config';
-import { ASTCache } from './analysis/project/cache';
 
 
 // Create LSP connection (stdio or Node IPC autodetect).
@@ -59,28 +58,38 @@ connection.onInitialized(async () => {
 
     const pathsToIndex = [workspaceRoot, ...includePaths];
     const allFiles: string[] = [];
+    const seenRealPaths = new Set<string>();
 
     for (const basePath of pathsToIndex) {
         console.log(`Adding folder ${basePath} to indexing`);
         try {
             const files = await findAllFiles(basePath, ['.c']);
-            allFiles.push(...files);
+            for (const file of files) {
+                // Deduplicate by resolved real path (handles subst drives, junctions, symlinks)
+                try {
+                    const realPath = await fs.realpath(file);
+                    const normalizedReal = realPath.toLowerCase();
+                    if (!seenRealPaths.has(normalizedReal)) {
+                        seenRealPaths.add(normalizedReal);
+                        allFiles.push(file);
+                    }
+                } catch {
+                    // If realpath fails, include the file anyway
+                    allFiles.push(file);
+                }
+            }
         } catch (err) {
             console.warn(`Failed to scan path: ${basePath} – ${String(err)}`);
         }
     }
 
-    console.log(`Indexing ${allFiles.length} EnScript files...`);
+    console.log(`Indexing ${allFiles.length} EnScript files (${seenRealPaths.size} unique)...`);
 
     // Notify client that indexing is starting
     connection.sendNotification('enscript/indexingStart', { 
         fileCount: allFiles.length
     });
 
-    // Initialize persistent AST cache for faster subsequent launches
-    const astCache = new ASTCache(workspaceRoot);
-    let cacheHits = 0;
-    let cacheMisses = 0;
     const startTime = Date.now();
     let lastProgressUpdate = 0;
 
@@ -88,24 +97,9 @@ connection.onInitialized(async () => {
         const filePath = allFiles[i];
         const uri = url.pathToFileURL(filePath).toString();
         
-        // Try to load from persistent cache first
-        const cachedAst = astCache.get(filePath);
-        if (cachedAst) {
-            // Cache hit - inject directly into Analyzer's memory cache
-            Analyzer.instance().injectCachedAST(uri, cachedAst);
-            cacheHits++;
-        } else {
-            // Cache miss - need to read and parse
-            const text = await readFileUtf8(filePath);
-            const doc = TextDocument.create(uri, 'enscript', 1, text);
-            const ast = Analyzer.instance().parseAndCache(doc);
-            
-            // Store in persistent cache for next launch
-            if (ast && ast.body.length > 0) {
-                astCache.set(filePath, ast);
-            }
-            cacheMisses++;
-        }
+        const text = await readFileUtf8(filePath);
+        const doc = TextDocument.create(uri, 'enscript', 1, text);
+        Analyzer.instance().parseAndCache(doc);
 
         // Send progress updates every 500ms or every 100 files
         const now = Date.now();
@@ -118,9 +112,6 @@ connection.onInitialized(async () => {
             lastProgressUpdate = now;
         }
     }
-
-    // Save the cache to disk
-    astCache.save();
     
     const elapsed = Date.now() - startTime;
 
@@ -132,7 +123,6 @@ connection.onInitialized(async () => {
         `${stats.enums} enums, ${stats.typedefs} typedefs, ${stats.globals} globals` +
         (stats.parseErrors > 0 ? ` (${stats.parseErrors} parse errors)` : '')
     );
-    console.log(`  Cache: ${cacheHits} hits, ${cacheMisses} misses (${cacheHits > 0 ? Math.round(cacheHits / (cacheHits + cacheMisses) * 100) : 0}% hit rate)`);
     // Log per-module file counts
     const modParts = Object.entries(stats.moduleCounts)
         .sort(([a], [b]) => Number(a) - Number(b))

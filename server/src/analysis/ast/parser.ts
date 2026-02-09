@@ -187,6 +187,26 @@ export function parse(
     // ====================================================================
     const diagnostics: Diagnostic[] = [];
     
+    // ====================================================================
+    // MULTI-LINE STRING DETECTION
+    // ====================================================================
+    // Enforce Script does not support multi-line string literals.
+    // Detect any string token that spans multiple lines and report an error.
+    // ====================================================================
+    for (const tok of toks) {
+        if (tok.kind === TokenKind.String && tok.value.includes('\n')) {
+            diagnostics.push({
+                range: {
+                    start: doc.positionAt(tok.start),
+                    end: doc.positionAt(tok.end)
+                },
+                message: 'Multi-line string literals are not supported in Enforce Script. Use string concatenation with + instead.',
+                severity: DiagnosticSeverity.Error,
+                source: 'enforce-script'
+            });
+        }
+    }
+    
     /**
      * Add a diagnostic error or warning
      */
@@ -574,7 +594,14 @@ export function parse(
                     // walk backwards past balanced angle brackets to find the actual type name.
                     // The '>>' token represents two closing brackets (nested generics like
                     // map<int, array<float>>) and must be counted as 2.
-                    if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',' || t.value === ':')) {
+                    //
+                    // IMPORTANT: The walk-back must stop at statement/scope boundaries
+                    // (';', '{', '}') because comparison operators also use '<' and '>'.
+                    // Without this, expressions like `tier.radius > maxSafeRadius;` can
+                    // walk back to `<` from a for-loop condition `i < tierCount`, falsely
+                    // detecting `i maxSafeRadius` as a generic-typed variable declaration.
+                    // Valid generic types like `array<int>` never span these boundaries.
+                    if (prev && prevPrev && (t.value === ';' || t.value === '=' || t.value === ',' || t.value === ':' || t.value === '[')) {
                         let typeTok = prevPrev;
                         if (prevPrev.value === '>' || prevPrev.value === '>>') {
                             // Walk backwards through tokens to find matching '<' and the type before it
@@ -586,6 +613,9 @@ export function parse(
                                 if (st.value === '>>') angleDepth += 2;
                                 else if (st.value === '>') angleDepth++;
                                 else if (st.value === '<') angleDepth--;
+                                // Stop at statement/scope boundaries — a <> pair that
+                                // spans these is a comparison operator, not a generic type.
+                                else if (st.value === ';' || st.value === '{' || st.value === '}') break;
                                 searchPos--;
                             }
                             // After the loop, searchPos has been decremented past '<',

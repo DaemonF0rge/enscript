@@ -549,21 +549,7 @@ export class Analyzer {
     }
 
     /**
-     * Inject a pre-parsed AST directly into the cache (used by persistent cache on startup)
-     * @param uri The document URI
-     * @param ast The pre-parsed AST from disk cache
-     */
-    injectCachedAST(uri: string, ast: File): void {
-        const normalizedUri = normalizeUri(uri);
-        ast.module = getModuleLevel(uri);
-        this.docCache.set(normalizedUri, ast);
-        // Update indexes for fast lookups
-        this.updateGlobalSymbolIndex(normalizedUri, ast);
-        this.updateAllIndexes(normalizedUri, ast);
-    }
-
-    /**
-     * Parse a document and return the AST (used during indexing to populate persistent cache)
+     * Parse a document and return the AST (used during indexing)
      * @param doc The TextDocument to parse
      * @returns The parsed AST (or a stub on error)
      */
@@ -942,15 +928,15 @@ export class Analyzer {
         const text = doc.getText();
         const regexKeywords = new Set(['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'case', 'break', 'continue', 'this', 'super', 'null', 'true', 'false', 'out', 'inout', 'volatile']);
         
-        // Pattern: Type varName; or Type varName =
+        // Pattern: Type varName; or Type varName = or Type varName[  (C-style array)
         // Use word boundary to avoid matching inside larger expressions
-        const varDeclMatch = text.match(new RegExp(`(?:^|[{;,\\s])\\s*(\\w+)\\s+${varName}\\s*[;=]`));
+        const varDeclMatch = text.match(new RegExp(`(?:^|[{;,\\s])\\s*(\\w+)\\s+${varName}\\s*[;=\\[]`));
         if (varDeclMatch && !regexKeywords.has(varDeclMatch[1])) {
             return varDeclMatch[1];
         }
         
-        // Pattern: (Type varName) or (Type varName,) - function parameters
-        const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)\\s+${varName}\\s*[,)]`));
+        // Pattern: (Type varName) or (Type varName,) or (Type varName[) - function parameters
+        const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)\\s+${varName}\\s*[,)\\[]`));
         if (paramMatch) {
             return paramMatch[1];
         }
@@ -1224,6 +1210,20 @@ export class Analyzer {
     private resolveTypedef(typeName: string): string {
         const node = this.resolveTypedefNode(typeName);
         return node ? node.oldType.identifier : typeName;
+    }
+
+    /**
+     * Given a type that is being indexed with [], return the element type.
+     * e.g., vector[0] → float, string[0] → string, array<T>[0] → null (skip check)
+     * Returns null if the indexed type cannot be determined (to avoid false positives).
+     */
+    private resolveIndexedType(containerType: string): string | null {
+        const lower = containerType.toLowerCase();
+        if (lower === 'vector') return 'float';
+        if (lower === 'string') return 'string';
+        // For arrays, maps, sets, etc., we can't easily determine the element type
+        // from just the base type name, so return null to skip the type check.
+        return null;
     }
 
     /**
@@ -3204,6 +3204,12 @@ export class Analyzer {
                 if (!returnType) {
                     returnType = this.resolveFunctionReturnType(funcName);
                 }
+                // Check for array indexing after the function call, e.g. GetOrientation()[0]
+                // If present, adjust the return type to the element type
+                const afterCall = afterMatch.substring(singleEnd).trim();
+                if (afterCall.startsWith('[') && returnType) {
+                    returnType = this.resolveIndexedType(returnType);
+                }
                 highlightLength = match[0].length + singleEnd;
             }
             
@@ -3417,6 +3423,12 @@ export class Analyzer {
                 // Fall back to global function lookup if not found in class hierarchy
                 if (!returnType) {
                     returnType = this.resolveFunctionReturnType(funcName);
+                }
+                // Check for array indexing after the function call, e.g. GetOrientation()[0]
+                // If present, adjust the return type to the element type
+                const afterCall = afterMatch.substring(chainEnd).trim();
+                if (afterCall.startsWith('[') && returnType) {
+                    returnType = this.resolveIndexedType(returnType);
                 }
             }
             
@@ -3767,6 +3779,10 @@ export class Analyzer {
                 if (afterCall.startsWith('.')) {
                     // There's a chain after the function call — resolve it
                     return this.resolveVariableChainType(rootType, afterCall);
+                }
+                // Check for array indexing after the function call: FuncName(...)[expr]
+                if (afterCall.startsWith('[')) {
+                    return this.resolveIndexedType(rootType);
                 }
             }
             return rootType;
