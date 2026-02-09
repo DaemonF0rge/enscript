@@ -12,6 +12,11 @@ export function registerDiagnostics(conn: Connection, docs: TextDocuments<TextDo
     const analyser = Analyzer.instance();
 
     const validate = (change: TextDocumentChangeEvent<TextDocument>) => {
+        // Only report diagnostics for files inside the workspace folder
+        if (!analyser.isWorkspaceFile(change.document.uri)) {
+            conn.sendDiagnostics({ uri: change.document.uri, diagnostics: [] });
+            return;
+        }
         const diagnostics = analyser.runDiagnostics(change.document);
         conn.sendDiagnostics({ uri: change.document.uri, diagnostics });
     };

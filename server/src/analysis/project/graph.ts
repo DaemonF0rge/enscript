@@ -436,6 +436,30 @@ export class Analyzer {
         this.preprocessorDefines = new Set(defines);
     }
 
+    /** Store include paths so diagnostics can be suppressed for external files */
+    private includePaths: string[] = [];
+    private workspaceRoot: string = '';
+
+    setIncludePaths(paths: string[]): void {
+        this.includePaths = paths.map(p => p.replace(/\\/g, '/').toLowerCase());
+    }
+
+    setWorkspaceRoot(root: string): void {
+        this.workspaceRoot = root.replace(/\\/g, '/').toLowerCase();
+    }
+
+    /** Check if a URI belongs to the workspace (not an external include path file) */
+    isWorkspaceFile(uri: string): boolean {
+        if (!this.workspaceRoot) return true; // no workspace root set, allow all
+        let fsPath: string;
+        try {
+            fsPath = url.fileURLToPath(uri).replace(/\\/g, '/').toLowerCase();
+        } catch {
+            fsPath = uri.replace(/\\/g, '/').toLowerCase();
+        }
+        return fsPath.startsWith(this.workspaceRoot);
+    }
+
     /**
      * Compute character ranges that should be blanked for #ifdef/#ifndef regions.
      * Returns an array of { start, end } pairs (character offsets) covering:

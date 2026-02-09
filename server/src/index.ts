@@ -50,6 +50,12 @@ connection.onInitialized(async () => {
     const includePaths = config.includePaths as string[] || [];
     const preprocessorDefines = config.preprocessorDefines as string[] || [];
     
+    // Store include paths on the analyzer so diagnostics can be suppressed
+    if (includePaths.length > 0) {
+        Analyzer.instance().setIncludePaths(includePaths);
+    }
+    Analyzer.instance().setWorkspaceRoot(workspaceRoot);
+    
     // Configure preprocessor defines
     if (preprocessorDefines.length > 0) {
         Analyzer.instance().setPreprocessorDefines(preprocessorDefines);
