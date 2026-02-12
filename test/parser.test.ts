@@ -274,6 +274,120 @@ test('no false positive for single-line strings', () => {
     expect(mlDiag).toBeUndefined();
 });
 
+// ── Return statement detection tests ──────────────────────────────────────
+
+test('detects return statements in function bodies', () => {
+    const code = `class Foo {
+    int GetValue() {
+        return 42;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.hasBody).toBe(true);
+    expect(func.returnStatements.length).toBe(1);
+    expect(func.returnStatements[0].isEmpty).toBe(false);
+});
+
+test('detects bare return in void function', () => {
+    const code = `class Foo {
+    void DoStuff() {
+        if (true)
+            return;
+        Print("hello");
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.hasBody).toBe(true);
+    expect(func.returnStatements.length).toBe(1);
+    expect(func.returnStatements[0].isEmpty).toBe(true);
+});
+
+test('detects multiple return statements', () => {
+    const code = `class Foo {
+    int GetValue(bool flag) {
+        if (flag)
+            return 1;
+        return 0;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.returnStatements.length).toBe(2);
+    expect(func.returnStatements[0].isEmpty).toBe(false);
+    expect(func.returnStatements[1].isEmpty).toBe(false);
+});
+
+test('proto functions have no body', () => {
+    const code = `class Foo {
+    proto int GetValue();
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.hasBody).toBe(false);
+    expect(func.returnStatements.length).toBe(0);
+});
+
+test('detects return this in method', () => {
+    const code = `class Foo {
+    Foo Clone() {
+        return this;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.returnStatements.length).toBe(1);
+    const ret = func.returnStatements[0];
+    expect(ret.isEmpty).toBe(false);
+    const exprText = code.substring(ret.exprStart, ret.exprEnd).trim();
+    expect(exprText).toBe('this');
+});
+
+test('detects return this.Method() chain', () => {
+    const code = `class Foo {
+    string GetName() {
+        return this.m_name;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.returnStatements.length).toBe(1);
+    const ret = func.returnStatements[0];
+    const exprText = code.substring(ret.exprStart, ret.exprEnd).trim();
+    expect(exprText).toBe('this.m_name');
+});
+
+test('detects return with expression text', () => {
+    const code = `class Foo {
+    string GetName() {
+        return m_name;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    const cls = ast.body[0] as any;
+    const func = cls.members[0] as any;
+    expect(func.returnStatements.length).toBe(1);
+    const ret = func.returnStatements[0];
+    expect(ret.isEmpty).toBe(false);
+    // The expression text between exprStart and exprEnd should contain 'm_name'
+    const exprText = code.substring(ret.exprStart, ret.exprEnd).trim();
+    expect(exprText).toBe('m_name');
+});
+
 test('playground', () => {
     const target_file = path.join("P:\\enscript\\test", "test_enscript.c");
     const text = fs.readFileSync(target_file, "utf8");

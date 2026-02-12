@@ -154,11 +154,22 @@ export interface VarDeclNode extends SymbolNodeBase {
     scopeEnd?: Position;  // End of the brace-scope where this local is visible (set for function-body locals)
 }
 
+/** Info about a return statement found inside a function body */
+export interface ReturnStatementInfo {
+    start: Position;          // Position of the 'return' keyword
+    end: Position;            // Position after the ';'
+    isEmpty: boolean;         // true for bare 'return;' (no expression)
+    exprStart: number;        // Character offset of expression start (after 'return ')
+    exprEnd: number;          // Character offset of expression end (before ';')
+}
+
 export interface FunctionDeclNode extends SymbolNodeBase {
     kind: 'FunctionDecl';
     parameters: VarDeclNode[];
     returnType: TypeNode;
     locals: VarDeclNode[];
+    returnStatements: ReturnStatementInfo[];  // All return statements found in the body
+    hasBody: boolean;                          // true if function has a { } body (not proto/native)
 }
 
 export interface File {
@@ -561,7 +572,10 @@ export function parse(
             //   if (condition) x = 1; else x = 0;
             // ====================================================================
             const locals: VarDeclNode[] = [];
+            const returnStatements: ReturnStatementInfo[] = [];
+            let hasBody = false;
             if (peek().value === '{') {
+                hasBody = true;
                 next();
                 let depth = 1;
                 // Scope tracking: each entry holds locals declared in that brace scope.
@@ -615,6 +629,47 @@ export function parse(
                         if (foundColon) {
                             addDiagnostic(t, 'Ternary operator (? :) is not supported in Enforce Script. Use if/else statement instead.', DiagnosticSeverity.Error);
                         }
+                    }
+
+                    // ================================================================
+                    // RETURN STATEMENT DETECTION
+                    // ================================================================
+                    // Detect 'return' keyword and capture the expression that follows.
+                    // Tracks the char offset range [exprStart..exprEnd) so the
+                    // diagnostics engine can resolve the returned expression's type.
+                    // A bare 'return;' is flagged as isEmpty for void-return checks.
+                    // ================================================================
+                    if (t.kind === TokenKind.Keyword && t.value === 'return' && depth > 0) {
+                        const retStart = doc.positionAt(t.start);
+                        // Scan forward to the ';' to capture the expression range
+                        const exprStartOffset = t.end; // right after the 'return' token
+                        let exprEndOffset = exprStartOffset;
+                        let semiOffset = exprStartOffset;
+                        let scanIdx = pos;
+                        while (scanIdx < toks.length) {
+                            const scanTok = toks[scanIdx];
+                            if (scanTok.value === ';') {
+                                semiOffset = scanTok.end;
+                                exprEndOffset = scanTok.start;
+                                break;
+                            }
+                            // Stop at block boundaries to be safe
+                            if (scanTok.value === '{' || scanTok.value === '}') {
+                                exprEndOffset = scanTok.start;
+                                semiOffset = scanTok.start;
+                                break;
+                            }
+                            scanIdx++;
+                        }
+                        const isEmpty = exprEndOffset <= exprStartOffset ||
+                            doc.getText().substring(exprStartOffset, exprEndOffset).trim().length === 0;
+                        returnStatements.push({
+                            start: retStart,
+                            end: doc.positionAt(semiOffset),
+                            isEmpty,
+                            exprStart: exprStartOffset,
+                            exprEnd: exprEndOffset,
+                        });
                     }
 
                     // Detect local variable declarations:
@@ -711,6 +766,8 @@ export function parse(
                 returnType: baseTypeNode,
                 parameters: params,
                 locals: locals,
+                returnStatements: returnStatements,
+                hasBody: hasBody,
                 annotations: annotations,
                 modifiers: mods,
                 start: baseTypeNode.start,

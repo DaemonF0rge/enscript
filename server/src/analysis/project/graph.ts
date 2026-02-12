@@ -38,7 +38,7 @@
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { Position, Range, Location, SymbolInformation, SymbolKind, Diagnostic, DiagnosticSeverity } from 'vscode-languageserver';
-import { parse, ParseError, ClassDeclNode, File, SymbolNodeBase, FunctionDeclNode, VarDeclNode, TypedefNode, toSymbolKind, EnumDeclNode, EnumMemberDeclNode, TypeNode } from '../ast/parser';
+import { parse, ParseError, ClassDeclNode, File, SymbolNodeBase, FunctionDeclNode, VarDeclNode, TypedefNode, toSymbolKind, EnumDeclNode, EnumMemberDeclNode, TypeNode, ReturnStatementInfo } from '../ast/parser';
 import { prettyPrint } from '../ast/printer';
 import { lex } from '../lexer/lexer';
 import { Token, TokenKind } from '../lexer/token';
@@ -1182,17 +1182,15 @@ export class Analyzer {
      * Includes genericArgs for template types like map<string, int>.
      */
     private resolveMethodReturnTypeNode(className: string, methodName: string): TypeNode | null {
-        // Constructor call: if looking up a method whose name matches a known constructor
-        const ctorClass = this.constructorIndex.get(methodName);
-        if (ctorClass) {
-            return { identifier: ctorClass, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
-        }
-        
         // Resolve typedefs first (e.g., testMapType → map)
         const resolvedClass = this.resolveTypedef(className);
         const visited = new Set<string>();
         const classesToSearch = this.getClassHierarchyOrdered(resolvedClass, visited);
         
+        // Search class members FIRST — a field or method on the target class takes
+        // priority over a global constructor with the same name.  This prevents
+        // e.g. `marker.Icon` (a string field named "Icon") from being resolved as
+        // the constructor of a class called "Icon".
         for (const classNode of classesToSearch) {
             for (const member of classNode.members || []) {
                 if (member.kind === 'FunctionDecl' && member.name === methodName) {
@@ -1209,6 +1207,14 @@ export class Analyzer {
                     }
                 }
             }
+        }
+        
+        // Fallback: constructor call — if no member was found on the class, check
+        // if the name matches a known constructor (e.g. chaining into a constructor
+        // call like `obj.SomeType()` where SomeType is a class).
+        const ctorClass = this.constructorIndex.get(methodName);
+        if (ctorClass) {
+            return { identifier: ctorClass, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
         }
         
         return null;
@@ -1520,7 +1526,7 @@ export class Analyzer {
             // No return type found — check if it's an implicit constructor (class/typedef with no declaration)
             if (this.classIndex.has(firstFunc) || this.typedefIndex.has(firstFunc)) {
                 if (calls.length === 0) return firstFunc;
-                return this.resolveVariableChainType(firstFunc, calls.join('.'));
+                return this.resolveVariableChainType(firstFunc, '.' + calls.join('.'));
             }
             return null;
         }
@@ -2733,6 +2739,10 @@ export class Analyzer {
             
             // Check function call arguments (param count and types)
             this.checkFunctionCallArgs(doc, diags, text, lines, lineOffsets, ast, scopedVars);
+            
+            // Check return statements: missing returns in non-void functions
+            // and return type mismatches (including downcast warnings)
+            this.checkReturnStatements(doc, diags, text, lineOffsets, ast, scopedVars);
         }
         
         // Check for multi-line statements (not supported in Enforce Script)
@@ -2746,6 +2756,320 @@ export class Analyzer {
         this.checkDuplicateVariables(ast, diags);
         
         return diags;
+    }
+
+    // ====================================================================
+    // RETURN STATEMENT VALIDATION
+    // ====================================================================
+    // Checks:
+    //   1. Non-void functions with bodies must have at least one return statement
+    //   2. Return expressions must be type-compatible with the declared return type
+    //   3. Downcast warnings for return expressions (e.g., returning a parent type
+    //      where a child type is expected)
+    //   4. Void functions should not return a value
+    // ====================================================================
+
+    /**
+     * Check return statements in all functions (top-level and class methods).
+     * 
+     * Uses the parser's ReturnStatementInfo to:
+     *   - Detect missing return statements in non-void functions
+     *   - Validate return expression types against declared return types
+     *   - Issue downcast warnings for implicit narrowing conversions
+     */
+    private checkReturnStatements(
+        doc: TextDocument,
+        diags: Diagnostic[],
+        text: string,
+        lineOffsets: number[],
+        ast: File,
+        scopedVars: Map<string, { type: string; startLine: number; endLine: number; isClassField: boolean }[]>
+    ): void {
+        // Helper to resolve the type of a variable at a specific line
+        const getVarTypeAtLine = (name: string, line: number): string | undefined => {
+            const vars = scopedVars.get(name);
+            if (!vars) return undefined;
+            let bestMatch: { type: string; startLine: number; endLine: number; isClassField: boolean } | undefined;
+            for (const v of vars) {
+                if (line < v.startLine || line > v.endLine) continue;
+                if (v.isClassField) {
+                    if (!bestMatch || (bestMatch.isClassField &&
+                        (v.endLine - v.startLine) < (bestMatch.endLine - bestMatch.startLine))) {
+                        bestMatch = v;
+                    }
+                } else {
+                    if (!bestMatch || bestMatch.isClassField ||
+                        (v.endLine - v.startLine) < (bestMatch.endLine - bestMatch.startLine)) {
+                        bestMatch = v;
+                    }
+                }
+            }
+            return bestMatch?.type;
+        };
+
+        // Skip constructors, destructors, proto/native functions
+        const shouldCheckFunction = (func: FunctionDeclNode, className?: string): boolean => {
+            // Must have a body
+            if (!func.hasBody) return false;
+            // Skip proto/native (no body to check)
+            if (func.modifiers.includes('proto') || func.modifiers.includes('native')) return false;
+            // Skip constructors (name matches class name)
+            if (className && func.name === className) return false;
+            // Skip destructors (name starts with ~)
+            if (func.name.startsWith('~')) return false;
+            return true;
+        };
+
+        // Check a single function's return statements
+        const checkFunction = (func: FunctionDeclNode, className?: string): void => {
+            if (!shouldCheckFunction(func, className)) return;
+
+            const returnType = func.returnType?.identifier ?? 'void';
+            const isVoid = returnType === 'void';
+            const returns = func.returnStatements || [];
+
+            // 1. Non-void functions must have at least one return statement
+            if (!isVoid && returns.length === 0) {
+                diags.push({
+                    message: `Function '${func.name}' has return type '${returnType}' but has no return statement.`,
+                    range: { start: func.nameStart, end: func.nameEnd },
+                    severity: DiagnosticSeverity.Warning
+                });
+                return; // No returns to type-check
+            }
+
+            // 2. Validate each return statement
+            for (const ret of returns) {
+                if (isVoid) {
+                    // Void function returning a value
+                    if (!ret.isEmpty) {
+                        diags.push({
+                            message: `Function '${func.name}' has return type 'void' but returns a value.`,
+                            range: { start: ret.start, end: ret.end },
+                            severity: DiagnosticSeverity.Error
+                        });
+                    }
+                    continue;
+                }
+
+                // Non-void function with bare 'return;'
+                if (ret.isEmpty) {
+                    diags.push({
+                        message: `Function '${func.name}' has return type '${returnType}' but returns nothing. Expected a value of type '${returnType}'.`,
+                        range: { start: ret.start, end: ret.end },
+                        severity: DiagnosticSeverity.Error
+                    });
+                    continue;
+                }
+
+                // Try to resolve the type of the return expression
+                const exprText = text.substring(ret.exprStart, ret.exprEnd).trim();
+                if (!exprText) continue;
+
+                const resolvedType = this.resolveReturnExpressionType(
+                    exprText, doc, ast, ret.start.line, lineOffsets, getVarTypeAtLine, className
+                );
+
+                if (!resolvedType) continue; // Can't resolve — skip
+
+                // 3. Check type compatibility (errors and downcast warnings)
+                const compat = this.checkTypeCompatibility(returnType, resolvedType);
+
+                if (!compat.compatible) {
+                    diags.push({
+                        message: compat.message || `Return type mismatch in '${func.name}': cannot return '${resolvedType}' as '${returnType}'.`,
+                        range: { start: ret.start, end: ret.end },
+                        severity: DiagnosticSeverity.Error
+                    });
+                } else if (compat.isDowncast) {
+                    diags.push({
+                        message: compat.message || `Unsafe downcast in return of '${func.name}': returning '${resolvedType}' as '${returnType}'. Use '${returnType}.Cast(value)' or 'Class.CastTo(target, value)' instead.`,
+                        range: { start: ret.start, end: ret.end },
+                        severity: DiagnosticSeverity.Warning
+                    });
+                }
+            }
+        };
+
+        // Process all top-level functions
+        for (const node of ast.body) {
+            if (node.kind === 'FunctionDecl') {
+                checkFunction(node as FunctionDeclNode);
+            }
+            // Process class methods
+            if (node.kind === 'ClassDecl') {
+                const cls = node as ClassDeclNode;
+                for (const member of cls.members || []) {
+                    if (member.kind === 'FunctionDecl') {
+                        checkFunction(member as FunctionDeclNode, cls.name);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolve the type of a return expression.
+     *
+     * Handles common patterns:
+     *   - Literals: null, true, false, integers, floats, strings
+     *   - Variable references: return varName;
+     *   - Function calls: return FuncCall();
+     *   - Method chains: return obj.Method().Prop;
+     *   - Constructor calls: return new ClassName();
+     *   - Cast expressions: return ClassName.Cast(expr);
+     *   - Enum values: return EnumName.VALUE;
+     *
+     * @returns The resolved type name, or null if unresolvable
+     */
+    private resolveReturnExpressionType(
+        expr: string,
+        doc: TextDocument,
+        ast: File,
+        line: number,
+        lineOffsets: number[],
+        getVarTypeAtLine: (name: string, line: number) => string | undefined,
+        className?: string
+    ): string | null {
+        // Strip outer parentheses: return (expr) → expr
+        let trimmed = expr.trim();
+        while (trimmed.startsWith('(') && trimmed.endsWith(')')) {
+            // Make sure parens are balanced (not just matching start/end)
+            let depth = 0;
+            let balanced = true;
+            for (let i = 0; i < trimmed.length - 1; i++) {
+                if (trimmed[i] === '(') depth++;
+                else if (trimmed[i] === ')') depth--;
+                if (depth === 0) { balanced = false; break; }
+            }
+            if (!balanced) break;
+            trimmed = trimmed.substring(1, trimmed.length - 1).trim();
+        }
+
+        // Skip expressions with top-level binary operators (&&, ||, +, -, *, /, %, ==, !=, <, >, etc.)
+        // These produce results that are hard to type-check without full expression typing
+        if (this.hasTopLevelBinaryOperator(trimmed)) {
+            // But if the expression contains comparison/logical operators, the result is bool
+            if (this.hasTopLevelComparisonOperator(trimmed)) {
+                return 'bool';
+            }
+            return null; // Too complex to resolve
+        }
+
+        // --- Literal patterns ---
+        if (trimmed === 'null' || trimmed === 'NULL') return 'null';
+        if (trimmed === 'true' || trimmed === 'false') return 'bool';
+        if (/^-?\d+$/.test(trimmed)) return 'int';
+        if (/^-?\d+\.\d*f?$/.test(trimmed) || /^-?\.\d+f?$/.test(trimmed)) return 'float';
+        if (/^".*"$/.test(trimmed)) return 'string';
+        // Vector literal: "x y z" is handled by string → vector compat in checkTypeCompatibility
+
+        // --- 'new ClassName(...)' ---
+        const newMatch = trimmed.match(/^new\s+(\w+)\s*\(/);
+        if (newMatch) return newMatch[1];
+
+        // --- Cast: ClassName.Cast(expr) ---
+        const castMatch = trimmed.match(/^(\w+)\s*\.\s*Cast\s*\(/);
+        if (castMatch) return castMatch[1];
+
+        // --- Class.CastTo pattern: Class.CastTo(target, source) returns bool ---
+        if (/^Class\s*\.\s*CastTo\s*\(/.test(trimmed)) return 'bool';
+
+        // --- Enum value: EnumName.VALUE ---
+        const enumDotMatch = trimmed.match(/^(\w+)\s*\.\s*(\w+)$/);
+        if (enumDotMatch) {
+            const potentialEnum = enumDotMatch[1];
+            if (this.enumIndex.has(potentialEnum)) {
+                return potentialEnum;
+            }
+            // Could also be a static field access — fall through
+        }
+
+        // --- Function call (possibly chained): FuncName(...) or FuncName(...).Method(...)  ---
+        const funcCallMatch = trimmed.match(/^(\w+)\s*\(/);
+        if (funcCallMatch) {
+            const funcName = funcCallMatch[1];
+            // Check for chaining (. after the closing paren)
+            const afterFuncName = trimmed.substring(funcCallMatch[0].length);
+            let parenDepth = 1, ci = 0;
+            while (ci < afterFuncName.length && parenDepth > 0) {
+                if (afterFuncName[ci] === '(') parenDepth++;
+                else if (afterFuncName[ci] === ')') parenDepth--;
+                ci++;
+            }
+            const afterCall = afterFuncName.substring(ci).trim();
+
+            if (afterCall.startsWith('.')) {
+                // Method chain — delegate to resolveChainReturnType
+                return this.resolveChainReturnType(trimmed);
+            }
+            // Single function call — resolve as method of containing class first
+            if (className) {
+                const methodType = this.resolveMethodReturnType(className, funcName);
+                if (methodType) return methodType;
+            }
+            return this.resolveFunctionReturnType(funcName);
+        }
+
+        // --- Variable.method() or variable.property chain ---
+        const varChainMatch = trimmed.match(/^(\w+)\s*\.\s*(.+)$/);
+        if (varChainMatch) {
+            const rootName = varChainMatch[1];
+            const chainText = '.' + varChainMatch[2];
+            // Resolve the variable's type
+            let rootType = getVarTypeAtLine(rootName, line);
+            if (!rootType && rootName === 'this' && className) {
+                rootType = className;
+            }
+            if (rootType) {
+                const resolved = this.resolveVariableChainType(rootType, chainText);
+                if (resolved) return resolved;
+            }
+        }
+
+        // --- Simple variable reference ---
+        const simpleVarMatch = trimmed.match(/^(\w+)$/);
+        if (simpleVarMatch) {
+            const varName = simpleVarMatch[1];
+            // 'this' resolves to the containing class type
+            if (varName === 'this' && className) return className;
+            // Check local/param/field/global variable
+            const varType = getVarTypeAtLine(varName, line);
+            if (varType) return varType;
+            // Check if it's an enum value or class name used as type
+            if (this.enumIndex.has(varName)) return varName;
+            if (this.classIndex.has(varName)) return varName;
+            // Could be a global function name used as a value (unlikely but possible)
+            return null;
+        }
+
+        return null; // Unresolvable expression
+    }
+
+    /**
+     * Check if an expression has a top-level binary operator (outside of balanced parens/brackets).
+     * Used to skip complex expressions in return type resolution.
+     */
+    private hasTopLevelBinaryOperator(expr: string): boolean {
+        let depth = 0;
+        for (let i = 0; i < expr.length; i++) {
+            const ch = expr[i];
+            if (ch === '(' || ch === '[') depth++;
+            else if (ch === ')' || ch === ']') depth--;
+            if (depth === 0) {
+                // Check for binary operators (but not unary minus or method chains)
+                const rest = expr.substring(i);
+                if (/^[\+\-\*\/%](?!=)/.test(rest) && i > 0 && /\w/.test(expr[i - 1])) return true;
+                if (/^&&|^\|\|/.test(rest)) return true;
+                if (/^==|^!=|^<=|^>=/.test(rest)) return true;
+                // Be careful with < and > — they could be generics
+                if ((ch === '<' || ch === '>') && i > 0 && /\w/.test(expr[i - 1])) {
+                    // If followed by another < or >, or if followed by a type name and comma, it's generic
+                    // Simple heuristic: skip
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -2860,7 +3184,7 @@ export class Analyzer {
 
         // ── Collect inherited fields & parent method signatures ────────────
         const inheritedFields = new Map<string, SymbolNodeBase>();
-        const parentMethodSigs = new Map<string, number[]>();
+        const parentMethods = new Map<string, FunctionDeclNode[]>();
 
         if (cls.base?.identifier) {
             const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
@@ -2872,11 +3196,10 @@ export class Analyzer {
                         }
                     }
                     if (member.kind === 'FunctionDecl' && member.name) {
-                        const paramCount = (member as FunctionDeclNode).parameters?.length ?? 0;
-                        if (!parentMethodSigs.has(member.name)) {
-                            parentMethodSigs.set(member.name, []);
+                        if (!parentMethods.has(member.name)) {
+                            parentMethods.set(member.name, []);
                         }
-                        parentMethodSigs.get(member.name)!.push(paramCount);
+                        parentMethods.get(member.name)!.push(member as FunctionDeclNode);
                     }
                 }
             }
@@ -2901,14 +3224,30 @@ export class Analyzer {
             const func = member as FunctionDeclNode;
 
             // Missing override check
-            if (parentMethodSigs.size > 0 && func.name && func.name !== cls.name) {
+            if (parentMethods.size > 0 && func.name && func.name !== cls.name) {
                 const hasOverride = func.modifiers.includes('override');
-                if (!hasOverride && parentMethodSigs.has(func.name)) {
+                const parentOverloads = parentMethods.get(func.name);
+                if (!hasOverride && parentOverloads) {
                     const childParamCount = func.parameters?.length ?? 0;
-                    const parentParamCounts = parentMethodSigs.get(func.name)!;
-                    if (parentParamCounts.includes(childParamCount)) {
+                    const hasMatchingParamCount = parentOverloads.some(p => (p.parameters?.length ?? 0) === childParamCount);
+                    if (hasMatchingParamCount) {
                         diags.push({
                             message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
+                            range: { start: func.nameStart, end: func.nameEnd },
+                            severity: DiagnosticSeverity.Warning
+                        });
+                    }
+                }
+
+                // Override signature mismatch check
+                // When 'override' is present, validate the signature exactly matches
+                // at least one parent overload (return type, param types, names,
+                // modifiers like out/inout, and default presence).
+                if (hasOverride && parentOverloads) {
+                    const mismatch = this.checkOverrideSignatureMismatch(func, parentOverloads);
+                    if (mismatch) {
+                        diags.push({
+                            message: mismatch,
                             range: { start: func.nameStart, end: func.nameEnd },
                             severity: DiagnosticSeverity.Warning
                         });
@@ -2930,6 +3269,98 @@ export class Analyzer {
                 );
             }
         }
+    }
+
+    /**
+     * Check whether an override method's signature exactly matches at least one
+     * parent overload.  Returns a human-readable mismatch message, or null if
+     * a matching overload was found.
+     *
+     * Checks: return type, parameter count, and for each parameter: type,
+     * name, modifiers (out/inout/notnull), and default presence.
+     */
+    private checkOverrideSignatureMismatch(
+        child: FunctionDeclNode,
+        parentOverloads: FunctionDeclNode[]
+    ): string | null {
+        // Helper: get the relevant modifiers for a parameter (out, inout, notnull)
+        const paramMods = (p: VarDeclNode): string[] =>
+            (p.modifiers || []).filter(m => m === 'out' || m === 'inout' || m === 'notnull');
+
+        // Helper: compare two TypeNode identifiers (case-sensitive)
+        const typeEq = (a: TypeNode | undefined, b: TypeNode | undefined): boolean => {
+            if (!a && !b) return true;
+            if (!a || !b) return false;
+            return a.identifier === b.identifier;
+        };
+
+        // Try every parent overload — if ANY matches exactly, the override is valid
+        let closestMismatch: string | null = null;
+
+        for (const parent of parentOverloads) {
+            const childParams = child.parameters || [];
+            const parentParams = parent.parameters || [];
+
+            // --- Return type ---
+            if (!typeEq(child.returnType, parent.returnType)) {
+                const childRet = child.returnType?.identifier ?? 'void';
+                const parentRet = parent.returnType?.identifier ?? 'void';
+                closestMismatch = `Override '${child.name}' return type '${childRet}' does not match parent return type '${parentRet}'.`;
+                continue;
+            }
+
+            // --- Parameter count ---
+            if (childParams.length !== parentParams.length) {
+                closestMismatch = `Override '${child.name}' has ${childParams.length} parameter(s) but parent has ${parentParams.length}.`;
+                continue;
+            }
+
+            // --- Per-parameter comparison ---
+            let paramMismatch: string | null = null;
+            for (let i = 0; i < childParams.length; i++) {
+                const cp = childParams[i];
+                const pp = parentParams[i];
+
+                // Type check
+                if (!typeEq(cp.type, pp.type)) {
+                    paramMismatch = `Override '${child.name}' parameter ${i + 1} type '${cp.type?.identifier ?? '?'}' does not match parent type '${pp.type?.identifier ?? '?'}'.`;
+                    break;
+                }
+
+                // Name check
+                if (cp.name !== pp.name) {
+                    paramMismatch = `Override '${child.name}' parameter ${i + 1} name '${cp.name}' does not match parent name '${pp.name}'.`;
+                    break;
+                }
+
+                // Modifier check (out, inout, notnull)
+                const cMods = paramMods(cp).sort();
+                const pMods = paramMods(pp).sort();
+                if (cMods.length !== pMods.length || cMods.some((m, j) => m !== pMods[j])) {
+                    paramMismatch = `Override '${child.name}' parameter ${i + 1} '${cp.name}' modifiers [${cMods.join(', ')}] do not match parent modifiers [${pMods.join(', ')}].`;
+                    break;
+                }
+
+                // Default presence check
+                if (!!cp.hasDefault !== !!pp.hasDefault) {
+                    const childHas = cp.hasDefault ? 'has' : 'missing';
+                    const parentHas = pp.hasDefault ? 'has' : 'missing';
+                    paramMismatch = `Override '${child.name}' parameter ${i + 1} '${cp.name}' default value mismatch: override ${childHas} default, parent ${parentHas} default.`;
+                    break;
+                }
+            }
+
+            if (paramMismatch) {
+                closestMismatch = paramMismatch;
+                continue;
+            }
+
+            // All checks passed — this overload matches exactly
+            return null;
+        }
+
+        // No overload matched; return the mismatch from the closest one
+        return closestMismatch;
     }
 
     /**
@@ -4244,7 +4675,13 @@ export class Analyzer {
                 // Check if objName is a class name FIRST (for static access like ClassName.StaticMethod)
                 // This must come before getVarTypeAtLine because regex fallbacks can
                 // produce false positives (e.g., matching "new InventoryLocation;" as type "new")
-                if (objName[0] === objName[0].toUpperCase() && this.classIndex.has(objName)) {
+                // BUT: only treat it as static access if objName is NOT part of a larger
+                // chain (i.e., not preceded by a dot or closing paren). For chains like
+                // GetBasicMapConfig().Icons.Find(), "Icons" is a member access, not a
+                // static class reference, even if a class named "Icons" exists.
+                const beforeObjName = textBeforeFunc.substring(0, dotMatch.index).trimEnd();
+                const isPartOfChain = beforeObjName.length > 0 && (beforeObjName[beforeObjName.length - 1] === '.' || beforeObjName[beforeObjName.length - 1] === ')');
+                if (!isPartOfChain && objName[0] === objName[0].toUpperCase() && this.classIndex.has(objName)) {
                     overloads = this.findFunctionOverloads(funcName, objName);
                 }
                 
@@ -4343,7 +4780,8 @@ export class Analyzer {
                         }
                     }
                     // Fall back to static class call if chain didn't resolve
-                    if (overloads.length === 0 && objName[0] === objName[0].toUpperCase()) {
+                    // Only for true static access, not when objName is part of a chain
+                    if (overloads.length === 0 && !isPartOfChain && objName[0] === objName[0].toUpperCase()) {
                         overloads = this.findFunctionOverloads(funcName, objName);
                     }
                 }
