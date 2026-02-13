@@ -170,6 +170,7 @@ export interface FunctionDeclNode extends SymbolNodeBase {
     locals: VarDeclNode[];
     returnStatements: ReturnStatementInfo[];  // All return statements found in the body
     hasBody: boolean;                          // true if function has a { } body (not proto/native)
+    isOverride: boolean;                       // true if declared with the 'override' keyword
 }
 
 export interface File {
@@ -768,6 +769,7 @@ export function parse(
                 locals: locals,
                 returnStatements: returnStatements,
                 hasBody: hasBody,
+                isOverride: mods.includes('override'),
                 annotations: annotations,
                 modifiers: mods,
                 start: baseTypeNode.start,

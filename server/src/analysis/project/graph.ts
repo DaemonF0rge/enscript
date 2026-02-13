@@ -3186,21 +3186,74 @@ export class Analyzer {
         const inheritedFields = new Map<string, SymbolNodeBase>();
         const parentMethods = new Map<string, FunctionDeclNode[]>();
 
-        if (cls.base?.identifier) {
-            const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
-            for (const parentClass of hierarchy) {
-                for (const member of parentClass.members || []) {
-                    if (member.kind === 'VarDecl' && member.name) {
-                        if (!inheritedFields.has(member.name)) {
-                            inheritedFields.set(member.name, member);
-                        }
-                    }
+        const isModded = cls.modifiers?.includes('modded');
+
+        // For modded classes: look up the original class (non-modded) + its base
+        // hierarchy as the "true parents."  Other modded versions of the same
+        // class are "sibling mods" — they can introduce methods, but their
+        // indexing order is non-deterministic so we can't treat them as parents.
+        //
+        // - "missing override" → only fires if method is in true parents
+        // - "override without parent" → suppressed only if a sibling INTRODUCES
+        //   the method (defines it without override); if all siblings also use
+        //   override, nobody introduced it so the warning fires.
+        // - "duplicate across mods" → fires when siblings both define the same
+        //   method without override (one will shadow the other)
+        // - signature mismatch → checked against true parents
+        const hierarchyToSearch: ClassDeclNode[] = [];
+        // Map<methodName, { anyIntroduced: true if a sibling defines it WITHOUT override }>
+        const moddedSiblingMethods = new Map<string, { anyIntroduced: boolean }>();
+
+        if (isModded) {
+            const allVersions = this.findAllClassesByName(cls.name);
+            const originalClass = allVersions.find(c => !c.modifiers?.includes('modded'));
+
+            // True parents: the original class + its full base hierarchy
+            if (originalClass) {
+                hierarchyToSearch.push(originalClass);
+                if (originalClass.base?.identifier) {
+                    const baseHierarchy = this.getClassHierarchyOrdered(originalClass.base.identifier, new Set());
+                    hierarchyToSearch.push(...baseHierarchy);
+                }
+            }
+
+            // Sibling mods: collect method names from other modded versions,
+            // tracking whether any sibling INTRODUCES the method (defines it
+            // without 'override').  This lets us distinguish:
+            //   - Sibling introduces → our 'override' is valid, suppress warning
+            //   - All siblings also 'override' → nobody introduced it, warn
+            for (const ver of allVersions) {
+                if (ver === cls || ver === originalClass) continue;
+                for (const member of ver.members || []) {
                     if (member.kind === 'FunctionDecl' && member.name) {
-                        if (!parentMethods.has(member.name)) {
-                            parentMethods.set(member.name, []);
+                        const func = member as FunctionDeclNode;
+                        const existing = moddedSiblingMethods.get(member.name);
+                        const isIntroduction = !func.isOverride;
+                        if (existing) {
+                            if (isIntroduction) existing.anyIntroduced = true;
+                        } else {
+                            moddedSiblingMethods.set(member.name, { anyIntroduced: isIntroduction });
                         }
-                        parentMethods.get(member.name)!.push(member as FunctionDeclNode);
                     }
+                }
+            }
+        } else if (cls.base?.identifier) {
+            const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
+            hierarchyToSearch.push(...hierarchy);
+        }
+
+        for (const parentClass of hierarchyToSearch) {
+            for (const member of parentClass.members || []) {
+                if (member.kind === 'VarDecl' && member.name) {
+                    if (!inheritedFields.has(member.name)) {
+                        inheritedFields.set(member.name, member);
+                    }
+                }
+                if (member.kind === 'FunctionDecl' && member.name) {
+                    if (!parentMethods.has(member.name)) {
+                        parentMethods.set(member.name, []);
+                    }
+                    parentMethods.get(member.name)!.push(member as FunctionDeclNode);
                 }
             }
         }
@@ -3223,31 +3276,52 @@ export class Analyzer {
             if (member.kind !== 'FunctionDecl') continue;
             const func = member as FunctionDeclNode;
 
-            // Missing override check
-            if (parentMethods.size > 0 && func.name && func.name !== cls.name) {
-                const hasOverride = func.modifiers.includes('override');
+            // Override / inheritance checks (skip constructors)
+            if (func.name && func.name !== cls.name) {
                 const parentOverloads = parentMethods.get(func.name);
-                if (!hasOverride && parentOverloads) {
-                    const childParamCount = func.parameters?.length ?? 0;
-                    const hasMatchingParamCount = parentOverloads.some(p => (p.parameters?.length ?? 0) === childParamCount);
-                    if (hasMatchingParamCount) {
-                        diags.push({
-                            message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
-                            range: { start: func.nameStart, end: func.nameEnd },
-                            severity: DiagnosticSeverity.Warning
-                        });
-                    }
-                }
 
-                // Override signature mismatch check
-                // When 'override' is present, validate the signature exactly matches
-                // at least one parent overload (return type, param types, names,
-                // modifiers like out/inout, and default presence).
-                if (hasOverride && parentOverloads) {
-                    const mismatch = this.checkOverrideSignatureMismatch(func, parentOverloads);
-                    if (mismatch) {
+                if (parentOverloads) {
+                    // Method exists in a parent — check override usage
+                    if (!func.isOverride) {
+                        // Missing 'override' keyword (only if param count matches)
+                        const childParamCount = func.parameters?.length ?? 0;
+                        if (parentOverloads.some(p => (p.parameters?.length ?? 0) === childParamCount)) {
+                            diags.push({
+                                message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
+                                range: { start: func.nameStart, end: func.nameEnd },
+                                severity: DiagnosticSeverity.Warning
+                            });
+                        }
+                    } else {
+                        // Has 'override' — validate signature matches a parent overload
+                        const mismatch = this.checkOverrideSignatureMismatch(func, parentOverloads);
+                        if (mismatch) {
+                            diags.push({
+                                message: mismatch,
+                                range: { start: func.nameStart, end: func.nameEnd },
+                                severity: DiagnosticSeverity.Warning
+                            });
+                        }
+                    }
+                } else if (this.docCache.size >= Analyzer.MIN_INDEX_SIZE_FOR_TYPE_CHECKS) {
+                    // Method NOT in any parent — check for modded-class edge cases
+                    const siblingInfo = moddedSiblingMethods.get(func.name);
+
+                    if (func.isOverride) {
+                        // 'override' on a method no parent has — only valid if a
+                        // sibling mod introduces it (defines without override).
+                        if (!siblingInfo?.anyIntroduced) {
+                            diags.push({
+                                message: `Method '${func.name}' is marked 'override' but no matching method was found in any parent class.`,
+                                range: { start: func.nameStart, end: func.nameEnd },
+                                severity: DiagnosticSeverity.Warning
+                            });
+                        }
+                    } else if (isModded && siblingInfo?.anyIntroduced) {
+                        // Two mods both introduce the same method without override —
+                        // one will shadow the other depending on load order.
                         diags.push({
-                            message: mismatch,
+                            message: `Method '${func.name}' is also defined in another modded version of '${cls.name}' without 'override'. One definition will shadow the other depending on mod load order.`,
                             range: { start: func.nameStart, end: func.nameEnd },
                             severity: DiagnosticSeverity.Warning
                         });
