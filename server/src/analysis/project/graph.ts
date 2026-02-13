@@ -2630,7 +2630,8 @@ export class Analyzer {
                 for (const local of (node as FunctionDeclNode).locals || []) {
                     if (local.name && local.type?.identifier) {
                         const localStart = local.start?.line ?? funcStart;
-                        add(local.name, local.type.identifier, localStart, funcEnd, false);
+                        const localEnd = local.scopeEnd?.line ?? funcEnd;
+                        add(local.name, local.type.identifier, localStart, localEnd, false);
                     }
                 }
             }
@@ -2658,7 +2659,8 @@ export class Analyzer {
                         for (const l of func.locals || []) {
                             if (l.name && l.type?.identifier) {
                                 const localStart = l.start?.line ?? fStart;
-                                add(l.name, l.type.identifier, localStart, fEnd, false);
+                                const localEnd = l.scopeEnd?.line ?? fEnd;
+                                add(l.name, l.type.identifier, localStart, localEnd, false);
                             }
                         }
                     }
@@ -2670,15 +2672,20 @@ export class Analyzer {
                 // shared map is safe because they have large ranges (class scope) and
                 // checkFunctionCallArgs' smallest-range heuristic will prefer local
                 // declarations over them anyway, matching prior behavior.
+                // Look up the BASE hierarchy (not cls.name) to avoid including
+                // the class itself — reference comparison can fail across re-parses.
+                let parentClasses: ClassDeclNode[] = [];
                 if (cls.base?.identifier) {
-                    const parentClasses = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
-                    for (const parentClass of parentClasses) {
-                        for (const member of parentClass.members || []) {
-                            if (member.kind === 'VarDecl' && member.name) {
-                                const varMember = member as VarDeclNode;
-                                if (varMember.type?.identifier) {
-                                    add(member.name, varMember.type.identifier, clsStart, clsEnd, true);
-                                }
+                    parentClasses = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
+                } else if (cls.name !== 'Class') {
+                    parentClasses = this.getClassHierarchyOrdered('Class', new Set());
+                }
+                for (const parentClass of parentClasses) {
+                    for (const member of parentClass.members || []) {
+                        if (member.kind === 'VarDecl' && member.name) {
+                            const varMember = member as VarDeclNode;
+                            if (varMember.type?.identifier) {
+                                add(member.name, varMember.type.identifier, clsStart, clsEnd, true);
                             }
                         }
                     }
@@ -2968,9 +2975,29 @@ export class Analyzer {
         const newMatch = trimmed.match(/^new\s+(\w+)\s*\(/);
         if (newMatch) return newMatch[1];
 
-        // --- Cast: ClassName.Cast(expr) ---
+        // --- Array literal: {val1, val2, ...} ---
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) return 'array';
+
+        // --- Cast: ClassName.Cast(expr) possibly chained ---
         const castMatch = trimmed.match(/^(\w+)\s*\.\s*Cast\s*\(/);
-        if (castMatch) return castMatch[1];
+        if (castMatch) {
+            const castType = castMatch[1];
+            // Check for chaining after Cast(...)
+            const afterCastStart = trimmed.substring(castMatch[0].length);
+            let parenDepth = 1, ci = 0;
+            while (ci < afterCastStart.length && parenDepth > 0) {
+                if (afterCastStart[ci] === '(') parenDepth++;
+                else if (afterCastStart[ci] === ')') parenDepth--;
+                ci++;
+            }
+            const afterClose = afterCastStart.substring(ci).trim();
+            if (afterClose.startsWith('.')) {
+                // Chain continues after Cast — resolve from castType
+                const resolved = this.resolveVariableChainType(castType, afterClose);
+                if (resolved) return resolved;
+            }
+            return castType;
+        }
 
         // --- Class.CastTo pattern: Class.CastTo(target, source) returns bool ---
         if (/^Class\s*\.\s*CastTo\s*\(/.test(trimmed)) return 'bool';
@@ -3208,12 +3235,27 @@ export class Analyzer {
             const allVersions = this.findAllClassesByName(cls.name);
             const originalClass = allVersions.find(c => !c.modifiers?.includes('modded'));
 
-            // True parents: the original class + its full base hierarchy
+            // True parents: the original (non-modded) class + its base hierarchy.
+            // We look up the BASE of the original to avoid including the original's
+            // own modded siblings.  Then add the original itself.
             if (originalClass) {
                 hierarchyToSearch.push(originalClass);
                 if (originalClass.base?.identifier) {
                     const baseHierarchy = this.getClassHierarchyOrdered(originalClass.base.identifier, new Set());
                     hierarchyToSearch.push(...baseHierarchy);
+                } else if (originalClass.name !== 'Class') {
+                    const classHierarchy = this.getClassHierarchyOrdered('Class', new Set());
+                    hierarchyToSearch.push(...classHierarchy);
+                }
+            } else {
+                // No original found (all modded) — try to get base from first modded
+                const anyBase = allVersions[0]?.base?.identifier;
+                if (anyBase) {
+                    const baseHierarchy = this.getClassHierarchyOrdered(anyBase, new Set());
+                    hierarchyToSearch.push(...baseHierarchy);
+                } else if (cls.name !== 'Class') {
+                    const classHierarchy = this.getClassHierarchyOrdered('Class', new Set());
+                    hierarchyToSearch.push(...classHierarchy);
                 }
             }
 
@@ -3237,9 +3279,16 @@ export class Analyzer {
                     }
                 }
             }
-        } else if (cls.base?.identifier) {
-            const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
-            hierarchyToSearch.push(...hierarchy);
+        } else {
+            // Non-modded class: get parent hierarchy + implicit Class root
+            if (cls.base?.identifier) {
+                const hierarchy = this.getClassHierarchyOrdered(cls.base.identifier, new Set());
+                hierarchyToSearch.push(...hierarchy);
+            } else if (cls.name !== 'Class') {
+                // No explicit base — implicitly inherits from Class
+                const hierarchy = this.getClassHierarchyOrdered('Class', new Set());
+                hierarchyToSearch.push(...hierarchy);
+            }
         }
 
         for (const parentClass of hierarchyToSearch) {
@@ -3254,6 +3303,22 @@ export class Analyzer {
                         parentMethods.set(member.name, []);
                     }
                     parentMethods.get(member.name)!.push(member as FunctionDeclNode);
+                }
+            }
+        }
+
+        // For "missing override" checks, methods introduced by MODDED parent
+        // classes should not force children to add 'override'. Only methods
+        // from original (non-modded) parent definitions count.
+        const originalParentMethods = new Map<string, FunctionDeclNode[]>();
+        for (const parentClass of hierarchyToSearch) {
+            if (parentClass.modifiers?.includes('modded')) continue;
+            for (const member of parentClass.members || []) {
+                if (member.kind === 'FunctionDecl' && member.name) {
+                    if (!originalParentMethods.has(member.name)) {
+                        originalParentMethods.set(member.name, []);
+                    }
+                    originalParentMethods.get(member.name)!.push(member as FunctionDeclNode);
                 }
             }
         }
@@ -3276,21 +3341,28 @@ export class Analyzer {
             if (member.kind !== 'FunctionDecl') continue;
             const func = member as FunctionDeclNode;
 
-            // Override / inheritance checks (skip constructors)
-            if (func.name && func.name !== cls.name) {
+            // Override / inheritance checks (skip constructors and destructors)
+            if (func.name && func.name !== cls.name && !func.name.startsWith('~')) {
                 const parentOverloads = parentMethods.get(func.name);
+                // For "missing override": only original (non-modded) parent methods
+                // count. A modded parent adding a method shouldn't force children
+                // to add 'override' — the child may be the original introducer.
+                const originalOverloads = originalParentMethods.get(func.name);
 
                 if (parentOverloads) {
                     // Method exists in a parent — check override usage
                     if (!func.isOverride) {
-                        // Missing 'override' keyword (only if param count matches)
-                        const childParamCount = func.parameters?.length ?? 0;
-                        if (parentOverloads.some(p => (p.parameters?.length ?? 0) === childParamCount)) {
-                            diags.push({
-                                message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
-                                range: { start: func.nameStart, end: func.nameEnd },
-                                severity: DiagnosticSeverity.Warning
-                            });
+                        // Only warn "missing override" if the method exists in an
+                        // ORIGINAL (non-modded) parent class definition.
+                        if (originalOverloads) {
+                            const childParamCount = func.parameters?.length ?? 0;
+                            if (originalOverloads.some(p => (p.parameters?.length ?? 0) === childParamCount)) {
+                                diags.push({
+                                    message: `Method '${func.name}' overrides a method from a parent class but is missing the 'override' keyword.`,
+                                    range: { start: func.nameStart, end: func.nameEnd },
+                                    severity: DiagnosticSeverity.Warning
+                                });
+                            }
                         }
                     } else {
                         // Has 'override' — validate signature matches a parent overload

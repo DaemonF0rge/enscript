@@ -642,23 +642,52 @@ export function parse(
                     // ================================================================
                     if (t.kind === TokenKind.Keyword && t.value === 'return' && depth > 0) {
                         const retStart = doc.positionAt(t.start);
+                        const retLine = retStart.line;
                         // Scan forward to the ';' to capture the expression range
                         const exprStartOffset = t.end; // right after the 'return' token
                         let exprEndOffset = exprStartOffset;
                         let semiOffset = exprStartOffset;
                         let scanIdx = pos;
+                        let foundTerminator = false;
                         while (scanIdx < toks.length) {
                             const scanTok = toks[scanIdx];
                             if (scanTok.value === ';') {
                                 semiOffset = scanTok.end;
                                 exprEndOffset = scanTok.start;
+                                foundTerminator = true;
                                 break;
                             }
-                            // Stop at block boundaries to be safe
-                            if (scanTok.value === '{' || scanTok.value === '}') {
+                            // Array literal initializer: {val1, val2, ...}
+                            // Scan through balanced braces as part of the expression
+                            if (scanTok.value === '{') {
+                                let braceDepth = 1;
+                                scanIdx++;
+                                while (scanIdx < toks.length && braceDepth > 0) {
+                                    if (toks[scanIdx].value === '{') braceDepth++;
+                                    else if (toks[scanIdx].value === '}') braceDepth--;
+                                    scanIdx++;
+                                }
+                                continue; // Continue looking for ';' after the array literal
+                            }
+                            // Stop at closing brace — end of enclosing block
+                            if (scanTok.value === '}') {
                                 exprEndOffset = scanTok.start;
                                 semiOffset = scanTok.start;
+                                foundTerminator = true;
                                 break;
+                            }
+                            // If the next non-whitespace token is on a different
+                            // line, treat this as a bare 'return' (no semicolon).
+                            // EnforceScript allows bare returns without ';'.
+                            if (scanIdx > pos - 1) {
+                                const tokLine = doc.positionAt(scanTok.start).line;
+                                if (tokLine > retLine) {
+                                    // Next token is on a new line — bare return
+                                    exprEndOffset = exprStartOffset;
+                                    semiOffset = t.end;
+                                    foundTerminator = true;
+                                    break;
+                                }
                             }
                             scanIdx++;
                         }
