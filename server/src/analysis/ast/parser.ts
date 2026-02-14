@@ -356,7 +356,8 @@ export function parse(
         diagnostics: diagnostics  // Include parser diagnostics
     };
 
-    // main loop
+    // main loop – with error recovery so one broken declaration
+    // doesn't kill parsing for the entire file.
     while (!eof()) {
         if (eof()) break;
 
@@ -366,8 +367,35 @@ export function parse(
             continue;
         }
 
-        const nodes = parseDecl(doc, 0); // depth = 0
-        file.body.push(...nodes);
+        try {
+            const nodes = parseDecl(doc, 0); // depth = 0
+            file.body.push(...nodes);
+        } catch (err) {
+            // Record the parse error as a diagnostic instead of aborting
+            if (err instanceof ParseError) {
+                addDiagnostic(
+                    toks[Math.min(pos, toks.length - 1)],
+                    err.message,
+                    DiagnosticSeverity.Error
+                );
+            }
+            // Skip to the next top-level boundary:
+            //  - ';' at brace depth 0  (end of broken variable/etc.)
+            //  - closing a balanced { } (end of broken function/class body)
+            //  - unmatched '}' at depth 0 (shouldn't happen at top level)
+            let braceDepth = 0;
+            while (!eof()) {
+                const v = peek().value;
+                if (v === '{') { braceDepth++; next(); }
+                else if (v === '}') {
+                    if (braceDepth === 0) { next(); break; }
+                    braceDepth--; next();
+                    if (braceDepth === 0) break; // closed a balanced block
+                }
+                else if (v === ';' && braceDepth === 0) { next(); break; }
+                else { next(); }
+            }
+        }
     }
 
     return file;
@@ -431,8 +459,35 @@ export function parse(
                     next();
                     continue;
                 }
-                const m = parseDecl(doc, depth + 1);
-                members.push(...m);
+                try {
+                    const m = parseDecl(doc, depth + 1);
+                    members.push(...m);
+                } catch (err) {
+                    // Record error but keep parsing remaining class members
+                    if (err instanceof ParseError) {
+                        addDiagnostic(
+                            toks[Math.min(pos, toks.length - 1)],
+                            err.message,
+                            DiagnosticSeverity.Error
+                        );
+                    }
+                    // Skip to the next member boundary:
+                    //  - ';' at brace depth 0  (end of broken variable)
+                    //  - closing a balanced { } (end of broken function body)
+                    //  - outer class '}' (stop WITHOUT consuming it)
+                    let bd = 0;
+                    while (!eof()) {
+                        const v = peek().value;
+                        if (v === '{') { bd++; next(); }
+                        else if (v === '}') {
+                            if (bd === 0) break; // outer class '}' — don't consume
+                            bd--; next();
+                            if (bd === 0) break; // closed a balanced block
+                        }
+                        else if (v === ';' && bd === 0) { next(); break; }
+                        else { next(); }
+                    }
+                }
             }
             expect('}');
 

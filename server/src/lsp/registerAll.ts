@@ -7,7 +7,6 @@ import { registerReferences } from './handlers/references';
 import { registerRename } from './handlers/rename';
 import { registerWorkspaceSymbol } from './handlers/workspaceSymbol';
 import { registerDiagnostics } from './handlers/diagnostics';
-import { registerDocuments } from './handlers/documents';
 import { registerDumpDiagnostics } from './handlers/dumpDiagnostics';
 import { registerIncludePaths } from './handlers/includePaths';
 
@@ -19,7 +18,6 @@ export function registerAllHandlers(conn: Connection, docs: TextDocuments<TextDo
     registerRename(conn, docs);
     registerWorkspaceSymbol(conn, docs);
     registerDiagnostics(conn, docs);
-    registerDocuments(conn, docs);
     registerDumpDiagnostics(conn, docs);
     registerIncludePaths(conn, docs);
 }

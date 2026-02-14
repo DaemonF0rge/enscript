@@ -967,6 +967,13 @@ export class Analyzer {
      */
     private resolveVariableType(doc: TextDocument, pos: Position, varName: string): string | null {
         
+        // Handle 'this' keyword — resolve to containing class type
+        if (varName === 'this') {
+            const ast = this.ensure(doc);
+            const containingClass = this.findContainingClass(ast, pos);
+            return containingClass?.name ?? null;
+        }
+        
         // Delegate the AST-based lookup to resolveVariableTypeNode
         const typeNode = this.resolveVariableTypeNode(doc, pos, varName);
         if (typeNode) {
@@ -1020,6 +1027,15 @@ export class Analyzer {
     private resolveVariableTypeNode(doc: TextDocument, pos: Position, varName: string): TypeNode | null {
         const ast = this.ensure(doc);
         
+        // Handle 'this' keyword — resolve to containing class type
+        if (varName === 'this') {
+            const containingClass = this.findContainingClass(ast, pos);
+            if (containingClass) {
+                return { identifier: containingClass.name, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
+            }
+            return null;
+        }
+        
         const containingFunc = this.findContainingFunction(ast, pos);
         if (containingFunc) {
             for (const param of containingFunc.parameters || []) {
@@ -1032,8 +1048,18 @@ export class Analyzer {
         
         const containingClass = this.findContainingClass(ast, pos);
         if (containingClass) {
+            // First search the local AST class members directly — this always works
+            // even if classIndex is stale or hasn't been populated yet
+            for (const member of containingClass.members || []) {
+                if (member.kind === 'VarDecl' && member.name === varName && (member as VarDeclNode).type) {
+                    return (member as VarDeclNode).type!;
+                }
+            }
+            // Then walk the class hierarchy via classIndex for inherited members
             const classHierarchy = this.getClassHierarchyOrdered(containingClass.name, new Set());
             for (const classNode of classHierarchy) {
+                // Skip self — already searched above via the local AST
+                if (classNode.name === containingClass.name) continue;
                 for (const member of classNode.members || []) {
                     if (member.kind === 'VarDecl' && member.name === varName && (member as VarDeclNode).type) {
                         return (member as VarDeclNode).type!;
@@ -1912,11 +1938,28 @@ export class Analyzer {
         // These are keywords in the lexer but also real classes defined in enconvert.c / enstring.c
         const typeKeywords = new Set(['string', 'int', 'float', 'bool', 'vector', 'typename', 'void']);
         if (token.kind !== TokenKind.Identifier && 
-            !(token.kind === TokenKind.Keyword && typeKeywords.has(token.value))) {
+            !(token.kind === TokenKind.Keyword && typeKeywords.has(token.value)) &&
+            !(token.kind === TokenKind.Keyword && token.value === 'this')) {
             return [];
         }
 
         const name = token.value;
+        
+        // Handle 'this' keyword — navigate to the containing class definition
+        if (name === 'this') {
+            const ast = this.ensure(doc);
+            const containingClass = this.findContainingClass(ast, _pos);
+            if (containingClass) {
+                // Return the class from classIndex for proper URI/position
+                const indexed = this.classIndex.get(containingClass.name);
+                if (indexed && indexed.length > 0) {
+                    return [indexed[0] as SymbolNodeBase];
+                }
+                // Fallback: return the local AST class node
+                return [containingClass as SymbolNodeBase];
+            }
+            return [];
+        }
 
         // Check if this is a member access (e.g., player.GetInputType or GetGame().GetTime())
         // Look backwards from the token start to find a dot
@@ -2018,10 +2061,17 @@ export class Analyzer {
         const containingClass = this.findContainingClass(ast, _pos);
         
         if (containingClass) {
-            // First, look in current class hierarchy
+            // First, look in current class hierarchy via classIndex
             const hierarchyMatches = this.findMemberInClassHierarchy(containingClass.name, name);
             if (hierarchyMatches.length > 0) {
                 return hierarchyMatches;
+            }
+            // Fallback: search local AST class members directly — works even if
+            // classIndex is stale or not yet populated for this file
+            for (const member of containingClass.members || []) {
+                if (member.name === name) {
+                    return [member as SymbolNodeBase];
+                }
             }
         }
 
@@ -2674,11 +2724,13 @@ export class Analyzer {
                     if (member.kind === 'VarDecl' && member.name && (member as VarDeclNode).type?.identifier) {
                         add(member.name, (member as VarDeclNode).type.identifier, clsStart, clsEnd, true);
                     }
-                    // Methods — collect params and locals
+                    // Methods — collect params, locals, and 'this' reference
                     if (member.kind === 'FunctionDecl') {
                         const func = member as FunctionDeclNode;
                         const fStart = func.start?.line ?? clsStart;
                         const fEnd = func.end?.line ?? clsEnd;
+                        // Add 'this' as the containing class type for each method scope
+                        add('this', cls.name, fStart, fEnd, false);
                         for (const p of func.parameters || []) {
                             if (p.name && p.type?.identifier) {
                                 add(p.name, p.type.identifier, fStart, fEnd, false);

@@ -388,6 +388,43 @@ test('detects return with expression text', () => {
     expect(exprText).toBe('m_name');
 });
 
+test('error recovery: broken class member does not kill entire class', () => {
+    // One broken member (badFunc has invalid syntax), rest should still parse
+    const code = `class MyClass {
+    int m_health;
+    void BadFunc(@@@ GARBAGE) { }
+    float m_speed;
+    void GoodFunc() {
+        int x = 5;
+    }
+};`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    // Class should still be parsed
+    expect(ast.body.length).toBe(1);
+    expect(ast.body[0]).toHaveProperty('kind', 'ClassDecl');
+    const cls = ast.body[0] as any;
+    expect(cls.name).toBe('MyClass');
+    // Members before and after the broken one should still be present
+    const memberNames = cls.members.map((m: any) => m.name);
+    expect(memberNames).toContain('m_health');
+    expect(memberNames).toContain('m_speed');
+    expect(memberNames).toContain('GoodFunc');
+});
+
+test('error recovery: broken top-level decl does not kill other declarations', () => {
+    // First class is fine, second has garbage, third is fine
+    const code = `class A { int x; };
+@@@ GARBAGE @@@;
+class B { float y; };`;
+    const doc = TextDocument.create('file:///test.enscript', 'enscript', 1, code);
+    const ast = parse(doc);
+    // Both valid classes should be recovered
+    const classNames = ast.body.filter((n: any) => n.kind === 'ClassDecl').map((n: any) => n.name);
+    expect(classNames).toContain('A');
+    expect(classNames).toContain('B');
+});
+
 test('playground', () => {
     const target_file = path.join("P:\\enscript\\test", "test_enscript.c");
     const text = fs.readFileSync(target_file, "utf8");
