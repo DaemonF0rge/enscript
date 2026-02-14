@@ -796,7 +796,14 @@ export class Analyzer {
             
             // If it's a function call like GetGame(). → look up the function's return type
             if (hasParens) {
-                const returnType = this.resolveFunctionReturnType(name);
+                let returnType = this.resolveFunctionReturnType(name);
+                // Fall back to method of containing class (e.g., GetInstance() inside a class)
+                if (!returnType) {
+                    const cc = this.findContainingClass(ast, pos);
+                    if (cc) {
+                        returnType = this.resolveMethodReturnType(cc.name, name);
+                    }
+                }
                 if (returnType) {
                     return this.getClassMemberCompletions(returnType, prefix);
                 }
@@ -1082,20 +1089,13 @@ export class Analyzer {
             }
         }
         
-        // Check class methods across all classes (still need to iterate but on indexed classes)
-        // This is for static calls or when we don't know the class
-        for (const [className, classes] of this.classIndex) {
-            for (const classNode of classes) {
-                for (const member of classNode.members || []) {
-                    if (member.kind === 'FunctionDecl' && member.name === funcName) {
-                        const func = member as FunctionDeclNode;
-                        if (func.returnType?.identifier) {
-                            return func.returnType;
-                        }
-                    }
-                }
-            }
-        }
+        // NOTE: We intentionally do NOT fall back to searching all class methods here.
+        // An unqualified function call should only resolve to:
+        //   1) A constructor (checked above)
+        //   2) A top-level (global) function (checked above)
+        //   3) A method in the containing class hierarchy (handled by resolveMethodReturnType)
+        // Searching all class methods would return arbitrary results (e.g., GetInstance()
+        // matching NotificationSystem instead of the caller's own class).
         
         return null;
     }
@@ -1499,7 +1499,7 @@ export class Analyzer {
      * Parses the chain, resolves the first function call, then delegates to
      * resolveChainSteps for subsequent member accesses.
      */
-    private resolveChainReturnType(chainText: string): string | null {
+    private resolveChainReturnType(chainText: string, className?: string): string | null {
         // Parse the first call: funcName(args)
         const remaining = chainText.trim();
         const firstMatch = remaining.match(/^(\w+)\s*\(/);
@@ -1522,38 +1522,47 @@ export class Analyzer {
         
         // Resolve the first function's return type
         const firstTypeNode = this.resolveFunctionReturnTypeNode(firstFunc);
-        if (!firstTypeNode?.identifier) {
-            // No return type found — check if it's an implicit constructor (class/typedef with no declaration)
-            if (this.classIndex.has(firstFunc) || this.typedefIndex.has(firstFunc)) {
-                if (calls.length === 0) return firstFunc;
-                return this.resolveVariableChainType(firstFunc, '.' + calls.join('.'));
+        let currentType: string | null = firstTypeNode?.identifier ?? null;
+        let resolvedTypeNode = firstTypeNode;
+        
+        if (!currentType) {
+            // Try resolving as a method of the containing class
+            if (className) {
+                currentType = this.resolveMethodReturnType(className, firstFunc);
             }
-            return null;
+            if (!currentType) {
+                // Check if it's an implicit constructor (class/typedef with no declaration)
+                if (this.classIndex.has(firstFunc) || this.typedefIndex.has(firstFunc)) {
+                    if (calls.length === 0) return firstFunc;
+                    return this.resolveVariableChainType(firstFunc, '.' + calls.join('.'));
+                }
+                return null;
+            }
         }
         
-        let currentType = firstTypeNode.identifier;
+        let currentType2 = currentType;
         
         // Resolve typedef and build initial template map
         let templateMap: Map<string, string>;
-        const typedefNode = this.resolveTypedefNode(currentType);
+        const typedefNode = this.resolveTypedefNode(currentType2);
         if (typedefNode) {
-            currentType = typedefNode.oldType.identifier;
-            templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+            currentType2 = typedefNode.oldType.identifier;
+            templateMap = this.buildTemplateMap(currentType2, typedefNode.oldType.genericArgs);
         } else {
-            templateMap = this.buildTemplateMap(currentType, firstTypeNode.genericArgs);
+            templateMap = this.buildTemplateMap(currentType2, resolvedTypeNode?.genericArgs);
         }
         
         // If no chained calls, return the first function's resolved type
         if (calls.length === 0) {
             // Check for array indexing after the single call, e.g., GetOrientation()[0]
             if (this.hasIndexingAfterCall(afterFirst)) {
-                return this.resolveIndexedType(currentType);
+                return this.resolveIndexedType(currentType2);
             }
-            return currentType;
+            return currentType2;
         }
         
         // Delegate remaining chain steps
-        const result = this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        const result = this.resolveChainSteps(calls, currentType2, templateMap)?.type ?? null;
         
         // If the chain contains array indexing outside of args, resolve to element type
         if (result && this.hasIndexingAfterCall(afterFirst)) {
@@ -1986,7 +1995,15 @@ export class Analyzer {
         if (chainedCallMatch) {
             // CHAINED CALL: Resolve the return type of the function call
             const funcName = chainedCallMatch[1];
-            const returnType = this.resolveFunctionReturnType(funcName);
+            let returnType = this.resolveFunctionReturnType(funcName);
+            // Fall back to method of containing class (e.g., GetInstance().member inside a class)
+            if (!returnType) {
+                const ast2 = this.ensure(doc);
+                const cc = this.findContainingClass(ast2, _pos);
+                if (cc) {
+                    returnType = this.resolveMethodReturnType(cc.name, funcName);
+                }
+            }
             
             if (returnType) {
                 const classMatches = this.findMemberInClassHierarchy(returnType, name);
@@ -2292,7 +2309,18 @@ export class Analyzer {
         const chainedCallMatch = textBeforeToken.match(/(\w+)\s*\([^)]*\)\s*\.\s*$/);
         if (chainedCallMatch) {
             const funcName = chainedCallMatch[1];
-            const returnTypeNode = this.resolveFunctionReturnTypeNode(funcName);
+            let returnTypeNode = this.resolveFunctionReturnTypeNode(funcName);
+            // Fall back to method of containing class
+            if (!returnTypeNode?.identifier) {
+                const ast2 = this.ensure(doc);
+                const cc = this.findContainingClass(ast2, _pos);
+                if (cc) {
+                    const methodType = this.resolveMethodReturnType(cc.name, funcName);
+                    if (methodType) {
+                        returnTypeNode = { identifier: methodType, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
+                    }
+                }
+            }
             if (returnTypeNode?.identifier) {
                 let resolvedType = returnTypeNode.identifier;
                 const typedefNode = this.resolveTypedefNode(resolvedType);
@@ -2750,6 +2778,10 @@ export class Analyzer {
             // Check return statements: missing returns in non-void functions
             // and return type mismatches (including downcast warnings)
             this.checkReturnStatements(doc, diags, text, lineOffsets, ast, scopedVars);
+            
+            // Check that modded classes are in the same script module (or higher)
+            // as the original class they are modding
+            this.checkModdedClassModules(ast, diags);
         }
         
         // Check for multi-line statements (not supported in Enforce Script)
@@ -3028,7 +3060,7 @@ export class Analyzer {
 
             if (afterCall.startsWith('.')) {
                 // Method chain — delegate to resolveChainReturnType
-                return this.resolveChainReturnType(trimmed);
+                return this.resolveChainReturnType(trimmed, className);
             }
             // Single function call — resolve as method of containing class first
             if (className) {
@@ -3850,7 +3882,9 @@ export class Analyzer {
                 // For type resolution, pass everything up to ';' - resolveChainReturnType
                 // handles trailing non-chain text gracefully
                 const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
-                returnType = this.resolveChainReturnType(fullChainText);
+                const lineNumForChain = Analyzer.getLineFromOffset(lineOffsets, match.index);
+                const chainClass = this.findContainingClass(ast, { line: lineNumForChain, character: 0 });
+                returnType = this.resolveChainReturnType(fullChainText, chainClass?.name);
                 
                 // For highlight, find where the chain actually ends (last ')' or property name)
                 // by scanning: balanced parens, then optional .identifier or .identifier(...)
@@ -4091,7 +4125,8 @@ export class Analyzer {
                 chainEnd = stmtEnd >= 0 ? stmtEnd : afterMatch.length;
                 
                 const fullChainText = funcName + '(' + afterMatch.substring(0, chainEnd);
-                returnType = this.resolveChainReturnType(fullChainText);
+                const chainClass2 = this.findContainingClass(ast, { line: lineNum, character: 0 });
+                returnType = this.resolveChainReturnType(fullChainText, chainClass2?.name);
                 
                 // For highlight, find where the chain actually ends (last ')' or property name)
                 let hlEnd = 0;
@@ -4982,6 +5017,9 @@ export class Analyzer {
                             if (afterRoot.trimStart().startsWith('(')) {
                                 // Root is a function call: FuncName(...).chain...
                                 rootType = this.resolveFunctionReturnType(rootName) ?? undefined;
+                                if (!rootType && containingClassName) {
+                                    rootType = this.resolveMethodCallWithTemplates(containingClassName, rootName) ?? undefined;
+                                }
                                 const parenStart = afterRoot.indexOf('(');
                                 let d = 1, i = parenStart + 1;
                                 while (i < afterRoot.length && d > 0) {
@@ -5276,6 +5314,52 @@ export class Analyzer {
                         });
                     }
                 }
+            }
+        }
+    }
+
+    // ====================================================================
+    // MODDED CLASS MODULE VALIDATION
+    // ====================================================================
+
+    /**
+     * Check that modded classes are placed in the correct script module.
+     * 
+     * A `modded class` must be in the SAME script module as the original class.
+     * For example:
+     *   - modded class PlayerBase (4_World) must be in 4_World
+     *   - modded class MissionServer (5_Mission) must be in 5_Mission
+     * 
+     * Placing it in a different module (higher or lower) will cause issues.
+     */
+    private checkModdedClassModules(ast: File, diags: Diagnostic[]): void {
+        for (const node of ast.body) {
+            if (node.kind !== 'ClassDecl') continue;
+            const cls = node as ClassDeclNode;
+            if (!cls.modifiers?.includes('modded')) continue;
+
+            // Get the module level of this modded class from its URI
+            const moddedLevel = getModuleLevel(cls.uri);
+            if (moddedLevel === 0) continue; // Can't determine module — skip
+
+            // Find the original (non-modded) class in the index
+            const allVersions = this.classIndex.get(cls.name);
+            if (!allVersions || allVersions.length === 0) continue;
+
+            const original = allVersions.find(c => !c.modifiers?.includes('modded'));
+            if (!original) continue; // No original found — all modded, can't check
+
+            const originalLevel = getModuleLevel((original as any)._sourceUri ?? original.uri);
+            if (originalLevel === 0) continue; // Can't determine original's module
+
+            if (moddedLevel !== originalLevel) {
+                const moddedModuleName = MODULE_NAMES[moddedLevel] || `module ${moddedLevel}`;
+                const originalModuleName = MODULE_NAMES[originalLevel] || `module ${originalLevel}`;
+                diags.push({
+                    message: `Modded class '${cls.name}' is in ${moddedModuleName} but the original class is in ${originalModuleName}. A modded class must be in the same module as the original.`,
+                    range: { start: cls.nameStart, end: cls.nameEnd },
+                    severity: DiagnosticSeverity.Error
+                });
             }
         }
     }
