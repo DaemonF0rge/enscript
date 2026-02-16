@@ -6,11 +6,14 @@ import {
     ServerOptions,
     TransportKind
 } from 'vscode-languageclient/node';
+import { activateDayzCppDiagnostics } from './dayzcppDiagnostics';
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
+    activateDayzCppDiagnostics(context);
+
     const serverModule = path.join(__dirname, '..', 'server', 'out', 'index.js');
 
     const debugOptions = { execArgv: ['--nolazy', '--inspect=6009'] };

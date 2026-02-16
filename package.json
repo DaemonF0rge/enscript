@@ -29,6 +29,17 @@
                     ".cproj"
                 ],
                 "configuration": "./language-configuration.json"
+            },
+            {
+                "id": "dayzcpp",
+                "aliases": [
+                    "DayZ Config Cpp",
+                    "dayzcpp"
+                ],
+                "filenames": [
+                    "config.cpp"
+                ],
+                "configuration": "./language-configuration-dayzcpp.json"
             }
         ],
         "grammars": [
@@ -36,6 +47,11 @@
                 "language": "enscript",
                 "scopeName": "source.enscript",
                 "path": "./syntaxes/enscript.tmLanguage.json"
+            },
+            {
+                "language": "dayzcpp",
+                "scopeName": "source.dayzcpp",
+                "path": "./syntaxes/dayzcpp.tmLanguage.json"
             }
         ],
         "commands": [

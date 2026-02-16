@@ -1,0 +1,317 @@
+{
+  "name": "DayZ Config Cpp",
+  "scopeName": "source.dayzcpp",
+  "fileTypes": [
+    "cpp"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#preprocessor"
+    },
+    {
+      "include": "#cfg-root-class"
+    },
+    {
+      "include": "#forward-class-declaration"
+    },
+    {
+      "include": "#inline-empty-class"
+    },
+    {
+      "include": "#class-declaration"
+    },
+    {
+      "include": "#script-module-class"
+    },
+    {
+      "include": "#macro-symbols"
+    },
+    {
+      "include": "#common-property-assignment"
+    },
+    {
+      "include": "#array-assignment"
+    },
+    {
+      "include": "#property-assignment"
+    },
+    {
+      "include": "#operators-and-punctuation"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#path-strings"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.dayzcpp",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.dayzcpp",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.dayzcpp",
+          "match": "^\\s*(#\\s*[A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "cfg-root-class": {
+      "patterns": [
+        {
+          "name": "meta.class.cfg-root.dayzcpp",
+          "match": "\\b(class)\\s+(CfgPatches|CfgVehicles|CfgWeapons|CfgMagazines|CfgAmmo|CfgSlots|CfgNonAIVehicles|CfgMods|CfgSoundSets|CfgSoundShaders|CfgSounds|CfgSoundTables|CfgSurfaces|CfgWorlds|CfgMovesBasic|CfgMovesMaleSdr|CfgVehiclesProxy|CfgEventTypes|CfgSoundGlobals|CfgEnvSounds)",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.dayzcpp"
+            },
+            "2": {
+              "name": "support.type.cfg-section.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "forward-class-declaration": {
+      "patterns": [
+        {
+          "name": "meta.class.forward.dayzcpp",
+          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)(\\s*;)",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.dayzcpp"
+            },
+            "2": {
+              "name": "entity.name.type.class.dayzcpp"
+            },
+            "3": {
+              "name": "punctuation.separator.key-value.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "inline-empty-class": {
+      "patterns": [
+        {
+          "name": "meta.class.inline-empty.dayzcpp",
+          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?\\s*(\\{\\s*\\})\\s*(;)",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.dayzcpp"
+            },
+            "2": {
+              "name": "entity.name.type.class.dayzcpp"
+            },
+            "3": {
+              "name": "entity.other.inherited-class.dayzcpp"
+            },
+            "4": {
+              "name": "meta.block.empty.dayzcpp"
+            },
+            "5": {
+              "name": "punctuation.separator.key-value.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "class-declaration": {
+      "patterns": [
+        {
+          "name": "meta.class.dayzcpp",
+          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.dayzcpp"
+            },
+            "2": {
+              "name": "entity.name.type.class.dayzcpp"
+            },
+            "3": {
+              "name": "entity.other.inherited-class.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "script-module-class": {
+      "patterns": [
+        {
+          "name": "support.class.script-module.dayzcpp",
+          "match": "\\b(engineScriptModule|gameLibScriptModule|gameScriptModule|worldScriptModule|missionScriptModule)\\b"
+        }
+      ]
+    },
+    "macro-symbols": {
+      "patterns": [
+        {
+          "name": "constant.other.macro.dayzcpp",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "common-property-assignment": {
+      "patterns": [
+        {
+          "name": "meta.assignment.common-property.dayzcpp",
+          "match": "\\b(scope|minScope|scopeArsenal|scopeCurator|displayName|descriptionShort|model|simulation|inventorySlot|requiredVersion|maxSpeed|minSpeed|acceleration|mass|weight|itemsCargoSize|hiddenSelections|hiddenSelectionsTextures|requiredAddons|units|weapons|magazines|attachments|cargoClass|vehicleClass|editorCategory|editorSubcategory|author|authorID|credits|name|version|dir|picture|action|hideName|hidePicture|extra|type|inputs|defines|dependencies|files|value|count|damage|ammo|soundSetShot|soundSetShotExt|itemSize|itemBehaviour|rotationFlags|absorbency|repairableWithKits|repairCosts|hitpoints|healthLevels|source|animPeriod|initPhase|stackedUnit|quantityBar|varQuantityInit|varQuantityMin|varQuantityMax|varQuantityDestroyOnMin|hasIcon|autoSwitchOffWhenInCargo|energyUsagePerSecond|plugType|attachmentAction)\\b\\s*(=)",
+          "captures": {
+            "1": {
+              "name": "variable.other.property.common.dayzcpp"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "array-assignment": {
+      "patterns": [
+        {
+          "name": "meta.assignment.array.dayzcpp",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\s*\\[\\s*\\])\\s*(=)",
+          "captures": {
+            "1": {
+              "name": "variable.other.property.dayzcpp"
+            },
+            "2": {
+              "name": "punctuation.definition.array.dayzcpp"
+            },
+            "3": {
+              "name": "keyword.operator.assignment.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "property-assignment": {
+      "patterns": [
+        {
+          "name": "meta.assignment.property.dayzcpp",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?!\\s*\\[)\\s*(=)",
+          "captures": {
+            "1": {
+              "name": "variable.other.property.dayzcpp"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.dayzcpp"
+            }
+          }
+        }
+      ]
+    },
+    "operators-and-punctuation": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.dayzcpp",
+          "match": "="
+        },
+        {
+          "name": "punctuation.separator.key-value.dayzcpp",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.comma.dayzcpp",
+          "match": ","
+        },
+        {
+          "name": "punctuation.definition.block.begin.dayzcpp",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.definition.block.end.dayzcpp",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.definition.array.dayzcpp",
+          "match": "\\[\\s*\\]"
+        },
+        {
+          "name": "punctuation.definition.inheritance.dayzcpp",
+          "match": ":"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.dayzcpp",
+          "match": "\\b(class|enum|delete|new|extern)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.dayzcpp",
+          "match": "\\b(true|false|null|NULL)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.dayzcpp",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.dayzcpp",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "path-strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.path.dayzcpp",
+          "match": "\"[^\"\\n]*\\.(?:p3d|paa|rvmat|xml|layout)\""
+        },
+        {
+          "name": "string.quoted.double.path.dayzcpp",
+          "match": "\"(?:[A-Za-z]:)?(?:\\\\|/)?(?:dz|DZ|DayZExpansion|BasicMap|PlayerMarkets|_UFramework)[^\"\\n]*\""
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.dayzcpp",
+          "match": "\\b-?(?:0x[0-9A-Fa-f]+|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b"
+        }
+      ]
+    }
+  }
+}

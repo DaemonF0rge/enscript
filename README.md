@@ -23,6 +23,15 @@ Find your extracted scripts folder (usually `P:\scripts`) and add it to user set
 
 ![syntax](https://raw.githubusercontent.com/yuvalino/enscript/refs/heads/main/media/syntax.jpg)
 
+### DayZ `config.cpp` / `mod.cpp` basic highlighting
+
+This extension now includes a separate lightweight language mode for DayZ config-style `config.cpp` and `mod.cpp` files.
+
+- It provides basic highlighting for class blocks, key/value assignments, arrays, strings, numbers, comments, and preprocessor lines.
+- It also provides lightweight warnings for common config mistakes (especially AI-generated ones), such as doubled backslashes in paths, mixed slash styles, accidental absolute Windows paths, and suspicious assignment/class declaration forms.
+- It is intentionally minimal and isolated from the EnScript language server features.
+- It only auto-associates files named `config.cpp` and `mod.cpp`, so regular C++ projects are not affected.
+
 2. **Hover & Jump to Definition:** Indexed symbols have their own hover and may be Ctrl+Click'ed to jump to definition.
 
 ![definition.gif](https://raw.githubusercontent.com/yuvalino/enscript/refs/heads/main/media/definition.gif)
