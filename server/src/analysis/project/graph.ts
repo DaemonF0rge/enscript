@@ -4892,6 +4892,7 @@ export class Analyzer {
             
             let overloads: FunctionDeclNode[] = [];
             let chainAttempted = false;
+            let dotIsPartOfChain = false;
             let containingClassName: string | undefined;
             
             // Try to find the containing class for this call site (needed for template resolution)
@@ -4914,6 +4915,7 @@ export class Analyzer {
                 // static class reference, even if a class named "Icons" exists.
                 const beforeObjName = textBeforeFunc.substring(0, dotMatch.index).trimEnd();
                 const isPartOfChain = beforeObjName.length > 0 && (beforeObjName[beforeObjName.length - 1] === '.' || beforeObjName[beforeObjName.length - 1] === ')');
+                dotIsPartOfChain = isPartOfChain;
                 if (!isPartOfChain && objName[0] === objName[0].toUpperCase() && this.classIndex.has(objName)) {
                     overloads = this.findFunctionOverloads(funcName, objName);
                 }
@@ -5124,22 +5126,31 @@ export class Analyzer {
                     continue;
                 }
                 
-                // Warn about unknown functions only when the index is large enough to be confident
-                if (this.docCache.size >= 500) {
-                    // Skip warning for chain calls where we couldn't resolve the target type —
-                    // we don't know what class the method belongs to
-                    const isUnresolvedChain = chainAttempted || (dotMatch && !getVarTypeAtLine(dotMatch[1], lineNum) && dotMatch[1][0] !== dotMatch[1][0].toUpperCase());
-                    if (!isUnresolvedChain) {
-                        const startPos = doc.positionAt(match.index);
-                        const endPos = doc.positionAt(match.index + funcName.length);
-                        diags.push({
-                            message: dotMatch
-                                ? `Unknown method '${funcName}' on type '${getVarTypeAtLine(dotMatch[1], lineNum) || dotMatch[1]}'`
-                                : `Unknown function '${funcName}'`,
-                            range: { start: startPos, end: endPos },
-                            severity: DiagnosticSeverity.Warning
-                        });
-                    }
+                // Skip warning for chain calls where we couldn't resolve the target type —
+                // we don't know what class the method belongs to
+                const dotObj = dotMatch ? dotMatch[1] : undefined;
+                const dotObjType = dotObj ? getVarTypeAtLine(dotObj, lineNum) : undefined;
+                const dotObjIsKnownClass = !!dotObj && dotObj[0] === dotObj[0].toUpperCase() && this.classIndex.has(dotObj);
+                const isUnresolvedChain =
+                    (!dotMatch && chainAttempted) ||
+                    (!!dotMatch && (dotIsPartOfChain || (!dotObjType && !dotObjIsKnownClass)));
+
+                // Global/unknown receiver calls need a large index to avoid noise.
+                // But when receiver type is known (obj.Method), we can warn confidently
+                // even with a smaller index.
+                const hasConfidentReceiverType = !!dotMatch && (!!dotObjType || dotObjIsKnownClass);
+                const canWarn = this.docCache.size >= 500 || hasConfidentReceiverType;
+
+                if (canWarn && !isUnresolvedChain) {
+                    const startPos = doc.positionAt(match.index);
+                    const endPos = doc.positionAt(match.index + funcName.length);
+                    diags.push({
+                        message: dotMatch
+                            ? `Unknown method '${funcName}' on type '${dotObjType || dotObj}'`
+                            : `Unknown function '${funcName}'`,
+                        range: { start: startPos, end: endPos },
+                        severity: DiagnosticSeverity.Warning
+                    });
                 }
                 continue;
             }
