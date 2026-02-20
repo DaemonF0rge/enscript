@@ -722,146 +722,68 @@ export class Analyzer {
         const textBeforeCursor = text.substring(0, offset);
         
         // ================================================================
-        // MULTI-LEVEL CHAIN COMPLETION
+        // UNIFIED CHAIN COMPLETION — handles all dot-chain patterns:
+        //   variable.prefix, func().prefix, var.field.method().prefix,
+        //   func().field.method().prefix, Class.prefix, this.prefix,
+        //   and arbitrarily deep chains with nested parentheses.
         // ================================================================
-        // Handles chains like: param.param4.G  or  param.Get("x").To
-        // Detects 2+ dot-separated segments, resolves through the chain
-        // (with typedef/template substitution), and offers completions
-        // for the final resolved type.
-        // ================================================================
-        const multiDotMatch = textBeforeCursor.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*(\w*)$/);
-        if (multiDotMatch) {
-            const rootName = multiDotMatch[1];
-            const middleChain = multiDotMatch[2]; // e.g., ".param4" or ".Get(key).field"
-            const prefix = multiDotMatch[3] || '';
+        // Extract the prefix (partial identifier being typed after the last dot)
+        // and the "before-dot" text for chain resolution.
+        const completionDotMatch = textBeforeCursor.match(/\.\s*(\w*)$/);
+        if (completionDotMatch) {
+            const prefix = completionDotMatch[1] || '';
+            // Text up to (and including) the dot, for chain parsing
+            const textUpToDot = textBeforeCursor.substring(0, textBeforeCursor.length - completionDotMatch[0].length + 1);
+            // textUpToDot ends with '.', which is what parseExpressionChainBackward expects
             
-            // Resolve the root variable's type
-            const rootType = this.resolveVariableType(doc, pos, rootName);
-            if (rootType) {
-                // Resolve root through typedef and build initial template map
-                let currentType = rootType;
-                let templateMap: Map<string, string>;
-                const typedefNode = this.resolveTypedefNode(currentType);
-                if (typedefNode) {
-                    currentType = typedefNode.oldType.identifier;
-                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
-                } else {
-                    const varTypeNode = this.resolveVariableTypeNode(doc, pos, rootName);
-                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
-                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
-                    } else {
-                        templateMap = new Map();
-                    }
-                }
-                
-                // Resolve through the middle chain steps
-                const chainMembers = this.parseChainMembers(middleChain);
-                if (chainMembers.length > 0) {
-                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
-                    if (result) {
-                        return this.getClassMemberCompletions(result.type, prefix, result.templateMap.size > 0 ? result.templateMap : undefined);
-                    }
-                }
-            }
-        }
-        
-        // Match both variable.method and function().method patterns
-        // Pattern 1: variable. or variable.prefix
-        // Pattern 2: function(). or function().prefix  
-        // Pattern 3: function(args). or function(args).prefix
-        const dotMatch = textBeforeCursor.match(/(\w+)(\([^)]*\))?\s*\.\s*(\w*)$/);
-        
-        if (dotMatch) {
-            // MEMBER COMPLETION MODE
-            const name = dotMatch[1];
-            const hasParens = !!dotMatch[2]; // true if it's a function call like GetGame()
-            const prefix = dotMatch[3] || '';
-            
-            
-            // Handle 'this' keyword
-            if (name === 'this') {
-                const containingClass = this.findContainingClass(ast, pos);
-                if (containingClass) {
-                    return this.getClassMemberCompletions(containingClass.name, prefix);
-                }
-            }
-            
-            // Handle 'super' keyword
-            if (name === 'super') {
-                const containingClass = this.findContainingClass(ast, pos);
-                if (containingClass?.base?.identifier) {
-                    return this.getClassMemberCompletions(containingClass.base.identifier, prefix);
-                }
-            }
-            
-            // If it's a function call like GetGame(). → look up the function's return type
-            if (hasParens) {
-                let returnType = this.resolveFunctionReturnType(name);
-                // Fall back to method of containing class (e.g., GetInstance() inside a class)
-                if (!returnType) {
-                    const cc = this.findContainingClass(ast, pos);
-                    if (cc) {
-                        returnType = this.resolveMethodReturnType(cc.name, name);
-                    }
-                }
-                if (returnType) {
-                    return this.getClassMemberCompletions(returnType, prefix);
-                }
-            }
-            
-            // Try to resolve the variable's type
-            const varType = this.resolveVariableType(doc, pos, name);
-            
-            if (varType) {
-                // ================================================================
-                // TYPEDEF + TEMPLATE TYPE RESOLUTION FOR COMPLETIONS
-                // ================================================================
-                // When a variable has a typedef'd type (e.g., testMapType → map<string, string>),
-                // we need to:
-                //   1. Resolve the typedef to the underlying class name
-                //   2. Build a template substitution map (TKey→string, TValue→string)
-                //   3. Pass the map to getClassMemberCompletions so it can replace
-                //      generic param names with concrete types in the completion details
-                //
-                // This also handles direct generic declarations like: map<string, int> myMap;
-                // In that case we get the TypeNode (which has genericArgs) and build the map.
-                // ================================================================
-                const typedefNode = this.resolveTypedefNode(varType);
-                let resolvedType: string;
-                let tplMap: Map<string, string> | undefined;
-                
-                if (typedefNode) {
-                    // Typedef path: e.g., testMapType → oldType is map<string, string>
-                    resolvedType = typedefNode.oldType.identifier;
-                    tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
-                } else {
-                    resolvedType = varType;
-                    // Direct generic path: e.g., map<string, int> myMap
-                    // resolveVariableTypeNode returns the full TypeNode with genericArgs
-                    const varTypeNode = this.resolveVariableTypeNode(doc, pos, name);
-                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
-                        tplMap = this.buildTemplateMap(resolvedType, varTypeNode.genericArgs);
-                    }
-                }
-                // Get methods/fields for this type (including inherited)
-                const members = this.getClassMemberCompletions(resolvedType, prefix, tplMap);
-                return members;
-            }
-            
-            // If name looks like a class name (starts with uppercase), 
-            // it might be a static method call: ClassName.StaticMethod()
-            // OR an enum access: EnumName.EnumValue
-            if (name[0] === name[0].toUpperCase()) {
-                // First check if it's an enum
-                const enumNode = this.findEnumByName(name);
+            const chainResult = this.resolveFullChain(textUpToDot, doc, pos, ast);
+            if (chainResult) {
+                // Check if it's an enum type → show enum members
+                const enumNode = this.findEnumByName(chainResult.type);
                 if (enumNode) {
                     return this.getEnumMemberCompletions(enumNode, prefix);
                 }
+                // Show class members (methods, fields, statics)
+                return this.getClassMemberCompletions(
+                    chainResult.type,
+                    prefix,
+                    chainResult.templateMap.size > 0 ? chainResult.templateMap : undefined
+                );
+            }
+            
+            // Fallback for simple `name.` where the name is a class for statics
+            // or an unresolved variable — try class static completion  
+            const simpleNameMatch = textUpToDot.match(/(\w+)\s*\.$/);
+            if (simpleNameMatch) {
+                const name = simpleNameMatch[1];
                 
-                // Otherwise check for class static members
-                const classNode = this.findClassByName(name);
-                if (classNode) {
-                    return this.getStaticMemberCompletions(classNode, prefix);
+                // Handle 'this' keyword
+                if (name === 'this') {
+                    const containingClass = this.findContainingClass(ast, pos);
+                    if (containingClass) {
+                        return this.getClassMemberCompletions(containingClass.name, prefix);
+                    }
+                }
+                
+                // Handle 'super' keyword
+                if (name === 'super') {
+                    const containingClass = this.findContainingClass(ast, pos);
+                    if (containingClass?.base?.identifier) {
+                        return this.getClassMemberCompletions(containingClass.base.identifier, prefix);
+                    }
+                }
+                
+                if (name[0] === name[0].toUpperCase()) {
+                    // Check for enum
+                    const enumNode2 = this.findEnumByName(name);
+                    if (enumNode2) {
+                        return this.getEnumMemberCompletions(enumNode2, prefix);
+                    }
+                    // Check for class statics
+                    const classNode = this.findClassByName(name);
+                    if (classNode) {
+                        return this.getStaticMemberCompletions(classNode, prefix);
+                    }
                 }
             }
             
@@ -986,14 +908,16 @@ export class Analyzer {
         const regexKeywords = new Set(['if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'class', 'enum', 'else', 'foreach', 'void', 'override', 'static', 'private', 'protected', 'const', 'ref', 'autoptr', 'proto', 'native', 'modded', 'sealed', 'event', 'typedef', 'case', 'break', 'continue', 'this', 'super', 'null', 'true', 'false', 'out', 'inout', 'volatile']);
         
         // Pattern: Type varName; or Type varName = or Type varName[  (C-style array)
+        // Also handles generic types: Type<GenericArg> varName;
         // Use word boundary to avoid matching inside larger expressions
-        const varDeclMatch = text.match(new RegExp(`(?:^|[{;,\\s])\\s*(\\w+)\\s+${varName}\\s*[;=\\[]`));
+        const varDeclMatch = text.match(new RegExp(`(?:^|[{;,\\s])\\s*(\\w+)(?:\\s*<[^>]*>)?\\s+${varName}\\s*[;=\\[(]`));
         if (varDeclMatch && !regexKeywords.has(varDeclMatch[1])) {
             return varDeclMatch[1];
         }
         
         // Pattern: (Type varName) or (Type varName,) or (Type varName[) - function parameters
-        const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)\\s+${varName}\\s*[,)\\[]`));
+        // Also handles generic types
+        const paramMatch = text.match(new RegExp(`[,(]\\s*(\\w+)(?:\\s*<[^>]*>)?\\s+${varName}\\s*[,)\\[]`));
         if (paramMatch) {
             return paramMatch[1];
         }
@@ -1307,34 +1231,52 @@ export class Analyzer {
 
     /**
      * Given a type that is being indexed with [], return the element type.
-     * e.g., vector[0] → float, string[0] → string, array<T>[0] → null (skip check)
+     * e.g., vector[0] → float, string[0] → string
+     * Uses the Get method's return type for classes (container[i] == container.Get(i)).
      * Returns null if the indexed type cannot be determined (to avoid false positives).
      */
     private resolveIndexedType(containerType: string): string | null {
         const lower = containerType.toLowerCase();
         if (lower === 'vector') return 'float';
         if (lower === 'string') return 'string';
-        // For arrays, maps, sets, etc., we can't easily determine the element type
-        // from just the base type name, so return null to skip the type check.
+        // Look up the Get method's return type on this class
+        const getReturnType = this.resolveMethodReturnTypeNode(containerType, 'Get');
+        if (getReturnType?.identifier) {
+            const retType = getReturnType.identifier;
+            // If Get returns a template param (e.g. T, TValue), we can't resolve without
+            // concrete generic args, so return null to skip the check
+            const genericVars = this.getClassGenericVars(containerType);
+            if (genericVars?.includes(retType)) return null;
+            return retType;
+        }
         return null;
     }
 
     /**
-     * Check if a chain/expression text contains `[...]` indexing OUTSIDE of
-     * parenthesised argument lists.  e.g.:
-     *   ".GetOrientation()[0]"            → true   ([0] is after the call)
-     *   ".GetAimDelta(pDt)[0] * RAD2DEG"  → true
-     *   ".GetSurface(pos[0], pos[2])"     → false  ([0]/[2] inside args)
+     * Count the number of `[...]` indexing levels OUTSIDE of parenthesised
+     * argument lists.  e.g.:
+     *   ".GetOrientation()[0]"            → 1
+     *   ".m_Patterns[id1][id2]"           → 2  (2D matrix)
+     *   ".GetSurface(pos[0], pos[2])"     → 0  ([0]/[2] inside args)
      */
-    private hasIndexingAfterCall(text: string): boolean {
+    private countIndexingLevels(text: string): number {
         let parenDepth = 0;
+        let bracketDepth = 0;
+        let count = 0;
         for (let i = 0; i < text.length; i++) {
             const ch = text[i];
             if (ch === '(') parenDepth++;
             else if (ch === ')') { if (parenDepth > 0) parenDepth--; }
-            else if (ch === '[' && parenDepth === 0) return true;
+            else if (parenDepth === 0) {
+                if (ch === '[') {
+                    if (bracketDepth === 0) count++;
+                    bracketDepth++;
+                } else if (ch === ']') {
+                    if (bracketDepth > 0) bracketDepth--;
+                }
+            }
         }
-        return false;
+        return count;
     }
 
     /**
@@ -1365,6 +1307,46 @@ export class Analyzer {
             if ((ch === '=' || ch === '!' || ch === '<' || ch === '>') && next === '=') return true;
             if (ch === '&' && next === '&') return true;
             if (ch === '|' && next === '|') return true;
+            // Single < and > as comparison operators (not template angle brackets).
+            // Exclude bit-shift operators << and >> (and compound <<= >>=).
+            // Heuristic: treat as comparison when preceded by ), ], digit, or word char
+            // AND when the < doesn't look like a generic type argument list.
+            if ((ch === '<' || ch === '>') && i > 0) {
+                // Skip <<, >>, <<=, >>= (bit shift operators, not comparisons)
+                if (next === ch) { i++; continue; } // << or >> — skip both chars
+                if (next === '=') continue; // <= or >= (already handled above as two-char ops)
+                // Also skip if the PREVIOUS char is < or > (second char of << or >>)
+                if (text[i - 1] === ch) continue;
+                
+                // For '<', check if this looks like a generic angle bracket <T>, <int, float>
+                // by scanning ahead for a matching '>' with only type-like content inside.
+                if (ch === '<') {
+                    let angleDep = 1;
+                    let looksGeneric = true;
+                    let j = i + 1;
+                    while (j < text.length && angleDep > 0) {
+                        const c = text[j];
+                        if (c === '<') angleDep++;
+                        else if (c === '>') angleDep--;
+                        // Generic args contain: word chars, commas, spaces, nested <>
+                        else if (!/[\w\s,]/.test(c)) { looksGeneric = false; break; }
+                        j++;
+                    }
+                    if (looksGeneric && angleDep === 0) {
+                        i = j - 1; // Skip past the closing '>' so it doesn't trigger as comparison
+                        continue;
+                    }
+                }
+                
+                let pi = i - 1;
+                while (pi >= 0 && (text[pi] === ' ' || text[pi] === '\t')) pi--;
+                if (pi >= 0) {
+                    const prev = text[pi];
+                    if (prev === ')' || prev === ']' || /[\w\d]/.test(prev)) {
+                        return true;
+                    }
+                }
+            }
         }
         return false;
     }
@@ -1399,6 +1381,312 @@ export class Analyzer {
      * @param chainText The full chain text starting from the first function
      * @returns The return type of the final call in the chain, or null if unresolved
      */
+
+    // ========================================================================
+    // ROBUST EXPRESSION CHAIN PARSER — backward-scanning, paren-aware
+    // ========================================================================
+    // Replaces fragile regex patterns that couldn't handle nested parentheses.
+    // Parses backwards from the end of `textBeforeToken` (which ends at a dot),
+    // extracting chain segments like:
+    //   "GetGame().GetObjectByNetworkId(low, high)."
+    //   → [{ name: "GetGame", isCall: true }, { name: "GetObjectByNetworkId", isCall: true }]
+    //
+    //   "a.b.c().d.e().f."
+    //   → [{ name: "a" }, { name: "b" }, { name: "c", isCall: true },
+    //      { name: "d" }, { name: "e", isCall: true }, { name: "f" }]
+    //
+    // Handles arbitrarily deep chains (7+), nested parentheses in function
+    // arguments, mixed static/instance/function-call segments, and `this`/`super`.
+    // ========================================================================
+
+    /**
+     * Parse an expression chain backward from text ending with a dot.
+     * Properly handles nested parentheses (e.g., `Cast(GetGame().Foo(a, b))`)
+     * and mixed call/field chains of arbitrary depth.
+     *
+     * @returns Array of chain segments in forward order (root first), empty if no chain found.
+     */
+    private parseExpressionChainBackward(text: string): { name: string; isCall: boolean; isIndexed: boolean }[] {
+        const segments: { name: string; isCall: boolean; isIndexed: boolean }[] = [];
+        let i = text.length - 1;
+
+        // Skip trailing whitespace
+        while (i >= 0 && /\s/.test(text[i])) i--;
+
+        // Must end with '.'
+        if (i < 0 || text[i] !== '.') return [];
+        i--; // skip the dot
+
+        // Parse segments backward
+        while (true) {
+            // Skip whitespace
+            while (i >= 0 && /\s/.test(text[i])) i--;
+            if (i < 0) break;
+
+            let isCall = false;
+            let isIndexed = false;
+
+            // Handle trailing ')' (function call) and/or ']' (array indexing)
+            // in a loop, since they can appear in any order and combination:
+            // e.g., GetItems()[0] scans backward as ']' then ')'.
+            while (i >= 0 && (text[i] === ')' || text[i] === ']')) {
+                if (text[i] === ')') {
+                    isCall = true;
+                    let depth = 1;
+                    i--; // skip ')'
+                    while (i >= 0 && depth > 0) {
+                        if (text[i] === ')') depth++;
+                        else if (text[i] === '(') depth--;
+                        // Skip string literals backward: when we hit a closing quote,
+                        // scan back to the matching open quote (handling escapes)
+                        else if (text[i] === '"' || text[i] === "'") {
+                            const q = text[i];
+                            i--;
+                            while (i >= 0 && text[i] !== q) i--;
+                            // i now on the opening quote — the loop's i-- will move past it
+                        }
+                        i--;
+                    }
+                    // i is now one before the '(' — skip whitespace
+                    while (i >= 0 && /\s/.test(text[i])) i--;
+                } else if (text[i] === ']') {
+                    isIndexed = true;
+                    let depth = 1;
+                    i--; // skip ']'
+                    while (i >= 0 && depth > 0) {
+                        if (text[i] === ']') depth++;
+                        else if (text[i] === '[') depth--;
+                        else if (text[i] === '"' || text[i] === "'") {
+                            const q = text[i];
+                            i--;
+                            while (i >= 0 && text[i] !== q) i--;
+                        }
+                        i--;
+                    }
+                    while (i >= 0 && /\s/.test(text[i])) i--;
+                }
+            }
+
+            // Read identifier backward
+            if (i < 0 || !/\w/.test(text[i])) break;
+            const end = i + 1;
+            while (i >= 0 && /\w/.test(text[i])) i--;
+            const name = text.substring(i + 1, end);
+
+            // Skip keywords that aren't valid chain roots (return, if, etc.)
+            // but allow 'this' and 'super'
+            if (!name || (name !== 'this' && name !== 'super' && /^(return|if|else|while|for|foreach|switch|case|new|delete|typeof|class|modded|static|private|protected|ref|autoptr|auto|void|int|float|bool|string|vector|const|override|break|continue|null|true|false)$/.test(name))) {
+                break;
+            }
+
+            segments.unshift({ name, isCall, isIndexed });
+
+            // Check for dot before this segment
+            let j = i;
+            while (j >= 0 && /\s/.test(text[j])) j--;
+            if (j >= 0 && text[j] === '.') {
+                i = j - 1; // skip the dot and continue
+            } else {
+                break; // no more chain
+            }
+        }
+
+        // Validate: 'this' and 'super' are only valid as the first segment.
+        // If they appear mid-chain (e.g., obj.this.Method), reject the chain.
+        for (let s = 1; s < segments.length; s++) {
+            if (segments[s].name === 'this' || segments[s].name === 'super') {
+                return [];
+            }
+        }
+
+        return segments;
+    }
+
+    /**
+     * Check if a type name is a template parameter of the containing class.
+     * If so, return the upper-bound type (constraint type or 'Class' as default).
+     * In Enforce Script, generic params are declared as "Class T", so the
+     * default upper bound for any template param is 'Class'.
+     *
+     * Also walks up the class hierarchy — if the containing class inherits
+     * from a generic base, the base's template params are also checked.
+     *
+     * @returns The resolved upper-bound type name, or null if not a template param.
+     */
+    private resolveTemplateParam(typeName: string, ast: File, pos: Position): string | null {
+        const cc = this.findContainingClass(ast, pos);
+        if (!cc) return null;
+
+        // Check the containing class's own template params
+        if (cc.genericVars && cc.genericVars.includes(typeName)) {
+            return 'Class';
+        }
+
+        // Also walk the class hierarchy in case a parent class defines the template param
+        const hierarchy = this.getClassHierarchyOrdered(cc.name, new Set());
+        for (const cls of hierarchy) {
+            if (cls.genericVars && cls.genericVars.includes(typeName)) {
+                return 'Class';
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve the root segment of an expression chain to a type.
+     * Handles variables, `this`, `super`, class names (static access),
+     * function calls, and method calls within the containing class.
+     *
+     * @returns Resolved type and template map, or null if unresolvable.
+     */
+    private resolveChainRoot(
+        root: { name: string; isCall: boolean },
+        doc: TextDocument,
+        pos: Position,
+        ast: File
+    ): { type: string; templateMap: Map<string, string> } | null {
+        if (root.isCall) {
+            // Function/method call root: e.g., GetGame() or GetInstance()
+            let rootType = this.resolveFunctionReturnType(root.name);
+            if (!rootType) {
+                const cc = this.findContainingClass(ast, pos);
+                if (cc) {
+                    rootType = this.resolveMethodReturnType(cc.name, root.name);
+                }
+            }
+            // Also check if it's an implicit constructor (class name used as call)
+            if (!rootType) {
+                if (this.classIndex.has(root.name)) {
+                    rootType = root.name;
+                } else {
+                    const resolved = this.resolveTypedef(root.name);
+                    if (resolved !== root.name) {
+                        rootType = resolved;
+                    }
+                }
+            }
+            if (!rootType) return null;
+
+            const resolved = this.resolveTypedef(rootType);
+            // Try to get template map from function return type node
+            const returnTypeNode = this.resolveFunctionReturnTypeNode(root.name);
+            let templateMap: Map<string, string> = new Map();
+            if (returnTypeNode?.genericArgs && returnTypeNode.genericArgs.length > 0) {
+                templateMap = this.buildTemplateMap(resolved, returnTypeNode.genericArgs);
+            } else {
+                const typedefNode = this.resolveTypedefNode(rootType);
+                if (typedefNode?.oldType.genericArgs && typedefNode.oldType.genericArgs.length > 0) {
+                    templateMap = this.buildTemplateMap(typedefNode.oldType.identifier, typedefNode.oldType.genericArgs);
+                }
+            }
+            return { type: resolved, templateMap };
+
+        } else {
+            // Variable/property/class/this/super root
+
+            // Handle 'this'
+            if (root.name === 'this') {
+                const cc = this.findContainingClass(ast, pos);
+                if (cc) return { type: cc.name, templateMap: new Map() };
+                return null;
+            }
+
+            // Handle 'super'
+            if (root.name === 'super') {
+                const cc = this.findContainingClass(ast, pos);
+                if (cc?.base?.identifier) return { type: cc.base.identifier, templateMap: new Map() };
+                return null;
+            }
+
+            // Try as variable first (most common)
+            const varType = this.resolveVariableType(doc, pos, root.name);
+            if (varType) {
+                let currentType = varType;
+                let templateMap: Map<string, string>;
+                const typedefNode = this.resolveTypedefNode(currentType);
+                if (typedefNode) {
+                    currentType = typedefNode.oldType.identifier;
+                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
+                } else {
+                    currentType = this.resolveTypedef(currentType);
+                    const varTypeNode = this.resolveVariableTypeNode(doc, pos, root.name);
+                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
+                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
+                    } else {
+                        templateMap = new Map();
+                    }
+                }
+
+                // If the resolved type is a template parameter (e.g., T, TKey),
+                // resolve it to its upper-bound type (Class by default in Enforce Script).
+                // This allows method lookups on template-typed variables like m_Entity
+                // to find methods on the base Class type instead of failing silently.
+                if (!this.classIndex.has(currentType) && !this.typedefIndex.has(currentType)) {
+                    const resolved = this.resolveTemplateParam(currentType, ast, pos);
+                    if (resolved) {
+                        currentType = resolved;
+                        templateMap = new Map();
+                    }
+                }
+
+                return { type: currentType, templateMap };
+            }
+
+            // Try as class name (static access: e.g., PlayerBase.Cast)
+            if (/^[A-Z]/.test(root.name)) {
+                if (this.classIndex.has(root.name)) {
+                    return { type: root.name, templateMap: new Map() };
+                }
+                // Try typedef
+                const resolved = this.resolveTypedef(root.name);
+                if (resolved !== root.name) {
+                    return { type: resolved, templateMap: new Map() };
+                }
+            }
+
+            return null;
+        }
+    }
+
+    /**
+     * Full chain resolution: parse `textBeforeToken` backward, resolve each
+     * segment, and return the final type + template map.
+     * Works for any chain depth (1+) with mixed calls, fields, statics.
+     *
+     * @returns The final resolved type and template map, or null if chain
+     *          parsing fails or any link can't be resolved.
+     */
+    resolveFullChain(
+        textBeforeToken: string,
+        doc: TextDocument,
+        pos: Position,
+        ast: File
+    ): { type: string; templateMap: Map<string, string> } | null {
+        const chain = this.parseExpressionChainBackward(textBeforeToken);
+        if (chain.length === 0) return null;
+
+        const root = chain[0];
+        const rest = chain.slice(1);
+
+        let rootResult = this.resolveChainRoot(root, doc, pos, ast);
+        if (!rootResult) return null;
+
+        // If the root was indexed (e.g., items[0].), dereference to element type
+        if (root.isIndexed) {
+            rootResult = this.resolveIndexedContainerType(rootResult);
+        }
+
+        if (rest.length === 0) {
+            return rootResult;
+        }
+
+        // Pass rest segments with isIndexed info to resolveChainSteps
+        const memberSegments = rest.map(s => ({ name: s.name, isIndexed: s.isIndexed }));
+        const result = this.resolveChainStepsWithIndexing(memberSegments, rootResult.type, rootResult.templateMap);
+        return result;
+    }
+
     /**
      * Parse chained member accesses from text like ".Method(args).Prop.Other()"
      * into a list of member names: ["Method", "Prop", "Other"].
@@ -1438,12 +1726,21 @@ export class Analyzer {
             
             calls.push(methodMatch[1]);
             
-            // Skip past this call's arguments (balanced parens)
+            // Skip past this call's arguments (balanced parens, string-literal aware)
             remaining = remaining.substring(methodMatch[0].length);
             let parenDepth = 1, i = 0;
             while (i < remaining.length && parenDepth > 0) {
-                if (remaining[i] === '(') parenDepth++;
-                else if (remaining[i] === ')') parenDepth--;
+                const ch = remaining[i];
+                if (ch === '(') parenDepth++;
+                else if (ch === ')') parenDepth--;
+                else if (ch === '"' || ch === "'") {
+                    const q = ch;
+                    i++;
+                    while (i < remaining.length && remaining[i] !== q) {
+                        if (remaining[i] === '\\') i++;
+                        i++;
+                    }
+                }
                 i++;
             }
             remaining = remaining.substring(i).trim();
@@ -1493,6 +1790,14 @@ export class Analyzer {
                 resolvedType = templateMap.get(resolvedType)!;
             }
             
+            // DayZ pattern: ClassName.Cast(x) returns ClassName, not Class.
+            // Cast is defined on Class as `proto native Class Cast()`, but by convention
+            // it returns the type it was called on (acts as a downcast). Keep the
+            // current receiver type and templateMap unchanged.
+            if (memberName === 'Cast' && resolvedType === 'Class') {
+                continue;
+            }
+            
             // Resolve through typedefs and rebuild template map for the next step
             const stepTypedef = this.resolveTypedefNode(resolvedType);
             if (stepTypedef) {
@@ -1521,6 +1826,98 @@ export class Analyzer {
     }
 
     /**
+     * Dereference an indexed container type using its Get method return type.
+     * In Enforce Script, container[i] is syntactic sugar for container.Get(i).
+     * Resolves the Get method's return type and applies template substitution.
+     * Falls back to hardcoded rules for vector/string (primitives without class defs).
+     */
+    private resolveIndexedContainerType(
+        result: { type: string; templateMap: Map<string, string> }
+    ): { type: string; templateMap: Map<string, string> } {
+        const lower = result.type.toLowerCase();
+        
+        // Primitive indexing fallbacks (no class definition to look up)
+        if (lower === 'vector') return { type: 'float', templateMap: new Map() };
+        if (lower === 'string') return { type: 'string', templateMap: new Map() };
+        
+        // Generic approach: look up the Get method's return type on this class
+        // container[i] == container.Get(i), so resolve Get's return type
+        const getReturnType = this.resolveMethodReturnTypeNode(result.type, 'Get');
+        if (getReturnType?.identifier) {
+            let resolvedType = getReturnType.identifier;
+            // Apply template substitution (e.g., Get returns T → use templateMap to resolve T → string)
+            if (result.templateMap.has(resolvedType)) {
+                resolvedType = result.templateMap.get(resolvedType)!;
+            }
+            const elemTemplateMap = this.buildTemplateMap(resolvedType, undefined);
+            return { type: resolvedType, templateMap: elemTemplateMap };
+        }
+        
+        // Can't determine — return as-is
+        return result;
+    }
+
+    /**
+     * Like resolveChainSteps but handles isIndexed on each segment.
+     * When a segment is indexed, the resolved type is dereferenced to its element type.
+     */
+    private resolveChainStepsWithIndexing(
+        segments: { name: string; isIndexed: boolean }[],
+        currentType: string,
+        templateMap: Map<string, string>
+    ): { type: string; templateMap: Map<string, string> } | null {
+        for (const seg of segments) {
+            const nextTypeNode = this.resolveMethodReturnTypeNode(currentType, seg.name);
+            if (!nextTypeNode?.identifier) return null;
+            
+            let resolvedType = nextTypeNode.identifier;
+            
+            // Apply template substitution (e.g., GetKey() returns TKey → "string")
+            if (templateMap.has(resolvedType)) {
+                resolvedType = templateMap.get(resolvedType)!;
+            }
+            
+            // DayZ pattern: ClassName.Cast(x) returns ClassName, not Class.
+            if (seg.name === 'Cast' && resolvedType === 'Class') {
+                // Keep currentType and templateMap — Cast acts as transparent pass-through
+                // Still handle indexing below
+                resolvedType = currentType;
+            }
+            
+            // Resolve through typedefs and rebuild template map for the next step
+            const stepTypedef = this.resolveTypedefNode(resolvedType);
+            if (stepTypedef) {
+                resolvedType = stepTypedef.oldType.identifier;
+                if (stepTypedef.oldType.genericArgs && stepTypedef.oldType.genericArgs.length > 0) {
+                    templateMap = this.buildTemplateMap(resolvedType, stepTypedef.oldType.genericArgs);
+                } else {
+                    templateMap = new Map();
+                }
+            } else if (nextTypeNode.genericArgs && nextTypeNode.genericArgs.length > 0) {
+                const substitutedArgs = nextTypeNode.genericArgs.map(arg => {
+                    const subId = templateMap.get(arg.identifier);
+                    if (subId) return { ...arg, identifier: subId } as TypeNode;
+                    return arg;
+                });
+                templateMap = this.buildTemplateMap(resolvedType, substitutedArgs);
+            } else {
+                templateMap = new Map();
+            }
+            
+            currentType = resolvedType;
+
+            // If this segment was indexed (e.g., .GetItems()[0]), dereference to element type
+            if (seg.isIndexed) {
+                const deref = this.resolveIndexedContainerType({ type: currentType, templateMap });
+                currentType = deref.type;
+                templateMap = deref.templateMap;
+            }
+        }
+        
+        return { type: currentType, templateMap };
+    }
+
+    /**
      * Resolve the final return type of a function chain like "U().Msg().SetMeta(...)".
      * Parses the chain, resolves the first function call, then delegates to
      * resolveChainSteps for subsequent member accesses.
@@ -1533,12 +1930,21 @@ export class Analyzer {
         
         const firstFunc = firstMatch[1];
         
-        // Skip past the first call's arguments (balanced parens)
+        // Skip past the first call's arguments (balanced parens, string-literal aware)
         let afterFirst = remaining.substring(firstMatch[0].length);
         let parenDepth = 1, i = 0;
         while (i < afterFirst.length && parenDepth > 0) {
-            if (afterFirst[i] === '(') parenDepth++;
-            else if (afterFirst[i] === ')') parenDepth--;
+            const ch = afterFirst[i];
+            if (ch === '(') parenDepth++;
+            else if (ch === ')') parenDepth--;
+            else if (ch === '"' || ch === "'") {
+                const q = ch;
+                i++;
+                while (i < afterFirst.length && afterFirst[i] !== q) {
+                    if (afterFirst[i] === '\\') i++;
+                    i++;
+                }
+            }
             i++;
         }
         afterFirst = afterFirst.substring(i).trim();
@@ -1581,21 +1987,32 @@ export class Analyzer {
         // If no chained calls, return the first function's resolved type
         if (calls.length === 0) {
             // Check for array indexing after the single call, e.g., GetOrientation()[0]
-            if (this.hasIndexingAfterCall(afterFirst)) {
-                return this.resolveIndexedType(currentType2);
+            const indexLevels0 = this.countIndexingLevels(afterFirst);
+            if (indexLevels0 > 0) {
+                let deref = { type: currentType2, templateMap };
+                for (let lvl = 0; lvl < indexLevels0; lvl++) {
+                    deref = this.resolveIndexedContainerType(deref);
+                }
+                return deref.type;
             }
             return currentType2;
         }
         
         // Delegate remaining chain steps
-        const result = this.resolveChainSteps(calls, currentType2, templateMap)?.type ?? null;
+        const chainResult = this.resolveChainSteps(calls, currentType2, templateMap);
+        if (!chainResult) return null;
         
         // If the chain contains array indexing outside of args, resolve to element type
-        if (result && this.hasIndexingAfterCall(afterFirst)) {
-            return this.resolveIndexedType(result);
+        const indexLevels1 = this.countIndexingLevels(afterFirst);
+        if (indexLevels1 > 0) {
+            let deref = { ...chainResult };
+            for (let lvl = 0; lvl < indexLevels1; lvl++) {
+                deref = this.resolveIndexedContainerType(deref);
+            }
+            return deref.type;
         }
         
-        return result;
+        return chainResult.type;
     }
 
     /**
@@ -1625,18 +2042,97 @@ export class Analyzer {
             templateMap = new Map();
         }
         
-        const result = this.resolveChainSteps(calls, currentType, templateMap)?.type ?? null;
+        const chainResult = this.resolveChainSteps(calls, currentType, templateMap);
+        if (!chainResult) return null;
         
         // If the chain contains array indexing like [expr] after the last
         // method call, resolve to the element type. Matches [0], [i], etc.
         // even when followed by arithmetic like * Math.RAD2DEG.
-        // Uses hasIndexingAfterCall to avoid false positives from []
+        // Uses countIndexingLevels to avoid false positives from []
         // inside function arguments like .GetSurface(pos[0], pos[2]).
-        if (result && this.hasIndexingAfterCall(chainText)) {
-            return this.resolveIndexedType(result);
+        const indexLevels2 = this.countIndexingLevels(chainText);
+        if (indexLevels2 > 0) {
+            // For multi-level indexing (e.g., matrix[i][j]), we need the full
+            // TypeNode of the last member so we can peel off generic args at each
+            // level. The string-only templateMap loses nested genericArgs.
+            const lastMember = calls[calls.length - 1];
+            const lastStepResult = this.resolveChainSteps(calls.slice(0, -1), currentType, templateMap);
+            const prevType = lastStepResult ? lastStepResult.type : currentType;
+            const prevMap = lastStepResult ? lastStepResult.templateMap : templateMap;
+            const lastTypeNode = this.resolveMethodReturnTypeNode(prevType, lastMember);
+            
+            if (lastTypeNode) {
+                return this.peelIndexingLevels(lastTypeNode, prevMap, indexLevels2);
+            }
+            
+            // Fallback: use the generic loop
+            let deref = { ...chainResult };
+            for (let lvl = 0; lvl < indexLevels2; lvl++) {
+                deref = this.resolveIndexedContainerType(deref);
+            }
+            return deref.type;
         }
         
-        return result;
+        return chainResult.type;
+    }
+
+    /**
+     * Peel off N indexing levels from a TypeNode, preserving nested generic args.
+     * For example, for `array<array<float>>` with 2 levels:
+     *   Level 1: array<array<float>>[i] → array<float>
+     *   Level 2: array<float>[j] → float
+     */
+    private peelIndexingLevels(
+        typeNode: TypeNode,
+        outerTemplateMap: Map<string, string>,
+        levels: number
+    ): string | null {
+        let currentType = typeNode.identifier;
+        let currentGenericArgs = typeNode.genericArgs;
+        let templateMap = outerTemplateMap;
+        
+        // Apply outer template substitution first (e.g., field type T → array)
+        if (templateMap.has(currentType)) {
+            currentType = templateMap.get(currentType)!;
+        }
+        
+        for (let lvl = 0; lvl < levels; lvl++) {
+            const lower = currentType.toLowerCase();
+            if (lower === 'vector') { currentType = 'float'; currentGenericArgs = undefined; continue; }
+            if (lower === 'string') { currentType = 'string'; currentGenericArgs = undefined; continue; }
+            
+            // Build template map for this level from genericArgs
+            const levelMap = this.buildTemplateMap(currentType, currentGenericArgs);
+            
+            // Look up Get method return type
+            const getReturn = this.resolveMethodReturnTypeNode(currentType, 'Get');
+            if (!getReturn?.identifier) return null;
+            
+            let elemType = getReturn.identifier;
+            if (levelMap.has(elemType)) {
+                elemType = levelMap.get(elemType)!;
+            }
+            
+            // Find the matching generic arg to get its nested genericArgs
+            let elemGenericArgs: TypeNode[] | undefined;
+            if (currentGenericArgs) {
+                // Find which generic arg corresponded to the element type.
+                // For containers like array<T>, the element is the first generic arg.
+                // For map<TKey, TValue>, Get returns TValue (the second generic arg).
+                const genericVars = this.getClassGenericVars(currentType);
+                if (genericVars && getReturn.identifier) {
+                    const paramIdx = genericVars.indexOf(getReturn.identifier);
+                    if (paramIdx >= 0 && paramIdx < currentGenericArgs.length) {
+                        elemGenericArgs = currentGenericArgs[paramIdx].genericArgs;
+                    }
+                }
+            }
+            
+            currentType = elemType;
+            currentGenericArgs = elemGenericArgs;
+        }
+        
+        return currentType;
     }
 
     /**
@@ -1965,99 +2461,32 @@ export class Analyzer {
         // Look backwards from the token start to find a dot
         const textBeforeToken = text.substring(0, token.start);
         
-        // Multi-level chain: e.g., param.param4.GetSomething or param.Get("x").field
-        // Captures root variable + middle chain segments before the final dot
-        const multiLevelMatch = textBeforeToken.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*$/);
-        if (multiLevelMatch) {
-            const rootName = multiLevelMatch[1];
-            const middleChain = multiLevelMatch[2]; // e.g., ".param4" or ".Get(key).field"
-            
-            let rootType = this.resolveVariableType(doc, _pos, rootName);
-            if (rootType) {
-                // Resolve root through typedef and build initial template map
-                let currentType = rootType;
-                let templateMap: Map<string, string>;
-                const typedefNode = this.resolveTypedefNode(currentType);
-                if (typedefNode) {
-                    currentType = typedefNode.oldType.identifier;
-                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
-                } else {
-                    currentType = this.resolveTypedef(currentType);
-                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, rootName);
-                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
-                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
-                    } else {
-                        templateMap = new Map();
+        // ================================================================
+        // UNIFIED CHAIN RESOLUTION — handles all dot-chain patterns:
+        //   variable.member, variable.field.method, func().method,
+        //   func().field.method, Class.StaticMethod, this.field.method,
+        //   and arbitrarily deep chains with nested parentheses.
+        // ================================================================
+        const ast = this.ensure(doc);
+        const chainResult = this.resolveFullChain(textBeforeToken, doc, _pos, ast);
+        if (chainResult) {
+            const classMatches = this.findMemberInClassHierarchy(chainResult.type, name);
+            if (classMatches.length > 0) {
+                return classMatches;
+            }
+            // If the chain resolved to a type but the member wasn't found,
+            // check if it's an enum member access (e.g., EnumType.VALUE)
+            const enumNode = this.enumIndex.get(chainResult.type);
+            if (enumNode) {
+                for (const member of enumNode.members) {
+                    if (member.name === name) {
+                        return [member as SymbolNodeBase];
                     }
-                }
-                
-                // Resolve through the middle chain to get the final type
-                const chainMembers = this.parseChainMembers(middleChain);
-                if (chainMembers.length > 0) {
-                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
-                    if (result) {
-                        const classMatches = this.findMemberInClassHierarchy(result.type, name);
-                        if (classMatches.length > 0) {
-                            return classMatches;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Pattern 1: variable.method (e.g., player.GetInputType)
-        const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
-        
-        // Pattern 2: functionCall().method (e.g., GetGame().GetTime())
-        const chainedCallMatch = textBeforeToken.match(/(\w+)\s*\([^)]*\)\s*\.\s*$/);
-        
-        if (memberMatch) {
-            // MEMBER ACCESS: Resolve the variable type and search only that class hierarchy
-            const varName = memberMatch[1];
-            let varType = this.resolveVariableType(doc, _pos, varName);
-            
-            if (varType) {
-                // Resolve through typedefs so go-to-definition works on typedef'd variables
-                // e.g., testMap.Get → varType="testMapType" → resolve to "map" → find Get in map hierarchy
-                varType = this.resolveTypedef(varType);
-                const classMatches = this.findMemberInClassHierarchy(varType, name);
-                if (classMatches.length > 0) {
-                    return classMatches;
-                }
-            }
-            
-            // If varName looks like a class (uppercase), try static member lookup
-            if (varName[0] === varName[0].toUpperCase()) {
-                const classMatches = this.findMemberInClassHierarchy(varName, name);
-                if (classMatches.length > 0) {
-                    return classMatches;
-                }
-            }
-        }
-        
-        if (chainedCallMatch) {
-            // CHAINED CALL: Resolve the return type of the function call
-            const funcName = chainedCallMatch[1];
-            let returnType = this.resolveFunctionReturnType(funcName);
-            // Fall back to method of containing class (e.g., GetInstance().member inside a class)
-            if (!returnType) {
-                const ast2 = this.ensure(doc);
-                const cc = this.findContainingClass(ast2, _pos);
-                if (cc) {
-                    returnType = this.resolveMethodReturnType(cc.name, funcName);
-                }
-            }
-            
-            if (returnType) {
-                const classMatches = this.findMemberInClassHierarchy(returnType, name);
-                if (classMatches.length > 0) {
-                    return classMatches;
                 }
             }
         }
         
         // Check if we're inside a class - prioritize current class and inheritance
-        const ast = this.ensure(doc);
         const containingClass = this.findContainingClass(ast, _pos);
         
         if (containingClass) {
@@ -2156,12 +2585,49 @@ export class Analyzer {
         // Returns in order: base classes first, then derived, with modded grouped by class
         const classesToSearch = this.getClassHierarchyOrdered(className, visited);
         
+        const seenPositions = new Set<string>();
         for (const classNode of classesToSearch) {
             for (const member of classNode.members || []) {
                 if (member.name === memberName) {
-                    matches.push(member as SymbolNodeBase);
+                    // Deduplicate by file path + position to avoid showing
+                    // the same definition twice when the same file is indexed
+                    // under different URIs (e.g., workspace + include path).
+                    const srcUri = (classNode as any)._sourceUri as string | undefined;
+                    const key = `${srcUri ?? ''}:${member.nameStart.line}:${member.nameStart.character}`;
+                    if (!seenPositions.has(key)) {
+                        seenPositions.add(key);
+                        matches.push(member as SymbolNodeBase);
+                    }
                 }
             }
+        }
+        
+        // Second-pass dedup: collapse entries from different URIs whose file
+        // paths resolve to the same relative path (handles the same mod
+        // indexed from both the workspace and an include path).
+        if (matches.length > 1) {
+            const pathKey = (node: SymbolNodeBase): string => {
+                const uri = (node as any)._sourceUri as string | undefined;
+                if (!uri) return '';
+                try {
+                    // Extract path from URI, normalize slashes, take last 3 segments
+                    const fsPath = url.fileURLToPath(uri).replace(/\\/g, '/').toLowerCase();
+                    const parts = fsPath.split('/');
+                    return parts.slice(-3).join('/') + ':' + node.nameStart.line;
+                } catch {
+                    return uri + ':' + node.nameStart.line;
+                }
+            };
+            const seen = new Set<string>();
+            const deduped: SymbolNodeBase[] = [];
+            for (const m of matches) {
+                const pk = pathKey(m);
+                if (!seen.has(pk)) {
+                    seen.add(pk);
+                    deduped.push(m);
+                }
+            }
+            return deduped;
         }
         
         return matches;
@@ -2181,7 +2647,30 @@ export class Analyzer {
         visited.add(className);
         
         // Find all classes with this name (original + modded versions)
-        const classNodes = this.findAllClassesByName(className);
+        // Deduplicate by _sourceUri in case the same file was indexed under
+        // different URI casings (Windows path case-insensitivity).
+        // Also dedup by path suffix to handle the same file indexed from both
+        // the workspace and an include path under different full URIs.
+        const rawClassNodes = this.findAllClassesByName(className);
+        const seenSourceUris = new Set<string>();
+        const seenPathSuffixes = new Set<string>();
+        const classNodes: ClassDeclNode[] = [];
+        for (const node of rawClassNodes) {
+            const srcUri = (node as any)._sourceUri as string | undefined;
+            if (srcUri) {
+                if (seenSourceUris.has(srcUri)) continue;
+                seenSourceUris.add(srcUri);
+                // Path suffix dedup: same file under different URI roots
+                try {
+                    const fsPath = url.fileURLToPath(srcUri).replace(/\\/g, '/').toLowerCase();
+                    const parts = fsPath.split('/');
+                    const suffix = parts.slice(-3).join('/') + ':' + (node.modifiers?.includes('modded') ? 'modded' : 'orig');
+                    if (seenPathSuffixes.has(suffix)) continue;
+                    seenPathSuffixes.add(suffix);
+                } catch { /* ignore path extraction errors */ }
+            }
+            classNodes.push(node);
+        }
         if (classNodes.length === 0) {
             // className might be a typedef (e.g., typedef ItemBase InventoryItemSuper)
             // Resolve through typedef and retry with the underlying type
@@ -2298,91 +2787,11 @@ export class Analyzer {
         
         const textBeforeToken = text.substring(0, token.start);
         
-        // Multi-level chain: e.g., param.field.Get
-        const multiLevelMatch = textBeforeToken.match(/(\w+)((?:\s*\.\s*\w+(?:\s*\([^)]*\))?)+)\s*\.\s*$/);
-        if (multiLevelMatch) {
-            const rootName = multiLevelMatch[1];
-            const middleChain = multiLevelMatch[2];
-            
-            const rootType = this.resolveVariableType(doc, _pos, rootName);
-            if (rootType) {
-                let currentType = rootType;
-                let templateMap: Map<string, string>;
-                const typedefNode = this.resolveTypedefNode(currentType);
-                if (typedefNode) {
-                    currentType = typedefNode.oldType.identifier;
-                    templateMap = this.buildTemplateMap(currentType, typedefNode.oldType.genericArgs);
-                } else {
-                    currentType = this.resolveTypedef(currentType);
-                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, rootName);
-                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
-                        templateMap = this.buildTemplateMap(currentType, varTypeNode.genericArgs);
-                    } else {
-                        templateMap = new Map();
-                    }
-                }
-                
-                const chainMembers = this.parseChainMembers(middleChain);
-                if (chainMembers.length > 0) {
-                    const result = this.resolveChainSteps(chainMembers, currentType, templateMap);
-                    if (result && result.templateMap.size > 0) {
-                        return result.templateMap;
-                    }
-                }
-            }
-        }
-        
-        // Single-level: variable.member (e.g., testMap.Get)
-        const memberMatch = textBeforeToken.match(/(\w+)\s*\.\s*$/);
-        if (memberMatch) {
-            const varName = memberMatch[1];
-            const varType = this.resolveVariableType(doc, _pos, varName);
-            if (varType) {
-                const typedefNode = this.resolveTypedefNode(varType);
-                if (typedefNode) {
-                    const resolvedType = typedefNode.oldType.identifier;
-                    const tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
-                    if (tplMap.size > 0) return tplMap;
-                } else {
-                    // Direct generic declaration: map<string, int> myMap;
-                    const varTypeNode = this.resolveVariableTypeNode(doc, _pos, varName);
-                    if (varTypeNode?.genericArgs && varTypeNode.genericArgs.length > 0) {
-                        const resolvedType = this.resolveTypedef(varType);
-                        const tplMap = this.buildTemplateMap(resolvedType, varTypeNode.genericArgs);
-                        if (tplMap.size > 0) return tplMap;
-                    }
-                }
-            }
-        }
-        
-        // Function call chain: GetSomething().member
-        const chainedCallMatch = textBeforeToken.match(/(\w+)\s*\([^)]*\)\s*\.\s*$/);
-        if (chainedCallMatch) {
-            const funcName = chainedCallMatch[1];
-            let returnTypeNode = this.resolveFunctionReturnTypeNode(funcName);
-            // Fall back to method of containing class
-            if (!returnTypeNode?.identifier) {
-                const ast2 = this.ensure(doc);
-                const cc = this.findContainingClass(ast2, _pos);
-                if (cc) {
-                    const methodType = this.resolveMethodReturnType(cc.name, funcName);
-                    if (methodType) {
-                        returnTypeNode = { identifier: methodType, arrayDims: [], modifiers: [], kind: 'Type', uri: '', start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } as TypeNode;
-                    }
-                }
-            }
-            if (returnTypeNode?.identifier) {
-                let resolvedType = returnTypeNode.identifier;
-                const typedefNode = this.resolveTypedefNode(resolvedType);
-                if (typedefNode) {
-                    resolvedType = typedefNode.oldType.identifier;
-                    const tplMap = this.buildTemplateMap(resolvedType, typedefNode.oldType.genericArgs);
-                    if (tplMap.size > 0) return tplMap;
-                } else if (returnTypeNode.genericArgs && returnTypeNode.genericArgs.length > 0) {
-                    const tplMap = this.buildTemplateMap(resolvedType, returnTypeNode.genericArgs);
-                    if (tplMap.size > 0) return tplMap;
-                }
-            }
+        // Use the unified chain resolver for all dot-chain patterns
+        const ast = this.ensure(doc);
+        const chainResult = this.resolveFullChain(textBeforeToken, doc, _pos, ast);
+        if (chainResult && chainResult.templateMap.size > 0) {
+            return chainResult.templateMap;
         }
         
         return undefined;
@@ -2915,7 +3324,12 @@ export class Analyzer {
         const checkFunction = (func: FunctionDeclNode, className?: string): void => {
             if (!shouldCheckFunction(func, className)) return;
 
-            const returnType = func.returnType?.identifier ?? 'void';
+            let returnType = func.returnType?.identifier ?? 'void';
+            // Reconstruct full generic type string (e.g., "array<CF_XML_Tag>")
+            // so that type compatibility checks work correctly for generic returns
+            if (func.returnType?.genericArgs && func.returnType.genericArgs.length > 0) {
+                returnType = `${returnType}<${func.returnType.genericArgs.map(a => a.identifier).join(', ')}>`;
+            }
             const isVoid = returnType === 'void';
             const returns = func.returnStatements || [];
 
@@ -3348,8 +3762,29 @@ export class Analyzer {
             // without 'override').  This lets us distinguish:
             //   - Sibling introduces → our 'override' is valid, suppress warning
             //   - All siblings also 'override' → nobody introduced it, warn
+            const currentSourceUri = (cls as any)._sourceUri as string | undefined;
+            // Also extract file-path suffix for cross-URI dedup (same file
+            // indexed from both workspace and include path under different URIs)
+            const uriToNormalizedPath = (uri: string | undefined): string => {
+                if (!uri) return '';
+                try {
+                    return url.fileURLToPath(uri).replace(/\\/g, '/').toLowerCase();
+                } catch {
+                    return uri;
+                }
+            };
+            const currentNormPath = uriToNormalizedPath(currentSourceUri);
             for (const ver of allVersions) {
                 if (ver === cls || ver === originalClass) continue;
+                // Skip duplicate entries for the same physical file (can happen if
+                // the file was indexed under a different URI casing, or if the same
+                // mod is indexed from both the workspace and an include path)
+                const verSourceUri = (ver as any)._sourceUri as string | undefined;
+                if (currentSourceUri && verSourceUri && currentSourceUri === verSourceUri) continue;
+                // Fallback: compare full normalized paths to catch cross-URI
+                // duplicates where the same file was indexed from different roots
+                const verNormPath = uriToNormalizedPath(verSourceUri);
+                if (currentNormPath && verNormPath && currentNormPath === verNormPath) continue;
                 for (const member of ver.members || []) {
                     if (member.kind === 'FunctionDecl' && member.name) {
                         const func = member as FunctionDeclNode;
@@ -3476,8 +3911,25 @@ export class Analyzer {
                     } else if (isModded && siblingInfo?.anyIntroduced) {
                         // Two mods both introduce the same method without override —
                         // one will shadow the other depending on load order.
+                        // Find the conflicting file for the message
+                        let conflictFile = '';
+                        const siblingVersions = this.findAllClassesByName(cls.name);
+                        for (const ver of siblingVersions) {
+                            if (ver === cls) continue;
+                            if (!ver.modifiers?.includes('modded')) continue;
+                            const verUri = (ver as any)._sourceUri as string | undefined;
+                            if (verUri) {
+                                for (const m of ver.members || []) {
+                                    if (m.kind === 'FunctionDecl' && m.name === func.name) {
+                                        try { conflictFile = ` (see ${url.fileURLToPath(verUri)})`; } catch { conflictFile = ''; }
+                                        break;
+                                    }
+                                }
+                                if (conflictFile) break;
+                            }
+                        }
                         diags.push({
-                            message: `Method '${func.name}' is also defined in another modded version of '${cls.name}' without 'override'. One definition will shadow the other depending on mod load order.`,
+                            message: `Method '${func.name}' is also defined in another modded version of '${cls.name}' without 'override'. One definition will shadow the other depending on mod load order.${conflictFile}`,
                             range: { start: func.nameStart, end: func.nameEnd },
                             severity: DiagnosticSeverity.Warning
                         });
@@ -4307,13 +4759,18 @@ export class Analyzer {
             // Calculate highlight: from match start to end of chain (before semicolon)
             const highlightLength = match[0].length + (stmtEnd >= 0 ? stmtEnd : afterDot.length);
             
-            // Skip if the full RHS contains a comparison/boolean operator and declared type is bool
-            if (declaredType === 'bool') {
-                const fullRhs5 = chainText; // chainText is everything from '.' to ';'
-                if (this.hasTopLevelComparisonOperator(fullRhs5)) {
-                    continue;
-                }
+            // Skip if the full RHS contains a comparison/boolean operator —
+            // the actual expression type is bool, not the chain's return type.
+            // When declaredType is bool, the comparison is expected and valid.
+            // When declaredType is not bool, the mismatch is bool vs declaredType,
+            // but we skip anyway because the resolved returnType (from the chain before
+            // the operator) would produce a misleading diagnostic message.
+            if (this.hasTopLevelComparisonOperator(chainText)) {
+                continue;
             }
+            // Skip unresolved template parameters (e.g., T, TKey, TValue) —
+            // these occur when generic args couldn't be resolved through typedefs.
+            if (/^[A-Z]$/.test(declaredType) || /^[A-Z]$/.test(returnType)) continue;
             this.addTypeMismatchDiagnostic(doc, diags, match.index, highlightLength, declaredType, returnType);
         }
         
@@ -4361,11 +4818,10 @@ export class Analyzer {
             if (/^[A-Z]$/.test(targetType) || /^[A-Z]$/.test(returnType)) continue;
             if (targetType === returnType) continue;
             
-            // Skip if the full RHS contains a comparison/boolean operator and target type is bool
-            if (targetType === 'bool') {
-                if (this.hasTopLevelComparisonOperator(chainText)) {
-                    continue;
-                }
+            // Skip if the full RHS contains a comparison/boolean operator —
+            // the actual expression type is bool, not the chain's return type.
+            if (this.hasTopLevelComparisonOperator(chainText)) {
+                continue;
             }
             
             const actualStart = match.index + 1 + leadingWs.length;
@@ -4477,8 +4933,23 @@ export class Analyzer {
             // Track nesting
             if (ch === '(' || ch === '[') { depth++; current += ch; continue; }
             if (ch === ')' || ch === ']') { depth--; current += ch; continue; }
-            if (ch === '<') { bracketDepth++; current += ch; continue; }
-            if (ch === '>') { bracketDepth--; current += ch; continue; }
+            // Distinguish generic angle brackets <> from bit shift <<, >>
+            if (ch === '<') {
+                const nextCh = i + 1 < argsText.length ? argsText[i + 1] : '';
+                if (nextCh !== '<') { // Not bit shift <<
+                    bracketDepth++;
+                }
+                current += ch;
+                continue;
+            }
+            if (ch === '>') {
+                const nextCh = i + 1 < argsText.length ? argsText[i + 1] : '';
+                if (nextCh !== '>') { // Not bit shift >>
+                    if (bracketDepth > 0) bracketDepth--;
+                }
+                current += ch;
+                continue;
+            }
             if (ch === '{') { braceDepth++; current += ch; continue; }
             if (ch === '}') { braceDepth--; current += ch; continue; }
             
@@ -4528,9 +4999,14 @@ export class Analyzer {
         // null
         if (arg === 'null' || arg === 'NULL') return null; // null is compatible with any ref type
         
-        // new ClassName(...)
+        // new ClassName(...) or new ClassName<T>(...)
         const newMatch = arg.match(/^new\s+(\w+)/);
         if (newMatch) return newMatch[1];
+        
+        // Templated constructor: new ClassName<Type>(...)  — handles cases where
+        // hasTopLevelComparisonOperator didn't catch it (e.g., complex expressions)
+        const newTemplateMatch = arg.match(/^new\s+(\w+)\s*</);
+        if (newTemplateMatch) return newTemplateMatch[1];
         
         // Cast: ClassName.Cast(expr) or ClassName.Cast(expr).Chain(...)
         const castMatch = arg.match(/^(\w+)\.Cast\s*\(/);
@@ -4625,10 +5101,17 @@ export class Analyzer {
             return rootType;
         }
         
-        // Method chain: var.Method(...)
+        // Method chain: var.Method(...) or ClassName.StaticMethod(...)
         const chainMatch = arg.match(/^(\w+)\s*\./);
         if (chainMatch) {
-            const varType = getVarType(chainMatch[1]);
+            const rootName = chainMatch[1];
+            let varType = getVarType(rootName);
+            
+            // If no variable found, check if it's a class name (static access)
+            if (!varType && /^[A-Z]/.test(rootName) && this.classIndex.has(rootName)) {
+                varType = rootName;
+            }
+            
             if (varType) {
                 const chainText = arg.substring(chainMatch[0].length - 1); // keep the dot
                 // If the chain ends with a method call, use resolveVariableChainType
@@ -4892,6 +5375,7 @@ export class Analyzer {
             
             let overloads: FunctionDeclNode[] = [];
             let chainAttempted = false;
+            let chainResolvedType: string | undefined; // Set when chain resolution identifies a known receiver type
             let dotIsPartOfChain = false;
             let containingClassName: string | undefined;
             
@@ -4905,6 +5389,11 @@ export class Analyzer {
             const dotMatch = textBeforeFunc.match(/(\w+)\s*\.\s*$/);
             if (dotMatch) {
                 const objName = dotMatch[1];
+                
+                // Skip super calls entirely — super always calls a valid parent/original
+                // method. The LSP may not have complete hierarchy knowledge, and in
+                // modded classes super refers to the previous mod layer, not the parent class.
+                if (objName === 'super') continue;
                 
                 // Check if objName is a class name FIRST (for static access like ClassName.StaticMethod)
                 // This must come before getVarTypeAtLine because regex fallbacks can
@@ -4937,81 +5426,14 @@ export class Analyzer {
                 if (overloads.length === 0) {
                     chainAttempted = true;
                     const fullTextBefore = textBeforeFunc.replace(/\s+$/, '');
-                    // fullTextBefore ends with "objName." — walk backwards from the end to extract
-                    // the entire chain expression including objName.
+                    // Use the unified backward chain parser + resolver instead of
+                    // hand-rolled backward walking. resolveFullChain handles nested
+                    // parens, function calls, variables, static access, and deep chains.
                     if (fullTextBefore.endsWith('.')) {
-                        let p = fullTextBefore.length - 2; // start before trailing dot
-                        while (p >= 0) {
-                            while (p >= 0 && /\s/.test(fullTextBefore[p])) p--;
-                            if (p < 0) break;
-                            if (fullTextBefore[p] === ')') {
-                                let depth = 1; p--;
-                                while (p >= 0 && depth > 0) {
-                                    if (fullTextBefore[p] === '(') depth--;
-                                    else if (fullTextBefore[p] === ')') depth++;
-                                    p--;
-                                }
-                                while (p >= 0 && /\s/.test(fullTextBefore[p])) p--;
-                            }
-                            if (p < 0 || !/\w/.test(fullTextBefore[p])) break;
-                            while (p >= 0 && /\w/.test(fullTextBefore[p])) p--;
-                            const idStart = p + 1;
-                            let pp = p;
-                            while (pp >= 0 && /\s/.test(fullTextBefore[pp])) pp--;
-                            if (pp >= 0 && fullTextBefore[pp] === '.') {
-                                p = pp - 1;
-                                continue;
-                            }
-                            p = idStart - 1;
-                            break;
-                        }
-                        const exprStart = p + 1;
-                        const chainExpr = fullTextBefore.substring(exprStart, fullTextBefore.length - 1); // exclude trailing dot
-                        if (chainExpr) {
-                            const rootM = chainExpr.match(/^(\w+)/);
-                            if (rootM) {
-                                const rootName = rootM[1];
-                                const afterRoot = chainExpr.substring(rootName.length);
-                                let rootType: string | undefined;
-                                let chainRemainder: string;
-                                if (afterRoot.trimStart().startsWith('(')) {
-                                    // Root is a function call: FuncName(...).chain...
-                                    rootType = this.resolveFunctionReturnType(rootName) ?? undefined;
-                                    if (!rootType && containingClassName) {
-                                        rootType = this.resolveMethodCallWithTemplates(containingClassName, rootName) ?? undefined;
-                                    }
-                                    const parenStart = afterRoot.indexOf('(');
-                                    let d = 1, ii = parenStart + 1;
-                                    while (ii < afterRoot.length && d > 0) {
-                                        if (afterRoot[ii] === '(') d++;
-                                        else if (afterRoot[ii] === ')') d--;
-                                        ii++;
-                                    }
-                                    chainRemainder = afterRoot.substring(ii);
-                                } else {
-                                    // Root is a variable or class name (for static access)
-                                    rootType = getVarTypeAtLine(rootName, lineNum);
-                                    if (!rootType) {
-                                        // Check if root is a class name (for static field/method access)
-                                        const classNodes = this.findAllClassesByName(rootName);
-                                        if (classNodes.length > 0) {
-                                            rootType = rootName;
-                                        }
-                                    }
-                                    chainRemainder = afterRoot;
-                                }
-                                // Resolve through the remaining chain if present.
-                                // Pass the raw (non-typedef-resolved) rootType to resolveVariableChainType
-                                // so it can build the proper template map from the typedef's generic args.
-                                if (rootType && chainRemainder.trim().startsWith('.')) {
-                                    const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
-                                    if (resolved) {
-                                        overloads = this.findFunctionOverloads(funcName, resolved);
-                                    }
-                                } else if (rootType) {
-                                    overloads = this.findFunctionOverloads(funcName, this.resolveTypedef(rootType));
-                                }
-                            }
+                        const chainResult = this.resolveFullChain(fullTextBefore, doc, { line: lineNum, character: 0 }, ast);
+                        if (chainResult) {
+                            chainResolvedType = chainResult.type;
+                            overloads = this.findFunctionOverloads(funcName, chainResult.type);
                         }
                     }
                     // Fall back to static class call if chain didn't resolve
@@ -5027,83 +5449,13 @@ export class Analyzer {
                 const trimBefore = textBeforeFunc.replace(/\s+$/, '');
                 if (trimBefore.endsWith('.')) {
                     chainAttempted = true;
-                    // Walk backwards to extract the full chain expression before the trailing dot
-                    let p = trimBefore.length - 2; // start before the dot
-                    while (p >= 0) {
-                        // Skip whitespace
-                        while (p >= 0 && /\s/.test(trimBefore[p])) p--;
-                        if (p < 0) break;
-                        // Optional balanced parens (method call arguments)
-                        if (trimBefore[p] === ')') {
-                            let depth = 1; p--;
-                            while (p >= 0 && depth > 0) {
-                                if (trimBefore[p] === '(') depth--;
-                                else if (trimBefore[p] === ')') depth++;
-                                p--;
-                            }
-                            // p is now before the '('
-                            while (p >= 0 && /\s/.test(trimBefore[p])) p--;
-                        }
-                        // Required: identifier
-                        if (p < 0 || !/\w/.test(trimBefore[p])) break;
-                        while (p >= 0 && /\w/.test(trimBefore[p])) p--;
-                        const idStart = p + 1;
-                        // Check for preceding dot (more chain)
-                        let pp = p;
-                        while (pp >= 0 && /\s/.test(trimBefore[pp])) pp--;
-                        if (pp >= 0 && trimBefore[pp] === '.') {
-                            p = pp - 1;
-                            continue;
-                        }
-                        // No more dots — idStart is the beginning of the expression
-                        p = idStart - 1;
-                        break;
-                    }
-                    const exprStart = p + 1;
-                    const chainExpr = trimBefore.substring(exprStart, trimBefore.length - 1); // exclude trailing dot
-                    if (chainExpr) {
-                        const rootM = chainExpr.match(/^(\w+)/);
-                        if (rootM) {
-                            const rootName = rootM[1];
-                            const afterRoot = chainExpr.substring(rootName.length);
-                            let rootType: string | undefined;
-                            let chainRemainder: string;
-                            if (afterRoot.trimStart().startsWith('(')) {
-                                // Root is a function call: FuncName(...).chain...
-                                rootType = this.resolveFunctionReturnType(rootName) ?? undefined;
-                                if (!rootType && containingClassName) {
-                                    rootType = this.resolveMethodCallWithTemplates(containingClassName, rootName) ?? undefined;
-                                }
-                                const parenStart = afterRoot.indexOf('(');
-                                let d = 1, i = parenStart + 1;
-                                while (i < afterRoot.length && d > 0) {
-                                    if (afterRoot[i] === '(') d++;
-                                    else if (afterRoot[i] === ')') d--;
-                                    i++;
-                                }
-                                chainRemainder = afterRoot.substring(i);
-                            } else {
-                                // Root is a variable or class name (for static access)
-                                // Check class name first to avoid regex false positives
-                                if (rootName[0] === rootName[0].toUpperCase() && this.classIndex.has(rootName)) {
-                                    rootType = rootName;
-                                } else {
-                                    rootType = getVarTypeAtLine(rootName, lineNum);
-                                }
-                                chainRemainder = afterRoot;
-                            }
-                            // Resolve through the remaining chain if present.
-                            // Pass the raw (non-typedef-resolved) rootType to resolveVariableChainType
-                            // so it can build the proper template map from the typedef's generic args.
-                            if (rootType && chainRemainder.trim().startsWith('.')) {
-                                const resolved = this.resolveVariableChainType(rootType, chainRemainder.trim());
-                                if (resolved) {
-                                    overloads = this.findFunctionOverloads(funcName, resolved);
-                                }
-                            } else if (rootType) {
-                                overloads = this.findFunctionOverloads(funcName, this.resolveTypedef(rootType));
-                            }
-                        }
+                    // Use the unified backward chain parser + resolver instead of
+                    // hand-rolled backward walking. resolveFullChain handles nested
+                    // parens, function calls, variables, static access, and deep chains.
+                    const chainResult = this.resolveFullChain(trimBefore, doc, { line: lineNum, character: 0 }, ast);
+                    if (chainResult) {
+                        chainResolvedType = chainResult.type;
+                        overloads = this.findFunctionOverloads(funcName, chainResult.type);
                     }
                 }
 
@@ -5127,26 +5479,80 @@ export class Analyzer {
                 }
                 
                 // Skip warning for chain calls where we couldn't resolve the target type —
-                // we don't know what class the method belongs to
+                // we don't know what class the method belongs to.
+                // BUT: if chain resolution DID resolve to a known type (chainResolvedType is set),
+                // then we know the method doesn't exist on that type and should warn.
                 const dotObj = dotMatch ? dotMatch[1] : undefined;
                 const dotObjType = dotObj ? getVarTypeAtLine(dotObj, lineNum) : undefined;
                 const dotObjIsKnownClass = !!dotObj && dotObj[0] === dotObj[0].toUpperCase() && this.classIndex.has(dotObj);
+                const chainResolvedToKnownType = !!chainResolvedType && this.classIndex.has(chainResolvedType);
+
+                // Check if the receiver type is actually resolvable (a known class or primitive).
+                // Suppress warnings only for truly unresolvable types: auto and typename.
+                // Template params (T, TKey, etc.) are now resolved to their upper bound
+                // by resolveChainRoot/resolveTemplateParam, so check the containing class's
+                // genericVars to recognize them as resolvable.
+                const hardcodedPrimitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector', 'class']);
+                const isResolvableType = (t: string | undefined): boolean => {
+                    if (!t) return false;
+                    if (t === 'auto' || t === 'typename') return false;
+                    const resolved = this.resolveTypedef(t);
+                    if (hardcodedPrimitives.has(resolved.toLowerCase()) || this.classIndex.has(resolved)) return true;
+                    // Template params are resolvable — resolveChainRoot resolves them to their upper bound
+                    if (containingClassName) {
+                        const ccClasses = this.classIndex.get(containingClassName);
+                        if (ccClasses) {
+                            for (const cc of ccClasses) {
+                                if (cc.genericVars?.includes(resolved)) return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
+
+                // If dotObjType resolved to an unresolvable type, skip the warning
+                const dotObjTypeIsResolvable = isResolvableType(dotObjType);
+                const chainTypeIsResolvable = isResolvableType(chainResolvedType ?? undefined);
+
                 const isUnresolvedChain =
-                    (!dotMatch && chainAttempted) ||
-                    (!!dotMatch && (dotIsPartOfChain || (!dotObjType && !dotObjIsKnownClass)));
+                    (!dotMatch && chainAttempted && !chainResolvedToKnownType) ||
+                    (!!dotMatch && (dotIsPartOfChain || (!dotObjType && !dotObjIsKnownClass)) && !chainResolvedToKnownType);
 
                 // Global/unknown receiver calls need a large index to avoid noise.
-                // But when receiver type is known (obj.Method), we can warn confidently
-                // even with a smaller index.
-                const hasConfidentReceiverType = !!dotMatch && (!!dotObjType || dotObjIsKnownClass);
+                // But when receiver type is known (obj.Method or resolved chain), we can
+                // warn confidently even with a smaller index.
+                // A type must actually be resolvable to be "confident" — auto, T, typename are not.
+                const hasConfidentReceiverType = (!!dotMatch && ((dotObjTypeIsResolvable) || dotObjIsKnownClass)) || chainTypeIsResolvable;
                 const canWarn = this.docCache.size >= 500 || hasConfidentReceiverType;
+
+                // Explicitly skip when the resolved type is auto or typename —
+                // these are inherently unresolvable and should never produce warnings.
+                const effectiveType = chainResolvedType || dotObjType;
+                if (effectiveType === 'auto' || effectiveType === 'typename') continue;
+
+                // Skip when the receiver type's hierarchy is incomplete (has an unresolved
+                // base class not in the index). The method may exist in unindexed parents.
+                // This commonly happens with modded classes that extend vanilla types whose
+                // full hierarchy isn't in the workspace.
+                if (effectiveType && canWarn && !isUnresolvedChain) {
+                    const hierarchy = this.getClassHierarchyOrdered(effectiveType, new Set());
+                    const hasIncompleteHierarchy = hierarchy.some(cls => {
+                        if (!cls.base?.identifier) return false;
+                        if (cls.base.identifier === 'Class') return false;
+                        return !this.classIndex.has(cls.base.identifier);
+                    });
+                    if (hasIncompleteHierarchy) continue;
+                }
 
                 if (canWarn && !isUnresolvedChain) {
                     const startPos = doc.positionAt(match.index);
                     const endPos = doc.positionAt(match.index + funcName.length);
+                    // Prefer chain-resolved type for the message when available,
+                    // since it may be more accurate (e.g., template param T → Class)
+                    const displayType = chainResolvedType || (dotMatch ? (dotObjType || dotObj) : undefined);
                     diags.push({
-                        message: dotMatch
-                            ? `Unknown method '${funcName}' on type '${dotObjType || dotObj}'`
+                        message: displayType
+                            ? `Unknown method '${funcName}' on type '${displayType}'`
                             : `Unknown function '${funcName}'`,
                         range: { start: startPos, end: endPos },
                         severity: DiagnosticSeverity.Warning
