@@ -40,8 +40,8 @@ import { TextDocument } from 'vscode-languageserver-textdocument';
 import { Position, Range, Location, SymbolInformation, SymbolKind, Diagnostic, DiagnosticSeverity } from 'vscode-languageserver';
 import { parse, ParseError, ClassDeclNode, File, SymbolNodeBase, FunctionDeclNode, VarDeclNode, TypedefNode, toSymbolKind, EnumDeclNode, EnumMemberDeclNode, TypeNode, ReturnStatementInfo } from '../ast/parser';
 import { prettyPrint } from '../ast/printer';
-import { lex } from '../lexer/lexer';
 import { Token, TokenKind } from '../lexer/token';
+import { keywords } from '../lexer/rules';
 import { normalizeUri } from '../../util/uri';
 import * as url from 'node:url';
 
@@ -82,30 +82,56 @@ interface GlobalSymbolEntry {
 
 /**
  * Returns the token at a specific offset (e.g. mouse hover or cursor position).
- * Lexes only a small window around the position for performance.
+ *
+ * Uses a simple regex scan instead of the full lexer so that preprocessor
+ * directives (#ifdef / #else / #endif) in the surrounding context can never
+ * accidentally "eat" the identifier under the cursor.
  */
 export function getTokenAtPosition(text: string, offset: number): Token | null {
-    const windowSize = 64;
-    const start = Math.max(0, offset - windowSize);
-    const end = Math.min(text.length, offset + windowSize);
-    const slice = text.slice(start, end);
+    // 1 · Detect if the cursor sits inside a // or /* */ comment.
+    //     If so, return null immediately (no hover/def on comments).
+    //     We only need to scan the current line for //, and a short
+    //     window for /* */.
+    const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
+    const lineText  = text.substring(lineStart, text.indexOf('\n', offset));
+    const colInLine = offset - lineStart;
 
-    const tokens = lex(slice);
+    // Check for // comment: everything after // on this line is a comment
+    const slashSlash = lineText.indexOf('//');
+    if (slashSlash >= 0 && colInLine > slashSlash) return null;
 
-    for (const t of tokens) {
-        const absStart = start + t.start;
-        const absEnd = start + t.end;
+    // Quick check for block comment: scan backward for /* without closing */
+    const windowBack = Math.max(0, offset - 500);
+    const before = text.substring(windowBack, offset);
+    const lastOpen  = before.lastIndexOf('/*');
+    const lastClose = before.lastIndexOf('*/');
+    if (lastOpen >= 0 && (lastClose < 0 || lastClose < lastOpen)) return null;
 
-        if (offset >= absStart && offset <= absEnd) {
-            return {
-                ...t,
-                start: absStart,
-                end: absEnd
-            };
+    // 2 · Check if cursor is inside a string literal (" ... ").
+    //     Count unescaped quotes from the start of the line to the cursor.
+    let inString = false;
+    for (let i = 0; i < colInLine; i++) {
+        if (lineText[i] === '"' && (i === 0 || lineText[i - 1] !== '\\')) {
+            inString = !inString;
         }
     }
+    if (inString) return null;
 
-    return null;
+    // 3 · Walk outward from the offset to find the word (identifier/keyword)
+    //     boundaries. Identifiers are [_A-Za-z0-9]+.
+    let lo = offset;
+    let hi = offset;
+    while (lo > 0 && /[_A-Za-z0-9]/.test(text[lo - 1])) lo--;
+    while (hi < text.length && /[_A-Za-z0-9]/.test(text[hi])) hi++;
+    if (lo === hi) return null;          // cursor is not on a word
+
+    const value = text.substring(lo, hi);
+
+    // 4 · Classify: keyword vs identifier vs number
+    if (/^\d/.test(value)) return null; // pure numeric — not useful for hover/def
+
+    const kind = keywords.has(value) ? TokenKind.Keyword : TokenKind.Identifier;
+    return { kind, value, start: lo, end: hi };
 }
 
 function formatDeclaration(node: SymbolNodeBase, templateMap?: Map<string, string>): string {
@@ -600,10 +626,20 @@ export class Analyzer {
         return this.ensure(doc);
     }
 
+    /**
+     * Lightweight re-parse + index update for the active document.
+     * Called on every keystroke so hover/definition always have a fresh AST,
+     * without blocking on heavy diagnostic checks.
+     */
+    ensureIndexed(doc: TextDocument): File {
+        return this.ensure(doc);
+    }
+
     private ensure(doc: TextDocument): File {
         // 1 · cache hit
+        const normalizedUri = normalizeUri(doc.uri);
         const currVersion = doc.version;
-        const cachedFile = this.docCache.get(normalizeUri(doc.uri));
+        const cachedFile = this.docCache.get(normalizedUri);
 
         if (cachedFile && cachedFile.version === currVersion) {
             return cachedFile;
@@ -612,15 +648,18 @@ export class Analyzer {
         try {
             // 2 · happy path ─ parse & cache
             const ast = parse(doc, undefined, this.preprocessorDefines);           // pass full TextDocument + defines
-            const normalizedUri = normalizeUri(doc.uri);
             ast.module = getModuleLevel(doc.uri);
             // Pre-compute skipped #ifdef regions so runDiagnostics can
             // apply them from cache instead of re-scanning directives.
             ast.skippedRegions = Analyzer.computeSkippedRegions(doc.getText(), this.preprocessorDefines);
             this.docCache.set(normalizedUri, ast);
-            // Update indexes for fast lookups
-            this.updateGlobalSymbolIndex(normalizedUri, ast);
-            this.updateAllIndexes(normalizedUri, ast);
+            // Update indexes for fast lookups — only for real files.
+            // Non-file URIs (e.g. vscode-chat-code-block://, untitled:)
+            // must not pollute the global class/function indexes.
+            if (normalizedUri.startsWith('file:')) {
+                this.updateGlobalSymbolIndex(normalizedUri, ast);
+                this.updateAllIndexes(normalizedUri, ast);
+            }
             return ast;
         } catch (err) {
             // 3 · graceful error handling
@@ -2662,6 +2701,8 @@ export class Analyzer {
         for (const node of rawClassNodes) {
             const srcUri = (node as any)._sourceUri as string | undefined;
             if (srcUri) {
+                // Skip non-file entries (e.g. chat code blocks indexed by VS Code)
+                if (!srcUri.startsWith('file:')) continue;
                 if (seenSourceUris.has(srcUri)) continue;
                 seenSourceUris.add(srcUri);
                 // Path suffix dedup: same file under different URI roots
@@ -3870,6 +3911,8 @@ export class Analyzer {
                 // duplicates where the same file was indexed from different roots
                 const verNormPath = uriToNormalizedPath(verSourceUri);
                 if (currentNormPath && verNormPath && currentNormPath === verNormPath) continue;
+                // Skip non-file entries (e.g. vscode-chat-code-block:// from Copilot Chat)
+                if (verSourceUri && !verSourceUri.startsWith('file:')) continue;
                 for (const member of ver.members || []) {
                     if (member.kind === 'FunctionDecl' && member.name) {
                         const func = member as FunctionDeclNode;
