@@ -2596,6 +2596,10 @@ export class Analyzer {
                     const key = `${srcUri ?? ''}:${member.nameStart.line}:${member.nameStart.character}`;
                     if (!seenPositions.has(key)) {
                         seenPositions.add(key);
+                        // Attach container class info for rich hover display
+                        (member as any)._containerClassName = classNode.name;
+                        (member as any)._containerIsModded = classNode.modifiers?.includes('modded') ?? false;
+                        (member as any)._sourceUri = srcUri;
                         matches.push(member as SymbolNodeBase);
                     }
                 }
@@ -2762,9 +2766,90 @@ export class Analyzer {
         const symbols = this.resolveDefinitions(doc, _pos);
         if (symbols.length === 0) return null;
 
+        // If there are multiple results for the same member name (overrides
+        // across the class hierarchy), show them as a hierarchy chain with
+        // class names and file paths for easy navigation.
+        const hasMemberContext = symbols.some(s => (s as any)._containerClassName);
+        if (hasMemberContext && symbols.length > 1) {
+            return this.formatOverrideChain(symbols, templateMap);
+        }
+
+        // For class definitions, show the full inheritance chain
+        if (symbols.length >= 1 && symbols[0].kind === 'ClassDecl') {
+            const cls = symbols[0] as ClassDeclNode;
+            const chain = this.getInheritanceChainNames(cls.name);
+            const decl = formatDeclaration(cls, templateMap);
+            if (chain.length > 1) {
+                return decl + '\n\n**Inheritance:** ' + chain.join(' → ');
+            }
+            return decl;
+        }
+
         return symbols
             .map((s) => formatDeclaration(s, templateMap))
             .join('\n\n');
+    }
+
+    /**
+     * Format a list of overrides as a hierarchy chain for the hover tooltip.
+     * Shows each definition with its containing class and file path.
+     */
+    private formatOverrideChain(symbols: SymbolNodeBase[], templateMap?: Map<string, string>): string {
+        const lines: string[] = [];
+        
+        for (const sym of symbols) {
+            const className = (sym as any)._containerClassName as string | undefined;
+            const isModded = (sym as any)._containerIsModded as boolean | undefined;
+            const sourceUri = (sym as any)._sourceUri as string | undefined;
+            
+            // Format the declaration
+            const decl = formatDeclaration(sym, templateMap);
+            
+            // Build context line: class name + file path
+            let context = '';
+            if (className) {
+                const prefix = isModded ? 'modded ' : '';
+                context = `*${prefix}${className}*`;
+            }
+            if (sourceUri) {
+                try {
+                    const fsPath = url.fileURLToPath(sourceUri).replace(/\\/g, '/');
+                    // Show the last meaningful path segments (e.g., Scripts/5_Mission/Mission.c)
+                    const parts = fsPath.split('/');
+                    const shortPath = parts.slice(-3).join('/');
+                    context += context ? ` — \`${shortPath}:${sym.nameStart.line + 1}\`` : `\`${shortPath}:${sym.nameStart.line + 1}\``;
+                } catch { /* ignore */ }
+            }
+            
+            if (context) {
+                lines.push(`${context}\n${decl}`);
+            } else {
+                lines.push(decl);
+            }
+        }
+        
+        return lines.join('\n\n---\n\n');
+    }
+
+    /**
+     * Get the inheritance chain names for a class (bottom-up: target → ... → root).
+     * e.g., PlayerBase → ManBase → EntityAI → Entity → Managed → Class
+     */
+    private getInheritanceChainNames(className: string): string[] {
+        const chain: string[] = [];
+        const visited = new Set<string>();
+        let current = className;
+        while (current && !visited.has(current)) {
+            visited.add(current);
+            chain.push(current);
+            const classes = this.classIndex.get(current);
+            if (!classes || classes.length === 0) break;
+            const original = classes.find(c => !c.modifiers?.includes('modded')) || classes[0];
+            const base = original.base?.identifier;
+            if (!base) break;
+            current = base;
+        }
+        return chain;
     }
 
     /**
