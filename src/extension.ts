@@ -76,16 +76,8 @@ export async function activate(context: vscode.ExtensionContext) {
             }, 5000);
         }
         
-        // Trigger a re-validation of all open enscript documents
-        for (const doc of vscode.workspace.textDocuments) {
-            if (doc.languageId === 'enscript') {
-                // Force a change event by doing a no-op edit
-                const edit = new vscode.WorkspaceEdit();
-                // Insert and immediately remove an empty string to trigger didChangeContent
-                edit.insert(doc.uri, new vscode.Position(0, 0), '');
-                vscode.workspace.applyEdit(edit);
-            }
-        }
+        // Ask the server to re-run diagnostics on every open document
+        client?.sendNotification('enscript/revalidateOpenFiles');
     });
 
     context.subscriptions.push(

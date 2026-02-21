@@ -201,6 +201,18 @@ connection.onRequest('enscript/checkWorkspace', async () => {
     };
 });
 
+// Re-validate every open enscript document (called by the client after indexing completes)
+connection.onNotification('enscript/revalidateOpenFiles', () => {
+    const analyser = Analyzer.instance();
+    for (const doc of documents.all()) {
+        if (!analyser.isWorkspaceFile(doc.uri)) {
+            continue;
+        }
+        const diagnostics = analyser.runDiagnostics(doc);
+        connection.sendDiagnostics({ uri: doc.uri, diagnostics });
+    }
+});
+
 // Wire all feature handlers.
 registerAllHandlers(connection, documents);
 
