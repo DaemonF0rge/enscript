@@ -50,4 +50,13 @@ export function registerDocuments(conn: Connection, docs: TextDocuments<TextDocu
             }
         }, DEBOUNCE_MS));
     });
+
+    docs.onDidClose((change) => {
+        const uri = change.document.uri;
+        const pending = debounceTimers.get(uri);
+        if (pending) {
+            clearTimeout(pending);
+            debounceTimers.delete(uri);
+        }
+    });
 }
