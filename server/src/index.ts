@@ -107,9 +107,9 @@ connection.onInitialized(async () => {
         const doc = TextDocument.create(uri, 'enscript', 1, text);
         Analyzer.instance().parseAndCache(doc);
 
-        // Send progress updates every 500ms or every 100 files
+        // Send progress updates at most every 500ms
         const now = Date.now();
-        if (now - lastProgressUpdate > 500 || (i + 1) % 100 === 0) {
+        if (now - lastProgressUpdate >= 500) {
             connection.sendNotification('enscript/indexingProgress', { 
                 current: i + 1,
                 total: allFiles.length,
