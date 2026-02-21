@@ -383,17 +383,27 @@ export function parse(
             //  - ';' at brace depth 0  (end of broken variable/etc.)
             //  - closing a balanced { } (end of broken function/class body)
             //  - unmatched '}' at depth 0 (shouldn't happen at top level)
+            const MAX_RECOVERY_TOKENS = 500;
             let braceDepth = 0;
-            while (!eof()) {
+            let skippedTokens = 0;
+            const recoveryStartToken = toks[Math.min(pos, toks.length - 1)];
+            while (!eof() && skippedTokens < MAX_RECOVERY_TOKENS) {
                 const v = peek().value;
                 if (v === '{') { braceDepth++; next(); }
                 else if (v === '}') {
-                    if (braceDepth === 0) { next(); break; }
-                    braceDepth--; next();
+                    if (braceDepth === 0) { next(); skippedTokens++; break; }
+                    braceDepth--; next(); skippedTokens++;
                     if (braceDepth === 0) break; // closed a balanced block
                 }
-                else if (v === ';' && braceDepth === 0) { next(); break; }
-                else { next(); }
+                else if (v === ';' && braceDepth === 0) { next(); skippedTokens++; break; }
+                else { next(); skippedTokens++; }
+            }
+            if (!eof() && skippedTokens >= MAX_RECOVERY_TOKENS) {
+                addDiagnostic(
+                    recoveryStartToken,
+                    `Error recovery skipped ${skippedTokens} tokens before giving up. Parsing may be out of sync.`,
+                    DiagnosticSeverity.Warning
+                );
             }
         }
     }
