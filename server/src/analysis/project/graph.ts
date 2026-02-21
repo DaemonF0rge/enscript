@@ -1518,7 +1518,7 @@ export class Analyzer {
 
             // Skip keywords that aren't valid chain roots (return, if, etc.)
             // but allow 'this' and 'super'
-            if (!name || (name !== 'this' && name !== 'super' && /^(return|if|else|while|for|foreach|switch|case|new|delete|typeof|class|modded|static|private|protected|ref|autoptr|auto|void|int|float|bool|string|vector|const|override|break|continue|null|true|false)$/.test(name))) {
+            if (!name || (name !== 'this' && name !== 'super' && /^(return|if|else|while|for|foreach|switch|case|new|delete|typeof|class|modded|static|private|protected|ref|autoptr|auto|void|int|float|bool|string|const|override|break|continue|null|true|false)$/.test(name))) {
                 break;
             }
 
@@ -1677,7 +1677,9 @@ export class Analyzer {
             }
 
             // Try as class name (static access: e.g., PlayerBase.Cast)
-            if (/^[A-Z]/.test(root.name)) {
+            // Also handle lowercase built-in types like 'vector' that support static methods
+            const isStaticCandidate = /^[A-Z]/.test(root.name) || root.name === 'vector';
+            if (isStaticCandidate) {
                 if (this.classIndex.has(root.name)) {
                     return { type: root.name, templateMap: new Map() };
                 }
@@ -5528,7 +5530,9 @@ export class Analyzer {
                 const beforeObjName = textBeforeFunc.substring(0, dotMatch.index).trimEnd();
                 const isPartOfChain = beforeObjName.length > 0 && (beforeObjName[beforeObjName.length - 1] === '.' || beforeObjName[beforeObjName.length - 1] === ')');
                 dotIsPartOfChain = isPartOfChain;
-                if (!isPartOfChain && objName[0] === objName[0].toUpperCase() && this.classIndex.has(objName)) {
+                // Check for static access: ClassName.Method or lowercase built-ins like vector.Distance
+                const isStaticAccess = objName[0] === objName[0].toUpperCase() || objName === 'vector';
+                if (!isPartOfChain && isStaticAccess && this.classIndex.has(objName)) {
                     overloads = this.findFunctionOverloads(funcName, objName);
                 }
                 
@@ -5561,7 +5565,7 @@ export class Analyzer {
                     }
                     // Fall back to static class call if chain didn't resolve
                     // Only for true static access, not when objName is part of a chain
-                    if (overloads.length === 0 && !isPartOfChain && objName[0] === objName[0].toUpperCase()) {
+                    if (overloads.length === 0 && !isPartOfChain && isStaticAccess) {
                         overloads = this.findFunctionOverloads(funcName, objName);
                     }
                 }
