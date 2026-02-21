@@ -791,7 +791,12 @@ export function parse(
                             // '>>' counts as 2 closing brackets (nested generics)
                             let angleDepth = prevPrev.value === '>>' ? 2 : 1;
                             let searchPos = prevPrevIdx - 1; // start before the '>' or '>>'
-                            while (searchPos >= 0 && angleDepth > 0) {
+                            // Safety guard: limit walk-back distance to avoid runaway scans
+                            // if boundary detection somehow fails. Real generic types are
+                            // compact (e.g. map<string, array<int>>), so 64 tokens is generous.
+                            const maxWalkBack = 64;
+                            const minSearchPos = Math.max(0, searchPos - maxWalkBack);
+                            while (searchPos >= minSearchPos && angleDepth > 0) {
                                 const st = toks[searchPos];
                                 if (st.value === '>>') angleDepth += 2;
                                 else if (st.value === '>') angleDepth++;
