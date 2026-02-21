@@ -46,6 +46,79 @@
 import { Token, TokenKind } from './token';
 import { keywords, punct, multiCharOps } from './rules';
 
+/**
+ * Skip over a preprocessor-disabled region, handling nested #ifdef/#endif
+ * and stopping at the appropriate boundary directive.
+ *
+ * While scanning, strings (both single- and double-quoted) and comments
+ * (line and block) are recognised so that '#' characters inside them do
+ * not confuse depth tracking.
+ *
+ * Limitations:
+ *   - Strings/comments are detected with a lightweight scan that mirrors
+ *     the main lexer but is NOT the main lexer.  Extremely unusual
+ *     constructs (e.g. raw string literals, if Enforce ever adds them)
+ *     could theoretically mislead the scanner.
+ *   - Nested block comments are not supported, matching the behaviour
+ *     of the Enforce Script compiler.
+ *
+ * @param text        Full source text.
+ * @param pos         Index to start scanning (just after the opening directive line).
+ * @param stopAtElse  If true, an `#else` / `#elif` at depth 1 terminates the skip
+ *                    (used when skipping the first branch of an #ifdef).
+ * @returns           The index just past the terminating directive line.
+ */
+function skipPreprocRegion(text: string, pos: number, stopAtElse: boolean): number {
+    let i = pos;
+    let depth = 1;
+
+    while (depth > 0 && i < text.length) {
+        // Advance to the next '#' while skipping over strings & comments
+        // so that a '#' inside a string or comment is not mistaken for a directive.
+        while (i < text.length && text[i] !== '#') {
+            if (text[i] === '"' || text[i] === "'") {
+                // String / character literal — skip to the matching close quote.
+                const quote = text[i];
+                i++;
+                while (i < text.length && text[i] !== quote) {
+                    if (text[i] === '\\' && i + 1 < text.length) i++;
+                    i++;
+                }
+                if (i < text.length) i++; // consume closing quote
+            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '/') {
+                // Line comment — skip to end of line.
+                while (i < text.length && text[i] !== '\n') i++;
+            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '*') {
+                // Block comment — skip to closing */.
+                i += 2;
+                while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+                if (i + 1 < text.length) i += 2; // consume closing */
+            } else {
+                i++;
+            }
+        }
+
+        if (i >= text.length) break;
+
+        // Read the full directive line.
+        const dStart = i;
+        while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
+        const d = text.slice(dStart, i).trim();
+
+        if (d.match(/^#\s*(ifdef|ifndef)\b/)) {
+            depth++;
+        } else if (d.match(/^#\s*endif\b/)) {
+            depth--;
+        } else if (stopAtElse && depth === 1 && d.match(/^#\s*(else|elif)\b/)) {
+            // Found #else/#elif at our level — stop skipping so the caller
+            // can process the alternative branch.
+            depth = 0;
+        }
+    }
+
+    return i;
+}
+
 export function lex(text: string, defines?: Set<string>): Token[] {
     const toks: Token[] = [];
     let i = 0;
@@ -113,45 +186,8 @@ export function lex(text: string, defines?: Set<string>): Token[] {
                     // We'll handle #else (skip) and #endif (emit) when we encounter them
                     continue;
                 } else {
-                    // Skip the #ifdef/#ifndef branch until #else or #endif
-                    let depth = 1;
-                    
-                    while (depth > 0 && i < text.length) {
-                        while (i < text.length && text[i] !== '#') {
-                            if (text[i] === '"') {
-                                i++;
-                                while (i < text.length && text[i] !== '"') {
-                                    if (text[i] === '\\' && i + 1 < text.length) i++;
-                                    i++;
-                                }
-                                if (i < text.length) i++;
-                            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '/') {
-                                while (i < text.length && text[i] !== '\n') i++;
-                            } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '*') {
-                                i += 2;
-                                while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
-                                i += 2;
-                            } else {
-                                i++;
-                            }
-                        }
-                        
-                        if (i >= text.length) break;
-                        
-                        const dStart = i;
-                        while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
-                        const d = text.slice(dStart, i).trim();
-                        
-                        if (d.match(/^#\s*(ifdef|ifndef)\b/)) {
-                            depth++;
-                        } else if (d.match(/^#\s*endif\b/)) {
-                            depth--;
-                        } else if (d.match(/^#\s*else\b/) && depth === 1) {
-                            // Found #else at our level - stop skipping, process #else branch
-                            depth = 0;
-                        }
-                    }
-                    
+                    // Skip the #ifdef/#ifndef branch until #else/#elif or #endif
+                    i = skipPreprocRegion(text, i, /* stopAtElse */ true);
                     push(TokenKind.Preproc, text.slice(lineStart, i), lineStart);
                     continue;
                 }
@@ -162,41 +198,8 @@ export function lex(text: string, defines?: Set<string>): Token[] {
             // Now skip from #else until #endif
             if (directive.match(/^#\s*else\b/)) {
                 const elseStart = lineStart;
-                let depth = 1;
-                
-                while (depth > 0 && i < text.length) {
-                    while (i < text.length && text[i] !== '#') {
-                        if (text[i] === '"') {
-                            i++;
-                            while (i < text.length && text[i] !== '"') {
-                                if (text[i] === '\\' && i + 1 < text.length) i++;
-                                i++;
-                            }
-                            if (i < text.length) i++;
-                        } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '/') {
-                            while (i < text.length && text[i] !== '\n') i++;
-                        } else if (text[i] === '/' && i + 1 < text.length && text[i + 1] === '*') {
-                            i += 2;
-                            while (i + 1 < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
-                            i += 2;
-                        } else {
-                            i++;
-                        }
-                    }
-                    
-                    if (i >= text.length) break;
-                    
-                    const dStart = i;
-                    while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
-                    const d = text.slice(dStart, i).trim();
-                    
-                    if (d.match(/^#\s*(ifdef|ifndef)\b/)) {
-                        depth++;
-                    } else if (d.match(/^#\s*endif\b/)) {
-                        depth--;
-                    }
-                }
-                
+                // Skip from #else until the matching #endif
+                i = skipPreprocRegion(text, i, /* stopAtElse */ false);
                 push(TokenKind.Preproc, text.slice(elseStart, i), elseStart);
                 continue;
             }
