@@ -22,14 +22,14 @@ const connection = createConnection(ProposedFeatures.all);
 // Track open documents — in-memory mirror of the client.
 export const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 
-let workspaceRoot = '';
+let workspaceRoots: string[] = [];
 
 connection.onInitialize((_params: InitializeParams): InitializeResult => {
     const folders = _params.workspaceFolders ?? [];
     if (folders.length > 0) {
-        workspaceRoot = url.fileURLToPath(folders[0].uri);
+        workspaceRoots = folders.map(f => url.fileURLToPath(f.uri));
     } else if (_params.rootUri) {
-        workspaceRoot = url.fileURLToPath(_params.rootUri);
+        workspaceRoots = [url.fileURLToPath(_params.rootUri)];
     }
 
     return {
@@ -54,7 +54,7 @@ connection.onInitialized(async () => {
     if (includePaths.length > 0) {
         Analyzer.instance().setIncludePaths(includePaths);
     }
-    Analyzer.instance().setWorkspaceRoot(workspaceRoot);
+    Analyzer.instance().setWorkspaceRoots(workspaceRoots);
     
     // Configure preprocessor defines
     if (preprocessorDefines.length > 0) {
@@ -62,7 +62,7 @@ connection.onInitialized(async () => {
         console.log(`Preprocessor defines: ${preprocessorDefines.join(', ')}`);
     }
 
-    const pathsToIndex = [workspaceRoot, ...includePaths];
+    const pathsToIndex = [...workspaceRoots, ...includePaths];
     const allFiles: string[] = [];
     const seenRealPaths = new Set<string>();
 
@@ -140,15 +140,20 @@ connection.onInitialized(async () => {
     // Notify client that indexing is complete - trigger refresh of open files
     connection.sendNotification('enscript/indexingComplete', { 
         fileCount: allFiles.length,
-        workspaceRoot: workspaceRoot 
+        workspaceRoots: workspaceRoots 
     });
 });
 
 // Handle request to check all workspace files
 connection.onRequest('enscript/checkWorkspace', async () => {
-    console.log(`Checking all workspace files in ${workspaceRoot}...`);
+    console.log(`Checking all workspace files in ${workspaceRoots.join(', ')}...`);
     
-    const files = await findAllFiles(workspaceRoot, ['.c']);
+    const allCheckFiles: string[] = [];
+    for (const root of workspaceRoots) {
+        const found = await findAllFiles(root, ['.c']);
+        allCheckFiles.push(...found);
+    }
+    const files = allCheckFiles;
     const allDiagnostics: Array<{ uri: string; diagnostics: any[] }> = [];
     
     for (const filePath of files) {

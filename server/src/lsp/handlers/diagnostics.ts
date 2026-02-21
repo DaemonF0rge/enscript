@@ -21,7 +21,42 @@ export function registerDiagnostics(conn: Connection, docs: TextDocuments<TextDo
         conn.sendDiagnostics({ uri: change.document.uri, diagnostics });
     };
 
+    // Debounce timers per-URI so each file gets its own delay
+    const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const DEBOUNCE_MS = 300;
+
     docs.onDidOpen(validate);
-    docs.onDidSave(validate);
-    docs.onDidChangeContent(validate);
+    docs.onDidSave((change) => {
+        // On save: cancel any pending debounce and run immediately
+        const uri = change.document.uri;
+        const pending = debounceTimers.get(uri);
+        if (pending) {
+            clearTimeout(pending);
+            debounceTimers.delete(uri);
+        }
+        validate(change);
+    });
+    docs.onDidChangeContent((change) => {
+        // On every keystroke: do a lightweight parse + index update
+        // immediately so hover/definition stay responsive, then
+        // schedule the HEAVY diagnostic checks after a debounce delay.
+        analyser.ensureIndexed(change.document);
+
+        const uri = change.document.uri;
+        const pending = debounceTimers.get(uri);
+        if (pending) clearTimeout(pending);
+        debounceTimers.set(uri, setTimeout(() => {
+            debounceTimers.delete(uri);
+            // Re-fetch the latest document — the user may have typed more
+            const latestDoc = docs.get(uri);
+            if (latestDoc) {
+                if (!analyser.isWorkspaceFile(uri)) {
+                    conn.sendDiagnostics({ uri, diagnostics: [] });
+                    return;
+                }
+                const diagnostics = analyser.runDiagnostics(latestDoc);
+                conn.sendDiagnostics({ uri, diagnostics });
+            }
+        }, DEBOUNCE_MS));
+    });
 }

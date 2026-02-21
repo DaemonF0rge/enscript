@@ -483,26 +483,30 @@ export class Analyzer {
 
     /** Store include paths so diagnostics can be suppressed for external files */
     private includePaths: string[] = [];
-    private workspaceRoot: string = '';
+    private workspaceRoots: string[] = [];
 
     setIncludePaths(paths: string[]): void {
         this.includePaths = paths.map(p => p.replace(/\\/g, '/').toLowerCase());
     }
 
     setWorkspaceRoot(root: string): void {
-        this.workspaceRoot = root.replace(/\\/g, '/').toLowerCase();
+        this.workspaceRoots = [root.replace(/\\/g, '/').toLowerCase()];
     }
 
-    /** Check if a URI belongs to the workspace (not an external include path file) */
+    setWorkspaceRoots(roots: string[]): void {
+        this.workspaceRoots = roots.map(r => r.replace(/\\/g, '/').toLowerCase());
+    }
+
+    /** Check if a URI belongs to any workspace folder (not an external include path file) */
     isWorkspaceFile(uri: string): boolean {
-        if (!this.workspaceRoot) return true; // no workspace root set, allow all
+        if (this.workspaceRoots.length === 0) return true; // no workspace root set, allow all
         let fsPath: string;
         try {
             fsPath = url.fileURLToPath(uri).replace(/\\/g, '/').toLowerCase();
         } catch {
             fsPath = uri.replace(/\\/g, '/').toLowerCase();
         }
-        return fsPath.startsWith(this.workspaceRoot);
+        return this.workspaceRoots.some(root => fsPath.startsWith(root));
     }
 
     /**
@@ -2696,7 +2700,6 @@ export class Analyzer {
         // the workspace and an include path under different full URIs.
         const rawClassNodes = this.findAllClassesByName(className);
         const seenSourceUris = new Set<string>();
-        const seenPathSuffixes = new Set<string>();
         const classNodes: ClassDeclNode[] = [];
         for (const node of rawClassNodes) {
             const srcUri = (node as any)._sourceUri as string | undefined;
@@ -2705,14 +2708,6 @@ export class Analyzer {
                 if (!srcUri.startsWith('file:')) continue;
                 if (seenSourceUris.has(srcUri)) continue;
                 seenSourceUris.add(srcUri);
-                // Path suffix dedup: same file under different URI roots
-                try {
-                    const fsPath = url.fileURLToPath(srcUri).replace(/\\/g, '/').toLowerCase();
-                    const parts = fsPath.split('/');
-                    const suffix = parts.slice(-3).join('/') + ':' + (node.modifiers?.includes('modded') ? 'modded' : 'orig');
-                    if (seenPathSuffixes.has(suffix)) continue;
-                    seenPathSuffixes.add(suffix);
-                } catch { /* ignore path extraction errors */ }
             }
             classNodes.push(node);
         }
