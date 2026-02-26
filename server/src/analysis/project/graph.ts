@@ -1115,7 +1115,8 @@ export class Analyzer {
      * unqualified method calls inside a class (i.e., calling inherited methods).
      */
     private resolveMethodCallWithTemplates(className: string, methodName: string): string | null {
-        // Walk the class hierarchy, building up the template map at each typedef step
+        // Walk the class hierarchy, building up the template map at each step
+        // (both typedef expansions AND extends clauses with generic arguments)
         const visited = new Set<string>();
         let templateMap = new Map<string, string>();
         
@@ -1157,11 +1158,21 @@ export class Analyzer {
                 }
             }
             
-            // Check base class
+            // Check base class, building template map from extends clause generic args
             const originalClass = classNodes.find(c => !c.modifiers?.includes('modded'));
-            const baseClassName = (originalClass || classNodes[0])?.base?.identifier;
-            if (baseClassName) {
-                return walk(baseClassName);
+            const baseNode = (originalClass || classNodes[0])?.base;
+            if (baseNode?.identifier) {
+                // If the extends clause has generic args (e.g., extends HFSMBase<WeaponStateBase, ...>),
+                // build a template map for the base class's generic parameters
+                if (baseNode.genericArgs && baseNode.genericArgs.length > 0) {
+                    const newMap = this.buildTemplateMap(baseNode.identifier, baseNode.genericArgs);
+                    for (const [k, v] of newMap) {
+                        // Apply existing template substitutions to the concrete args too
+                        // (handles chained generics)
+                        templateMap.set(k, templateMap.get(v) || v);
+                    }
+                }
+                return walk(baseNode.identifier);
             }
             
             return null;
@@ -1554,7 +1565,13 @@ export class Analyzer {
      * Also walks up the class hierarchy — if the containing class inherits
      * from a generic base, the base's template params are also checked.
      *
-     * @returns The resolved upper-bound type name, or null if not a template param.
+     * When a class extends a generic parent with concrete type arguments
+     * (e.g., WeaponFSM extends HFSMBase<WeaponStateBase, ...>), template
+     * parameters from the parent are resolved to the concrete arguments
+     * instead of falling back to the generic upper bound 'Class'.
+     *
+     * @returns The resolved concrete type name, or 'Class' as fallback if
+     *          no concrete substitution is found, or null if not a template param.
      */
     private resolveTemplateParam(typeName: string, ast: File, pos: Position): string | null {
         const cc = this.findContainingClass(ast, pos);
@@ -1562,18 +1579,86 @@ export class Analyzer {
 
         // Check the containing class's own template params
         if (cc.genericVars && cc.genericVars.includes(typeName)) {
+            // The containing class itself declares this template param.
+            // We can't resolve it further without knowing how this class is instantiated.
             return 'Class';
         }
 
-        // Also walk the class hierarchy in case a parent class defines the template param
-        const hierarchy = this.getClassHierarchyOrdered(cc.name, new Set());
-        for (const cls of hierarchy) {
-            if (cls.genericVars && cls.genericVars.includes(typeName)) {
-                return 'Class';
-            }
+        // Walk the inheritance chain from the containing class upward.
+        // At each step, check if the parent class defines the template param.
+        // If so, find the concrete type argument passed from the child's extends clause.
+        const concreteType = this.resolveTemplateParamThroughHierarchy(cc.name, typeName);
+        if (concreteType) {
+            return concreteType;
         }
 
         return null;
+    }
+
+    /**
+     * Walk the class hierarchy from `startClass` upward, resolving a template
+     * parameter name to the concrete type argument provided via extends clauses.
+     *
+     * Example:
+     *   class HFSMBase<Class FSMStateBase, Class FSMEventBase, ...> { FSMStateBase m_State; }
+     *   class WeaponFSM extends HFSMBase<WeaponStateBase, WeaponEventBase, ...> { }
+     *
+     * resolveTemplateParamThroughHierarchy("WeaponFSM", "FSMStateBase")
+     *   → finds HFSMBase has genericVars ["FSMStateBase", "FSMEventBase", ...]
+     *   → WeaponFSM's base.genericArgs[0] = "WeaponStateBase"
+     *   → returns "WeaponStateBase"
+     */
+    private resolveTemplateParamThroughHierarchy(startClass: string, templateParam: string): string | null {
+        const visited = new Set<string>();
+        
+        const walk = (className: string): string | null => {
+            if (visited.has(className)) return null;
+            visited.add(className);
+            
+            const classNodes = this.findAllClassesByName(className);
+            if (classNodes.length === 0) return null;
+            
+            // For each class node (original + modded), check if its base class
+            // defines the template parameter we're looking for.
+            for (const classNode of classNodes) {
+                if (!classNode.base?.identifier) continue;
+                
+                const baseName = classNode.base.identifier;
+                const baseGenericArgs = classNode.base.genericArgs;
+                
+                // Find the base class definition to get its genericVars
+                const baseClasses = this.findAllClassesByName(baseName);
+                const baseClass = baseClasses.find(c => !c.modifiers?.includes('modded')) || baseClasses[0];
+                
+                if (baseClass?.genericVars) {
+                    const paramIndex = baseClass.genericVars.indexOf(templateParam);
+                    if (paramIndex !== -1 && baseGenericArgs && paramIndex < baseGenericArgs.length) {
+                        const concreteType = baseGenericArgs[paramIndex].identifier;
+                        // The concrete type might itself be a template param of an
+                        // intermediate class — but usually it's a real class name.
+                        // Check if it resolves to a known class; if not, keep walking.
+                        if (this.classIndex.has(concreteType) || this.typedefIndex.has(concreteType)) {
+                            return concreteType;
+                        }
+                        // Could be a primitive
+                        const primitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
+                        if (primitives.has(concreteType.toLowerCase())) {
+                            return concreteType;
+                        }
+                        // It's an unknown type (possibly another template param) — still better than 'Class'
+                        return concreteType;
+                    }
+                }
+                
+                // Template param not found on this base — recurse up
+                const result = walk(baseName);
+                if (result) return result;
+            }
+            
+            return null;
+        };
+        
+        return walk(startClass);
     }
 
     /**
@@ -4288,11 +4373,30 @@ export class Analyzer {
             };
         }
         
-        // auto/typename/Class are wildcards - always compatible
+        // auto/typename/Class/Managed are wildcards - always compatible
+        // Managed is the root base class for all managed (ref-counted) classes
+        // in Enforce Script, so any class is assignable to Managed.
         if (declNorm === 'auto' || assignNorm === 'auto' ||
             declNorm === 'typename' || assignNorm === 'typename' ||
-            declNorm === 'Class' || assignNorm === 'Class') {
+            declNorm === 'Class' || assignNorm === 'Class' ||
+            declNorm === 'Managed' || assignNorm === 'Managed') {
             return { compatible: true, isDowncast: false, isUpcast: false };
+        }
+        
+        // Resolve typedefs before checking compatibility so that typedef'd
+        // names are compared against their underlying types.
+        const declResolved = this.resolveTypedef(declNorm);
+        const assignResolved = this.resolveTypedef(assignNorm);
+        
+        // If typedef resolution changed anything, re-check with resolved names
+        if (declResolved !== declNorm || assignResolved !== assignNorm) {
+            // After resolution, the types might now match directly
+            if (declResolved === assignResolved) {
+                return { compatible: true, isDowncast: false, isUpcast: false };
+            }
+            if (declResolved.toLowerCase() === assignResolved.toLowerCase()) {
+                return { compatible: true, isDowncast: false, isUpcast: false };
+            }
         }
         
         // Skip if either type is an unresolvable template parameter (TKey, TValue, T, etc.)
@@ -4300,10 +4404,35 @@ export class Analyzer {
         // Check: if the type doesn't exist as a known class, enum, or typedef in the index,
         // it's likely a template parameter or something we can't verify.
         const hardcodedPrimitives = new Set(['int', 'float', 'bool', 'string', 'void', 'vector']);
-        const declIsKnown = hardcodedPrimitives.has(declLower) || this.findAllClassesByName(declNorm).length > 0;
-        const assignIsKnown = hardcodedPrimitives.has(assignLower) || this.findAllClassesByName(assignNorm).length > 0;
+        const isKnownType = (name: string, nameLower: string): boolean => {
+            if (hardcodedPrimitives.has(nameLower)) return true;
+            if (this.findAllClassesByName(name).length > 0) return true;
+            if (this.enumIndex.has(name)) return true;
+            if (this.typedefIndex.has(name)) return true;
+            // Also check the resolved form (typedef resolution may have changed the name)
+            const resolved = this.resolveTypedef(name);
+            if (resolved !== name) {
+                if (this.findAllClassesByName(resolved).length > 0) return true;
+                if (this.enumIndex.has(resolved)) return true;
+            }
+            return false;
+        };
+        const declIsKnown = isKnownType(declNorm, declLower);
+        const assignIsKnown = isKnownType(assignNorm, assignLower);
         if (!declIsKnown || !assignIsKnown) {
             return { compatible: true, isDowncast: false, isUpcast: false }; // Unresolvable type
+        }
+        
+        // --- ENUM TYPE COMPATIBILITY ---
+        // In Enforce Script, enums are essentially named integers and are very
+        // loosely typed. They can be freely assigned to/from int, float, bool,
+        // other enum types, and even used interchangeably in many contexts.
+        // Treat any type involving an enum as compatible to avoid false positives.
+        const declIsEnum = this.enumIndex.has(declNorm) || this.enumIndex.has(declResolved);
+        const assignIsEnum = this.enumIndex.has(assignNorm) || this.enumIndex.has(assignResolved);
+        
+        if (declIsEnum || assignIsEnum) {
+            return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
         // array types - need to check element type compatibility
@@ -4316,18 +4445,18 @@ export class Analyzer {
         // If types are indexed as classes (including primitives like string, int from enconvert.c),
         // use the hierarchy to determine compatibility before falling back to hardcoded rules.
         
-        // Check class hierarchy for UPCAST
-        const assignedHierarchy = this.getClassHierarchyOrdered(assignNorm, new Set());
+        // Check class hierarchy for UPCAST (use resolved names so typedef'd types work)
+        const assignedHierarchy = this.getClassHierarchyOrdered(assignResolved, new Set());
         for (const classNode of assignedHierarchy) {
-            if (classNode.name === declNorm) {
+            if (classNode.name === declResolved || classNode.name === declNorm) {
                 return { compatible: true, isDowncast: false, isUpcast: true };
             }
         }
         
         // Check class hierarchy for DOWNCAST
-        const declaredHierarchy = this.getClassHierarchyOrdered(declNorm, new Set());
+        const declaredHierarchy = this.getClassHierarchyOrdered(declResolved, new Set());
         for (const classNode of declaredHierarchy) {
-            if (classNode.name === assignNorm) {
+            if (classNode.name === assignResolved || classNode.name === assignNorm) {
                 return { 
                     compatible: true,
                     isDowncast: true, 
@@ -4341,8 +4470,8 @@ export class Analyzer {
         // Only used if types aren't found in the indexed class hierarchy
         
         // Numeric types are compatible with each other (implicit conversion)
-        const numericTypes = new Set(['int', 'float', 'bool']);
-        if (numericTypes.has(declLower) && numericTypes.has(assignLower)) {
+        const numericTypesFallback = new Set(['int', 'float', 'bool']);
+        if (numericTypesFallback.has(declLower) && numericTypesFallback.has(assignLower)) {
             return { compatible: true, isDowncast: false, isUpcast: false };
         }
         
@@ -5330,7 +5459,7 @@ export class Analyzer {
                 // In Enforce Script, void parameters are generic "any type" placeholders,
                 // and func/function params accept function references which look like identifiers.
                 // Also skip container types (array, set, map) since we don't compare generics yet.
-                if (paramType === 'auto' || paramType === 'typename' || paramType === 'Class' || paramType === 'void' || paramType === 'func' || paramType === 'function' || paramType === 'array' || paramType === 'set' || paramType === 'map') continue;
+                if (paramType === 'auto' || paramType === 'typename' || paramType === 'Class' || paramType === 'Managed' || paramType === 'void' || paramType === 'func' || paramType === 'function' || paramType === 'array' || paramType === 'set' || paramType === 'map') continue;
                 
                 // Skip out/inout params - their types flow differently
                 if (param.modifiers?.includes('out') || param.modifiers?.includes('inout')) continue;
