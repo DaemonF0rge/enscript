@@ -4056,6 +4056,13 @@ export class Analyzer {
         for (const [fieldName, fieldNode] of classFields) {
             const inh = inheritedFields.get(fieldName);
             if (inh) {
+                // In modded classes, redeclaring a `const` field is the
+                // legitimate way to override its value — skip the duplicate
+                // report when BOTH the modded field and the inherited field
+                // are const.
+                if (isModded && fieldNode.modifiers?.includes('const')) {
+                    continue;
+                }
                 reportDup(fieldName, fieldNode, inh.start.line);
                 continue;
             }
