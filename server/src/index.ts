@@ -5,7 +5,8 @@ import {
     ProposedFeatures,
     InitializeParams,
     InitializeResult,
-    ConfigurationItem
+    ConfigurationItem,
+    FileChangeType
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import { registerAllHandlers } from './lsp/registerAll';
@@ -199,6 +200,54 @@ connection.onRequest('enscript/checkWorkspace', async () => {
         filesWithIssues: allDiagnostics.length,
         totalIssues: allDiagnostics.reduce((sum, d) => sum + d.diagnostics.length, 0)
     };
+});
+
+// Handle file changes on disk (e.g. Copilot edits, git operations, external tools).
+// The client sends these via the fileEvents watcher for **/*.c.
+// For files NOT open in the editor, we re-read from disk and re-index them.
+// For files that ARE open, TextDocuments already tracks their content via
+// didOpen/didChange, so we skip them to avoid overwriting in-memory edits.
+connection.onDidChangeWatchedFiles(async (params) => {
+    const analyser = Analyzer.instance();
+    let reindexedCount = 0;
+
+    for (const change of params.changes) {
+        const uri = change.uri;
+
+        if (change.type === FileChangeType.Deleted) {
+            // File was deleted — remove from index
+            analyser.removeFromIndex(uri);
+            // Clear diagnostics for the deleted file
+            connection.sendDiagnostics({ uri, diagnostics: [] });
+            continue;
+        }
+
+        // Created or Changed — re-read from disk and re-index
+        // Skip files that are currently open in the editor (TextDocuments
+        // already keeps them in sync via didChange notifications).
+        if (documents.get(uri)) continue;
+
+        try {
+            const filePath = url.fileURLToPath(uri);
+            const text = await readFileUtf8(filePath);
+            const doc = TextDocument.create(uri, 'enscript', Date.now(), text);
+            analyser.parseAndCache(doc);
+            reindexedCount++;
+        } catch (err) {
+            // File may have been deleted between notification and read
+            console.warn(`Failed to re-index ${uri}: ${err}`);
+        }
+    }
+
+    if (reindexedCount > 0) {
+        console.log(`Re-indexed ${reindexedCount} externally changed file(s)`);
+        // Re-validate all open documents since the index changed
+        for (const doc of documents.all()) {
+            if (!analyser.isWorkspaceFile(doc.uri)) continue;
+            const diagnostics = analyser.runDiagnostics(doc);
+            connection.sendDiagnostics({ uri: doc.uri, diagnostics });
+        }
+    }
 });
 
 // Re-validate every open enscript document (called by the client after indexing completes)

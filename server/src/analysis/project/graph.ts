@@ -639,6 +639,23 @@ export class Analyzer {
         return this.ensure(doc);
     }
 
+    /**
+     * Remove a file from all indexes (used when a file is deleted on disk).
+     * Also removes global symbol index entries and the doc cache entry.
+     */
+    removeFromIndex(uri: string): void {
+        const normalizedUri = normalizeUri(uri);
+        this.removeIndexEntriesForUri(normalizedUri);
+        // Remove from global symbol index
+        for (const [name, entry] of this.globalSymbolIndex) {
+            if (entry.uri === normalizedUri) {
+                this.globalSymbolIndex.delete(name);
+            }
+        }
+        this.symbolIndexDirty = true;
+        this.docCache.delete(normalizedUri);
+    }
+
     private ensure(doc: TextDocument): File {
         // 1 · cache hit
         const normalizedUri = normalizeUri(doc.uri);
@@ -5197,18 +5214,34 @@ export class Analyzer {
             // Distinguish generic angle brackets <> from bit shift <<, >>
             if (ch === '<') {
                 const nextCh = i + 1 < argsText.length ? argsText[i + 1] : '';
-                if (nextCh !== '<') { // Not bit shift <<
+                if (nextCh === '<') {
+                    // Bit shift <<: consume both characters, don't change bracketDepth
+                    current += '<<';
+                    i++;
+                } else {
+                    // Opening generic bracket
                     bracketDepth++;
+                    current += ch;
                 }
-                current += ch;
                 continue;
             }
             if (ch === '>') {
                 const nextCh = i + 1 < argsText.length ? argsText[i + 1] : '';
-                if (nextCh !== '>') { // Not bit shift >>
+                if (nextCh === '>' && bracketDepth >= 2) {
+                    // Two closing generic brackets: >> inside nested generic context
+                    // e.g., Param1<array<int>>(x) — consume both, decrement twice
+                    bracketDepth -= 2;
+                    current += '>>';
+                    i++; // skip next >
+                } else if (nextCh === '>' && bracketDepth === 0) {
+                    // Bit shift >> outside any generic context
+                    current += '>>';
+                    i++; // skip next >
+                } else {
+                    // Single > closing one generic bracket (or stray >)
                     if (bracketDepth > 0) bracketDepth--;
+                    current += ch;
                 }
-                current += ch;
                 continue;
             }
             if (ch === '{') { braceDepth++; current += ch; continue; }

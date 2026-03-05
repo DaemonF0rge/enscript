@@ -1669,3 +1669,123 @@ class ActiveConfig {
         expect(result).toBe('array');
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  parseCallArguments — argument splitting with generics, bit shifts, strings
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('parseCallArguments', () => {
+    const analyzer = freshAnalyzer();
+    function splitArgs(text: string): string[] {
+        return (analyzer as any).parseCallArguments(text);
+    }
+
+    // ── Basic splitting ────────────────────────────────────────────────────
+
+    test('simple args', () => {
+        expect(splitArgs('a, b, c')).toEqual(['a', 'b', 'c']);
+    });
+
+    test('single arg', () => {
+        expect(splitArgs('x')).toEqual(['x']);
+    });
+
+    test('empty string returns empty', () => {
+        expect(splitArgs('')).toEqual([]);
+    });
+
+    // ── Nested parentheses ─────────────────────────────────────────────────
+
+    test('nested function call', () => {
+        expect(splitArgs('Func(a, b), c')).toEqual(['Func(a, b)', 'c']);
+    });
+
+    test('deeply nested parens', () => {
+        expect(splitArgs('A(B(C(1))), 2')).toEqual(['A(B(C(1)))', '2']);
+    });
+
+    // ── String literals ────────────────────────────────────────────────────
+
+    test('string with comma', () => {
+        expect(splitArgs('"hello, world", x')).toEqual(['"hello, world"', 'x']);
+    });
+
+    test('string with escaped quote', () => {
+        expect(splitArgs('"say \\"hi\\"", x')).toEqual(['"say \\"hi\\""', 'x']);
+    });
+
+    // ── Generic angle brackets ─────────────────────────────────────────────
+
+    test('simple generic: array<int>', () => {
+        expect(splitArgs('new array<int>(), x')).toEqual(['new array<int>()', 'x']);
+    });
+
+    test('generic with comma in type args: map<string, int>', () => {
+        expect(splitArgs('new map<string, int>(), x')).toEqual(['new map<string, int>()', 'x']);
+    });
+
+    test('nested generics with >> closing: Param1<array<int>>', () => {
+        // The key bug fix: >> should be treated as two > closing brackets
+        expect(splitArgs('new Param1<array<int>>(x), true, NULL')).toEqual([
+            'new Param1<array<int>>(x)', 'true', 'NULL'
+        ]);
+    });
+
+    test('nested generics with autoptr: Param1<array<autoptr BasicMapMarker>>', () => {
+        // Exact pattern from the reported false positive
+        expect(splitArgs('MapItem, BASICMAPRPCS.SAVE_MARKERS, new Param1<array<autoptr BasicMapMarker>>(ClientMarkers), true, NULL')).toEqual([
+            'MapItem', 'BASICMAPRPCS.SAVE_MARKERS',
+            'new Param1<array<autoptr BasicMapMarker>>(ClientMarkers)',
+            'true', 'NULL'
+        ]);
+    });
+
+    test('triple nested generics: A<B<C<int>>>', () => {
+        expect(splitArgs('new A<B<C<int>>>(x), y')).toEqual([
+            'new A<B<C<int>>>(x)', 'y'
+        ]);
+    });
+
+    // ── Bit shift operators ────────────────────────────────────────────────
+
+    test('bit shift >> at top level', () => {
+        expect(splitArgs('a >> 2, b')).toEqual(['a >> 2', 'b']);
+    });
+
+    test('bit shift << at top level', () => {
+        expect(splitArgs('a << 2, b')).toEqual(['a << 2', 'b']);
+    });
+
+    test('bit shift >> after generic close', () => {
+        // new Map<string, array<int>>(a >> b) — >> closes generics, then >> is bit shift
+        expect(splitArgs('new Map<string, array<int>>(a >> b), c')).toEqual([
+            'new Map<string, array<int>>(a >> b)', 'c'
+        ]);
+    });
+
+    test('bit shift << in expression arg', () => {
+        expect(splitArgs('1 << 3, flags')).toEqual(['1 << 3', 'flags']);
+    });
+
+    test('multiple bit shifts', () => {
+        expect(splitArgs('a << 2, b >> 3, c')).toEqual(['a << 2', 'b >> 3', 'c']);
+    });
+
+    // ── Braces (array literals) ────────────────────────────────────────────
+
+    test('brace literal with commas', () => {
+        expect(splitArgs('{1, 2, 3}, x')).toEqual(['{1, 2, 3}', 'x']);
+    });
+
+    // ── Mixed scenarios ────────────────────────────────────────────────────
+
+    test('generic + function call + string', () => {
+        expect(splitArgs('new array<int>(), GetName(), "hello"')).toEqual([
+            'new array<int>()', 'GetName()', '"hello"'
+        ]);
+    });
+
+    test('bit shift inside parens does not affect splitting', () => {
+        expect(splitArgs('Func(a << 2), b')).toEqual(['Func(a << 2)', 'b']);
+    });
+});
